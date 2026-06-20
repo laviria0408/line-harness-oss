@@ -70,6 +70,15 @@ function trycleAckMessage(data: string): string {
   if (data.startsWith('pkg1_start')) {
     return '整備見積もりフローを準備中です。スタッフからご連絡いたします。';
   }
+  if (data.startsWith('pkg1_wage')) {
+    return '工賃表と同意書のご案内を準備中です。';
+  }
+  if (data.startsWith('pkg1_staff')) {
+    return 'スタッフへの相談を準備中です。担当者から折り返しご連絡いたします。';
+  }
+  if (data.startsWith('pkg1_')) {
+    return '整備関連のフローを準備中です。';
+  }
   if (data.startsWith('pkg8_start') || data.startsWith('faq_start')) {
     return 'FAQ をご案内します。準備中です。';
   }
