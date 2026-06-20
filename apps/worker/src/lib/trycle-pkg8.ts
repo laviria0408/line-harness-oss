@@ -217,14 +217,15 @@ function buildTapRow(row: TapRow): object {
 
 function buildSectionLabel(text: string): object {
   return {
-    type: 'text',
-    text,
-    size: 'sm',
-    color: TEXT_MUTED,
-    weight: 'bold',
+    type: 'box',
+    layout: 'vertical',
     paddingTop: 'md',
     paddingBottom: 'sm',
     paddingStart: 'md',
+    paddingEnd: 'md',
+    contents: [
+      { type: 'text', text, size: 'sm', color: TEXT_MUTED, weight: 'bold' },
+    ],
   };
 }
 
