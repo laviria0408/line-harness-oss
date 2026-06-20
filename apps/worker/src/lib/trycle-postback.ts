@@ -1,72 +1,61 @@
 /**
- * TRYCLE postback dispatcher (Phase B-4).
+ * TRYCLE postback dispatcher.
  *
- * The Vercel-era bot used "action=pkg1_*", "action=pkg8_*", "action=consent_*"
- * postback prefixes for the maintenance estimate / FAQ / consent flows. To keep
- * upstream `webhook.ts` diff small, we route those prefixes here as a single
- * `tryHandleTryclePostback(...)` call from inside the existing postback branch.
+ * Phase B-4 で stub として組み込まれた経路を、Phase E-impl Step 2 で Pkg8
+ * (FAQ) は完全実装に置き換えた。Pkg1 (整備見積) / consent / reservation は
+ * Step 4-6 で書き直す対象として stub のまま残置 (LH 標準 + 個別維持の混成
+ * 設計に従う・「LH 標準活用設計 v1.0 (Phase C-3)」§5 / §6 参照)。
  *
  * Return value:
  *   true  → TRYCLE handled it. Caller MUST NOT continue with auto-reply
  *           matching (we already replied via the LINE Client).
  *   false → not a TRYCLE postback; caller continues with stock LINE Harness
  *           auto_reply / scenario matching.
- *
- * Design note
- *   We don't import quote/store helpers here directly because actually wiring
- *   each Pkg1 step (region → symptom → variant → qty → cart → confirm)
- *   requires session storage that lives in Supabase `bot_sessions`. That full
- *   port is Phase B-3.5 (intentionally deferred to a follow-up commit so the
- *   current PR stays bounded). For now we ack the prefixes and reply with a
- *   clear "feature coming online" message so users don't fall into the
- *   pre-existing auto-reply path mistakenly.
  */
 import type { LineClient } from '@line-crm/line-sdk';
+import { handlePkg8Postback, isPkg8Postback } from './trycle-pkg8.js';
+import type { TrycleRepoEnv } from './trycle-repo.js';
 
-const TRYCLE_PREFIXES = [
+const TRYCLE_STUB_PREFIXES = [
   'pkg1_',
-  'pkg8_',
   'consent_',
   'reservation_',
 ] as const;
 
 export function isTryclePostback(data: string): boolean {
-  return TRYCLE_PREFIXES.some((prefix) => data.startsWith(prefix));
+  return isPkg8Postback(data) || TRYCLE_STUB_PREFIXES.some((prefix) => data.startsWith(prefix));
 }
 
 export interface TryclePostbackContext {
   readonly replyToken: string;
   readonly lineUserId: string;
   readonly lineClient: LineClient;
+  readonly env: TrycleRepoEnv;
 }
 
-/**
- * Returns true if the postback was consumed by TRYCLE flow, false otherwise.
- *
- * Stage 1 (Phase B-4) wiring: we ack the postback so the stock auto-reply
- * never picks it up; the rich flows (estimate / consent / reservation) land
- * in a follow-up commit. The reply message is intentionally short so the user
- * sees movement and the postback log captures the action data for analytics.
- */
 export async function tryHandleTryclePostback(
   data: string,
   ctx: TryclePostbackContext,
 ): Promise<boolean> {
-  if (!isTryclePostback(data)) {
-    return false;
+  // Pkg8 (FAQ) は Phase E-impl Step 2 で完全実装
+  if (isPkg8Postback(data)) {
+    return handlePkg8Postback(data, ctx);
   }
-  const message = trycleAckMessage(data);
-  try {
-    await ctx.lineClient.replyMessage(ctx.replyToken, [
-      { type: 'text', text: message },
-    ]);
-  } catch (err) {
-    console.error('[trycle-postback] reply failed', err);
+  // Pkg1 / consent / reservation は Phase E-impl Step 4-6 で書き直す対象。
+  // 暫定 ack で auto-reply 経路には流さない (重複返信防止)。
+  if (TRYCLE_STUB_PREFIXES.some((prefix) => data.startsWith(prefix))) {
+    const message = trycleStubAckMessage(data);
+    try {
+      await ctx.lineClient.replyMessage(ctx.replyToken, [{ type: 'text', text: message }]);
+    } catch (err) {
+      console.error('[trycle-postback] stub reply failed', err);
+    }
+    return true;
   }
-  return true;
+  return false;
 }
 
-function trycleAckMessage(data: string): string {
+function trycleStubAckMessage(data: string): string {
   if (data.startsWith('pkg1_start')) {
     return '整備見積もりフローを準備中です。スタッフからご連絡いたします。';
   }
@@ -78,9 +67,6 @@ function trycleAckMessage(data: string): string {
   }
   if (data.startsWith('pkg1_')) {
     return '整備関連のフローを準備中です。';
-  }
-  if (data.startsWith('pkg8_start') || data.startsWith('faq_start')) {
-    return 'FAQ をご案内します。準備中です。';
   }
   if (data.startsWith('consent_')) {
     return '同意書フローを準備中です。';

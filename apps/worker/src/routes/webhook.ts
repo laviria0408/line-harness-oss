@@ -165,7 +165,7 @@ webhook.post('/webhook', async (c) => {
   const processingPromise = (async () => {
     for (const event of body.events) {
       try {
-        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin, c.env.LIFF_URL, c.env.IMAGES);
+        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin, c.env.LIFF_URL, c.env.IMAGES, c.env);
       } catch (err) {
         console.error('Error handling webhook event:', err);
       }
@@ -186,6 +186,7 @@ async function handleEvent(
   workerUrl?: string,
   liffUrl?: string,
   r2?: R2Bucket,
+  workerEnv?: Env['Bindings'],
 ): Promise<void> {
   if (event.type === 'follow') {
     const userId =
@@ -390,11 +391,12 @@ async function handleEvent(
     // stock auto-reply matching and go to the dedicated dispatcher in
     // src/lib/trycle-postback.ts. If consumed, we still log it below.
     const replyTokenForTrycle = (event as unknown as { replyToken?: string }).replyToken;
-    if (replyTokenForTrycle) {
+    if (replyTokenForTrycle && workerEnv) {
       const handled = await tryHandleTryclePostback(postbackData, {
         replyToken: replyTokenForTrycle,
         lineUserId: userId,
         lineClient,
+        env: workerEnv,
       });
       if (handled) {
         // Log the incoming postback so dashboard analytics still see it.
