@@ -75,6 +75,9 @@ import { profileRefresh } from './routes/profile-refresh.js';
 import { richMenuGroups } from './routes/rich-menu-groups.js';
 import adminVersion from './routes/admin-version.js';
 import adminUpdate from './routes/admin-update.js';
+// TRYCLE business endpoints (Phase B). Mounted alongside LINE Harness
+// stock routes; tenant-scoped Supabase access is opt-in via env vars.
+import { trycle } from './routes/trycle.js';
 
 export type Env = {
   Bindings: {
@@ -113,6 +116,17 @@ export type Env = {
     WORKER_PUBLIC_URL?: string;
     ADMIN_PUBLIC_URL?: string;
     LIFF_PUBLIC_URL?: string;
+    // TRYCLE business integration (Phase B). Supabase is the
+    // canonical store for business data (customers/cases/quotes);
+    // GAS handles PDF + Drive; AppSheet mirrors customer master.
+    SUPABASE_URL?: string;
+    SUPABASE_SERVICE_ROLE_KEY?: string;
+    TRYCLE_TENANT_ID?: string;
+    GAS_WEB_APP_URL?: string;
+    APPSHEET_APP_ID?: string;
+    APPSHEET_API_KEY?: string;
+    APPSHEET_CUSTOMER_TABLE?: string;
+    APPSHEET_CASE_TABLE?: string;
   };
   Variables: {
     staff: { id: string; name: string; role: 'owner' | 'admin' | 'staff' };
@@ -154,6 +168,9 @@ app.route('/', usersGrouped);
 app.route('/', inbox);
 app.route('/', openapi);
 app.route('/', liffRoutes);
+
+// TRYCLE business endpoints (Phase B)
+app.route('/', trycle);
 
 // Mount route groups — Round 3
 app.route('/', webhooks);

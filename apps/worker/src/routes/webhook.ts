@@ -23,6 +23,7 @@ import {
 import type { EntryRoute, Friend } from '@line-crm/db';
 import { fireEvent } from '../services/event-bus.js';
 import { buildMessage, expandVariables } from '../services/step-delivery.js';
+import { tryHandleTryclePostback } from '../lib/trycle-postback.js';
 import type { Env } from '../index.js';
 
 const webhook = new Hono<Env>();
@@ -384,6 +385,33 @@ async function handleEvent(
     if (!friend) return;
 
     const postbackData = (event as unknown as { postback: { data: string } }).postback.data;
+
+    // TRYCLE business postbacks (pkg1_/pkg8_/consent_/reservation_) bypass the
+    // stock auto-reply matching and go to the dedicated dispatcher in
+    // src/lib/trycle-postback.ts. If consumed, we still log it below.
+    const replyTokenForTrycle = (event as unknown as { replyToken?: string }).replyToken;
+    if (replyTokenForTrycle) {
+      const handled = await tryHandleTryclePostback(postbackData, {
+        replyToken: replyTokenForTrycle,
+        lineUserId: userId,
+        lineClient,
+      });
+      if (handled) {
+        // Log the incoming postback so dashboard analytics still see it.
+        try {
+          await db
+            .prepare(
+              `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, line_account_id, created_at)
+               VALUES (?, ?, 'incoming', 'text', ?, NULL, NULL, 'postback', ?, ?)`,
+            )
+            .bind(crypto.randomUUID(), friend.id, postbackData, lineAccountId ?? null, jstNow())
+            .run();
+        } catch (err) {
+          console.error('Failed to log TRYCLE postback', err);
+        }
+        return;
+      }
+    }
 
     // Match postback data against auto_replies (exact match on keyword)
     const autoReplyQuery = lineAccountId
