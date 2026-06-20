@@ -1,21 +1,22 @@
 /**
- * TRYCLE Pkg8「なんでも質問」(FAQ) postback dispatcher + Flex Message builder.
+ * TRYCLE Pkg8「なんでも質問」(FAQ) postback dispatcher + Quick Reply builder.
  *
- * 設計 (Phase E-impl Step 2):
+ * 設計 v2 (2026-06-21): 横カルーセル廃止・Quick Reply ベースへ刷新。
+ *
  *   入口  Rich Menu「FAQ」タップ
  *   ↓     postback data=faq_start
- *   ① カテゴリ Flex Carousel
- *   ↓     postback data=faq_cat_{category}
- *   ② 質問 Flex Carousel (10 件まで)
+ *   ① テキスト + Quick Reply (人気トップ3 + カテゴリ + スタッフに聞く)
+ *   ↓     postback data=faq_cat_{category} or faq_q_{faq_id} or faq_staff
+ *   ② カテゴリ選択 → 質問 Quick Reply
  *   ↓     postback data=faq_q_{faq_id}
- *   ③ 回答 Bubble + Quick Reply (解決した / 困った)
- *           postback data=faq_h_{faq_id} (helpful)
- *           postback data=faq_u_{faq_id} (unhelpful)
+ *   ③ 回答 Bubble + Quick Reply (解決した / 困った / カテゴリへ戻る)
  *
  * データは Tenant Supabase faqs canonical 直読み (D1 mirror なし)。
+ * 業界調査: 横カルーセル使用例ゼロ・Quick Reply が定番。
  */
 
 import type { LineClient } from '@line-crm/line-sdk';
+import { quickReply, withQuickReply, type QuickReplyItem } from '@line-crm/line-sdk';
 import {
   listActiveFaqs,
   listFaqCategories,
@@ -26,7 +27,9 @@ import {
 import type { TrycleRepoEnv } from './trycle-repo.js';
 
 const FAQ_PREFIXES = ['faq_', 'pkg8_'] as const;
-const QUESTIONS_PER_CAROUSEL = 10;
+const QUICK_REPLY_LABEL_MAX = 20;
+const TOP_FAQS_COUNT = 3;
+const MAX_QUICK_REPLY_ITEMS = 13;
 
 export function isPkg8Postback(data: string): boolean {
   return FAQ_PREFIXES.some((prefix) => data.startsWith(prefix));
@@ -54,7 +57,11 @@ export async function handlePkg8Postback(data: string, ctx: Pkg8Context): Promis
 
   try {
     if (data === 'faq_start' || data === 'pkg8_start') {
-      await replyCategoryList(ctx);
+      await replyEntry(ctx);
+      return true;
+    }
+    if (data === 'faq_staff') {
+      await replyStaffEscalation(ctx);
       return true;
     }
     if (data.startsWith('faq_cat_')) {
@@ -98,39 +105,115 @@ export async function handlePkg8Postback(data: string, ctx: Pkg8Context): Promis
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
-async function replyCategoryList(ctx: Pkg8Context): Promise<void> {
+/**
+ * 入口: テキスト + Quick Reply (人気トップ 3 + カテゴリ + スタッフに聞く)
+ */
+async function replyEntry(ctx: Pkg8Context): Promise<void> {
   const [categories, faqs] = await Promise.all([
     listFaqCategories(ctx.env),
     listActiveFaqs(ctx.env),
   ]);
-  if (categories.length === 0) {
+  if (categories.length === 0 && faqs.length === 0) {
     await ctx.lineClient.replyMessage(ctx.replyToken, [
       { type: 'text', text: '現在ご案内できる FAQ がありません。スタッフへ直接ご連絡ください。' },
     ]);
     return;
   }
-  const countByCategory = new Map<string, number>();
-  for (const f of faqs) {
-    if (!f.category) continue;
-    countByCategory.set(f.category, (countByCategory.get(f.category) ?? 0) + 1);
+
+  const topFaqs = faqs.slice(0, TOP_FAQS_COUNT);
+  const items: QuickReplyItem[] = [];
+
+  // 人気トップ 3 を先頭に
+  for (const f of topFaqs) {
+    items.push({
+      type: 'action',
+      action: {
+        type: 'postback',
+        label: truncateLabel(`⭐ ${f.question}`),
+        data: `faq_q_${f.id}`,
+      },
+    });
   }
-  const flex = buildCategoryCarousel(categories, countByCategory);
-  await ctx.lineClient.replyMessage(ctx.replyToken, [flex]);
+  // カテゴリ
+  for (const cat of categories) {
+    items.push({
+      type: 'action',
+      action: {
+        type: 'postback',
+        label: truncateLabel(cat),
+        data: `faq_cat_${cat}`,
+      },
+    });
+  }
+  // スタッフ送り
+  if (items.length < MAX_QUICK_REPLY_ITEMS) {
+    items.push({
+      type: 'action',
+      action: {
+        type: 'postback',
+        label: '💬 スタッフに聞く',
+        data: 'faq_staff',
+      },
+    });
+  }
+
+  const message = withQuickReply(
+    {
+      type: 'text' as const,
+      text: 'よくあるご質問\n下のボタンから知りたいことをお選びください。',
+    },
+    quickReply(items.slice(0, MAX_QUICK_REPLY_ITEMS)),
+  );
+
+  await ctx.lineClient.replyMessage(ctx.replyToken, [message]);
 }
 
+/**
+ * カテゴリ選択: そのカテゴリの質問を Quick Reply で並べる + 戻る
+ */
 async function replyQuestionList(ctx: Pkg8Context, category: string): Promise<void> {
   const faqs = await listActiveFaqs(ctx.env);
-  const matched = faqs.filter((f) => f.category === category).slice(0, QUESTIONS_PER_CAROUSEL);
+  const matched = faqs.filter((f) => f.category === category);
   if (matched.length === 0) {
     await ctx.lineClient.replyMessage(ctx.replyToken, [
       { type: 'text', text: `「${category}」カテゴリに該当する質問が見つかりませんでした。` },
     ]);
     return;
   }
-  const flex = buildQuestionCarousel(matched, category);
-  await ctx.lineClient.replyMessage(ctx.replyToken, [flex]);
+
+  const items: QuickReplyItem[] = [];
+  // 質問 (最大 12 件・戻る分 1 を残す)
+  for (const f of matched.slice(0, MAX_QUICK_REPLY_ITEMS - 1)) {
+    items.push({
+      type: 'action',
+      action: {
+        type: 'postback',
+        label: truncateLabel(f.question),
+        data: `faq_q_${f.id}`,
+      },
+    });
+  }
+  // 戻る
+  items.push({
+    type: 'action',
+    action: {
+      type: 'postback',
+      label: '← カテゴリへ戻る',
+      data: 'faq_start',
+    },
+  });
+
+  const message = withQuickReply(
+    { type: 'text' as const, text: `「${category}」のよくあるご質問` },
+    quickReply(items),
+  );
+
+  await ctx.lineClient.replyMessage(ctx.replyToken, [message]);
 }
 
+/**
+ * 質問選択: 回答 Bubble (footer に Quick Reply 風ボタン) + Quick Reply で「カテゴリへ戻る」
+ */
 async function replyAnswer(ctx: Pkg8Context, faqId: string): Promise<void> {
   const faq = await getFaqById(ctx.env, faqId);
   if (!faq) {
@@ -142,153 +225,107 @@ async function replyAnswer(ctx: Pkg8Context, faqId: string): Promise<void> {
   await incrementFaqCounter(ctx.env, faqId, 'view_count').catch((err) => {
     console.error('[trycle-pkg8] view_count increment failed', err);
   });
+
+  // 回答 Bubble (現状の builder を流用)
   const flex = buildAnswerBubble(faq);
-  await ctx.lineClient.replyMessage(ctx.replyToken, [flex]);
+  // Quick Reply: カテゴリへ戻る + スタッフに聞く
+  const items: QuickReplyItem[] = [
+    {
+      type: 'action',
+      action: {
+        type: 'postback',
+        label: '← カテゴリへ戻る',
+        data: 'faq_start',
+      },
+    },
+    {
+      type: 'action',
+      action: {
+        type: 'postback',
+        label: '💬 スタッフに聞く',
+        data: 'faq_staff',
+      },
+    },
+  ];
+  const message = withQuickReply(flex, quickReply(items));
+
+  await ctx.lineClient.replyMessage(ctx.replyToken, [message]);
 }
 
 async function replyHelpfulAck(ctx: Pkg8Context, faqId: string): Promise<void> {
   await incrementFaqCounter(ctx.env, faqId, 'helpful_count').catch((err) => {
     console.error('[trycle-pkg8] helpful_count increment failed', err);
   });
-  await ctx.lineClient.replyMessage(ctx.replyToken, [
+  const items: QuickReplyItem[] = [
     {
-      type: 'text',
-      text: 'ご回答お役に立てて何よりです。他にもご質問があればメニューから「FAQ」をお選びください。',
+      type: 'action',
+      action: {
+        type: 'postback',
+        label: '← カテゴリへ戻る',
+        data: 'faq_start',
+      },
     },
-  ]);
+  ];
+  const message = withQuickReply(
+    {
+      type: 'text' as const,
+      text: 'ご回答お役に立てて何よりです。\n他にもご質問があれば下からお選びください。',
+    },
+    quickReply(items),
+  );
+  await ctx.lineClient.replyMessage(ctx.replyToken, [message]);
 }
 
 async function replyUnhelpfulAck(ctx: Pkg8Context, faqId: string): Promise<void> {
   await incrementFaqCounter(ctx.env, faqId, 'unhelpful_count').catch((err) => {
     console.error('[trycle-pkg8] unhelpful_count increment failed', err);
   });
+  const items: QuickReplyItem[] = [
+    {
+      type: 'action',
+      action: {
+        type: 'postback',
+        label: '💬 スタッフに聞く',
+        data: 'faq_staff',
+      },
+    },
+    {
+      type: 'action',
+      action: {
+        type: 'postback',
+        label: '← カテゴリへ戻る',
+        data: 'faq_start',
+      },
+    },
+  ];
+  const message = withQuickReply(
+    {
+      type: 'text' as const,
+      text: 'お役に立てず申し訳ありません。\nご質問の内容をテキストでお送りいただくか、下の「スタッフに聞く」からご連絡ください。',
+    },
+    quickReply(items),
+  );
+  await ctx.lineClient.replyMessage(ctx.replyToken, [message]);
+}
+
+async function replyStaffEscalation(ctx: Pkg8Context): Promise<void> {
   await ctx.lineClient.replyMessage(ctx.replyToken, [
     {
       type: 'text',
-      text: 'お役に立てず申し訳ありません。スタッフから折り返しご連絡いたしますので、ご質問の内容をテキストでお送りください。',
+      text:
+        'スタッフからご連絡いたします。\nご質問の内容をこちらにテキストでお送りください。\n営業時間内に順次お返事いたします。',
     },
   ]);
 }
 
-// ── Flex Message Builders ────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
-function buildCategoryCarousel(
-  categories: string[],
-  countByCategory: Map<string, number>,
-): FlexMessage {
-  // Carousel は最大 12 bubble。13 件以上は先頭 12 (運用上稀)
-  const limited = categories.slice(0, 12);
-  return {
-    type: 'flex',
-    altText: 'よくあるご質問のカテゴリ一覧',
-    contents: {
-      type: 'carousel',
-      contents: limited.map((cat) => ({
-        type: 'bubble',
-        size: 'kilo',
-        header: {
-          type: 'box',
-          layout: 'vertical',
-          contents: [
-            { type: 'text', text: cat, weight: 'bold', size: 'lg', color: '#1e293b', wrap: true },
-          ],
-          paddingAll: 'md',
-        },
-        body: {
-          type: 'box',
-          layout: 'vertical',
-          contents: [
-            {
-              type: 'text',
-              text: `${countByCategory.get(cat) ?? 0} 件の質問`,
-              size: 'sm',
-              color: '#64748b',
-            },
-          ],
-          paddingAll: 'md',
-        },
-        footer: {
-          type: 'box',
-          layout: 'vertical',
-          contents: [
-            {
-              type: 'button',
-              style: 'primary',
-              color: '#06C755',
-              action: { type: 'postback', label: '質問を見る', data: `faq_cat_${cat}` },
-              height: 'sm',
-            },
-          ],
-          paddingAll: 'md',
-        },
-      })),
-    },
-  };
+function truncateLabel(s: string, max: number = QUICK_REPLY_LABEL_MAX): string {
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1) + '…';
 }
 
-function buildQuestionCarousel(faqs: FaqRow[], category: string): FlexMessage {
-  const bubbles: object[] = faqs.map((f) => ({
-    type: 'bubble',
-    size: 'kilo',
-    body: {
-      type: 'box',
-      layout: 'vertical',
-      contents: [
-        { type: 'text', text: category, size: 'xs', color: '#64748b' },
-        { type: 'text', text: f.question, weight: 'bold', size: 'md', wrap: true, margin: 'sm', color: '#1e293b' },
-      ],
-      paddingAll: 'md',
-    },
-    footer: {
-      type: 'box',
-      layout: 'vertical',
-      contents: [
-        {
-          type: 'button',
-          style: 'primary',
-          color: '#06C755',
-          action: { type: 'postback', label: 'この質問を見る', data: `faq_q_${f.id}` },
-          height: 'sm',
-        },
-      ],
-      paddingAll: 'md',
-    },
-  }));
-
-  // 末尾に「別のカテゴリへ戻る」bubble
-  bubbles.push({
-    type: 'bubble',
-    size: 'kilo',
-    body: {
-      type: 'box',
-      layout: 'vertical',
-      contents: [
-        { type: 'text', text: '別のカテゴリ', size: 'xs', color: '#64748b' },
-        { type: 'text', text: '他の質問を探す', weight: 'bold', size: 'md', wrap: true, margin: 'sm', color: '#1e293b' },
-      ],
-      paddingAll: 'md',
-    },
-    footer: {
-      type: 'box',
-      layout: 'vertical',
-      contents: [
-        {
-          type: 'button',
-          style: 'secondary',
-          action: { type: 'postback', label: 'カテゴリへ戻る', data: 'faq_start' },
-          height: 'sm',
-        },
-      ],
-      paddingAll: 'md',
-    },
-  });
-
-  return {
-    type: 'flex',
-    altText: `${category} の質問一覧`,
-    contents: { type: 'carousel', contents: bubbles },
-  };
-}
+// ── Flex Message Builder (回答 Bubble は流用) ─────────────────────────────────
 
 function buildAnswerBubble(faq: FaqRow): FlexMessage {
   return {
@@ -324,36 +361,23 @@ function buildAnswerBubble(faq: FaqRow): FlexMessage {
       },
       footer: {
         type: 'box',
-        layout: 'vertical',
+        layout: 'horizontal',
         spacing: 'sm',
         contents: [
           {
-            type: 'box',
-            layout: 'horizontal',
-            spacing: 'sm',
-            contents: [
-              {
-                type: 'button',
-                style: 'primary',
-                color: '#06C755',
-                action: { type: 'postback', label: '解決した', data: `faq_h_${faq.id}` },
-                height: 'sm',
-                flex: 1,
-              },
-              {
-                type: 'button',
-                style: 'secondary',
-                action: { type: 'postback', label: '困った', data: `faq_u_${faq.id}` },
-                height: 'sm',
-                flex: 1,
-              },
-            ],
+            type: 'button',
+            style: 'primary',
+            color: '#06C755',
+            action: { type: 'postback', label: '解決した', data: `faq_h_${faq.id}` },
+            height: 'sm',
+            flex: 1,
           },
           {
             type: 'button',
-            style: 'link',
-            action: { type: 'postback', label: '別のカテゴリへ戻る', data: 'faq_start' },
+            style: 'secondary',
+            action: { type: 'postback', label: '困った', data: `faq_u_${faq.id}` },
             height: 'sm',
+            flex: 1,
           },
         ],
         paddingAll: 'lg',
