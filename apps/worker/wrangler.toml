@@ -1,4 +1,4 @@
-name = "line-harness"
+name = "trycle-poc"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
 # nodejs_compat is required by @line-harness/update-engine which pulls in
@@ -10,10 +10,10 @@ compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 
 # ═══════════════════════════════════════════════════════════════
-# デフォルト = テスト環境 (noda@)
+# デフォルト = TRYCLE PoC (laviria0408@)
 # 使い方: npx wrangler deploy
 # ═══════════════════════════════════════════════════════════════
-account_id = "YOUR_DEV_ACCOUNT_ID"
+account_id = "375ccebf7904d6088d4ba97c643533d5"
 
 [assets]
 directory = "dist/client"
@@ -21,12 +21,12 @@ binding = "ASSETS"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "line-harness"
-database_id = "YOUR_DEV_D1_DATABASE_ID"
+database_name = "trycle-poc"
+database_id = "d194f511-743c-4627-bd55-5cd5de38798e"
 
 [[r2_buckets]]
 binding = "IMAGES"
-bucket_name = "line-harness-images"
+bucket_name = "trycle-poc-images"
 
 [triggers]
 crons = ["*/5 * * * *", "0 */6 * * *"]
@@ -37,15 +37,15 @@ crons = ["*/5 * * * *", "0 */6 * * *"]
 # and are intentionally absent from this file.
 # ═══════════════════════════════════════════════════════════════
 [vars]
-WORKER_NAME = "line-harness"
-ADMIN_PAGES_PROJECT = "line-harness-admin"
-LIFF_PAGES_PROJECT = "line-harness-liff"
-D1_DATABASE_ID = "YOUR_DEV_D1_DATABASE_ID"
+WORKER_NAME = "trycle-poc"
+ADMIN_PAGES_PROJECT = "trycle-poc-admin-155f311f"
+LIFF_PAGES_PROJECT = "trycle-poc-liff"
+D1_DATABASE_ID = "d194f511-743c-4627-bd55-5cd5de38798e"
 MANIFEST_URL = "https://github.com/Shudesu/line-harness-oss/releases/latest/download/release-manifest.json"
-WORKER_PUBLIC_URL = "https://line-harness.workers.dev"
-ADMIN_PUBLIC_URL = "https://line-harness-admin.pages.dev"
-LIFF_PUBLIC_URL = "https://line-harness-liff.pages.dev"
-CF_ACCOUNT_ID = "YOUR_DEV_ACCOUNT_ID"
+WORKER_PUBLIC_URL = "https://trycle-poc.trycle-g1st-dev.workers.dev"
+ADMIN_PUBLIC_URL = "https://trycle-poc-admin-155f311f.pages.dev"
+LIFF_PUBLIC_URL = "https://trycle-poc-liff.pages.dev"
+CF_ACCOUNT_ID = "375ccebf7904d6088d4ba97c643533d5"
 
 # ═══════════════════════════════════════════════════════════════
 # 本番環境
