@@ -27,15 +27,20 @@ import {
   type FaqLinkRow,
 } from './trycle-faq-repo.js';
 import type { TrycleRepoEnv } from './trycle-repo.js';
+import {
+  buildTapRow,
+  buildSectionLabel,
+  buildDivider,
+  TRYCLE_GREEN,
+  TEXT_PRIMARY,
+  TEXT_MUTED,
+  type FlexMessage,
+} from './trycle-flex-helpers.js';
 
 const FAQ_PREFIXES = ['faq_', 'pkg8_'] as const;
 const TOP_FAQS_COUNT = 3;
 const SEARCH_RESULTS_LIMIT = 5;
 const MIN_SEARCH_QUERY_LENGTH = 2;
-const TRYCLE_GREEN = '#06C755';
-const TEXT_PRIMARY = '#1e293b';
-const TEXT_MUTED = '#64748b';
-const DIVIDER_COLOR = '#e2e8f0';
 
 export function isPkg8Postback(data: string): boolean {
   return FAQ_PREFIXES.some((prefix) => data.startsWith(prefix));
@@ -46,12 +51,6 @@ export interface Pkg8Context {
   readonly lineUserId: string;
   readonly lineClient: LineClient;
   readonly env: TrycleRepoEnv;
-}
-
-interface FlexMessage {
-  readonly type: 'flex';
-  readonly altText: string;
-  readonly contents: object;
 }
 
 export async function handlePkg8Postback(data: string, ctx: Pkg8Context): Promise<boolean> {
@@ -237,56 +236,8 @@ async function replyStaffEscalation(ctx: Pkg8Context): Promise<void> {
 }
 
 // ── Flex Builders ────────────────────────────────────────────────────────────
-
-interface TapRow {
-  icon: string;
-  label: string;
-  data: string;
-}
-
-function buildTapRow(row: TapRow): object {
-  return {
-    type: 'box',
-    layout: 'horizontal',
-    spacing: 'sm',
-    paddingTop: 'md',
-    paddingBottom: 'md',
-    paddingStart: 'md',
-    paddingEnd: 'md',
-    action: { type: 'postback', label: row.label, data: row.data },
-    contents: [
-      { type: 'text', text: row.icon, size: 'md', flex: 0 },
-      {
-        type: 'text',
-        text: row.label,
-        size: 'md',
-        color: TEXT_PRIMARY,
-        wrap: true,
-        flex: 1,
-        weight: 'regular',
-      },
-      { type: 'text', text: '›', size: 'lg', color: TEXT_MUTED, flex: 0, align: 'end' },
-    ],
-  };
-}
-
-function buildSectionLabel(text: string): object {
-  return {
-    type: 'box',
-    layout: 'vertical',
-    paddingTop: 'md',
-    paddingBottom: 'sm',
-    paddingStart: 'md',
-    paddingEnd: 'md',
-    contents: [
-      { type: 'text', text, size: 'sm', color: TEXT_MUTED, weight: 'bold' },
-    ],
-  };
-}
-
-function buildDivider(): object {
-  return { type: 'separator', color: DIVIDER_COLOR };
-}
+// 共通 helper (buildTapRow / buildSectionLabel / buildDivider) と色定数は
+// trycle-flex-helpers.ts に集約済み (Pkg1 と共有・LH 準拠 1 Bubble 縦リスト型)。
 
 function buildEntryBubble(topFaqs: FaqRow[], categories: string[]): FlexMessage {
   const contents: object[] = [];

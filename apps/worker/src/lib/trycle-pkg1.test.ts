@@ -226,10 +226,14 @@ describe('isPkg1Postback', () => {
 // ── ① 状況ふりわけ (REQ-002) ─────────────────────────────────────────────────
 
 describe('dispatch (REQ-PKG1-002)', () => {
-  it('原因特定済み advances to region selection (carousel)', async () => {
+  it('原因特定済み advances to region selection (LH 準拠 Flex 縦リスト)', async () => {
     await postback('pkg1_start');
     await postback('action=pkg1_dispatch&value=identified');
-    expect(lastReplyText()).toContain('carousel');
+    const s = lastReplyText();
+    // LH 準拠 Flex 縦リスト (Carousel テンプレートに退化していないこと)。
+    expect(s).toContain('"type":"flex"');
+    expect(s).toContain('action=pkg1_region&value=brake');
+    expect(s).not.toContain('carousel');
     expect(sessionStep()).toBe('awaiting_region');
   });
 
