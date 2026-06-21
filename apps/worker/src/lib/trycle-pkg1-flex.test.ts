@@ -241,3 +241,89 @@ describe('cartSummaryText', () => {
     expect(text).toContain('チェーン交換');
   });
 });
+
+// ── Bubble 10KB 不変条件 (920ecff の port・実シードで再現) ─────────────────────
+//
+// LINE の 1 bubble = 10240 byte 上限を超えると reply が 400 で silent reject され、
+// safeReply が握り潰す → 利用者には「無反応」。実シード (REGIONS) の全分岐で、各
+// bubble (carousel の場合は各 column) が上限未満であることを assert する。合成データ
+// では bubble が小さく問題を見逃すため、必ず実シード全件で測る ([[feedback-verify-with-real-operation]])。
+
+const LINE_BUBBLE_LIMIT = 10240;
+
+/** FlexMessage 1 件の最大 bubble byte size (carousel なら最大 column)。 */
+function maxBubbleBytes(msg: unknown): number {
+  const m = msg as { contents?: { type?: string; contents?: unknown[] } };
+  const c = m.contents;
+  if (c?.type === 'carousel' && Array.isArray(c.contents)) {
+    return Math.max(...c.contents.map((b) => new TextEncoder().encode(JSON.stringify(b)).length));
+  }
+  return new TextEncoder().encode(JSON.stringify(c)).length;
+}
+
+describe('Bubble 10KB 不変条件 (実シード REGIONS 全分岐)', () => {
+  it('region 一覧 bubble は 10KB 未満', () => {
+    for (const msg of regionMessages(REGIONS)) {
+      expect(maxBubbleBytes(msg)).toBeLessThan(LINE_BUBBLE_LIMIT);
+    }
+  });
+
+  it('全 region の symptom 一覧 bubble が 10KB 未満 (carousel 分割込み)', () => {
+    for (const region of REGIONS) {
+      if (!region.symptoms) continue;
+      for (const msg of symptomMessages(region)) {
+        const bytes = maxBubbleBytes(msg);
+        expect(bytes, `symptom[${region.value}]`).toBeLessThan(LINE_BUBBLE_LIMIT);
+      }
+    }
+  });
+
+  it('全 symptom の variant 一覧 / qty bubble が 10KB 未満', () => {
+    for (const region of REGIONS) {
+      if (!region.symptoms) continue;
+      for (const symptom of region.symptoms) {
+        if (symptom.variants && symptom.variants.length > 0) {
+          for (const msg of variantMessages(symptom)) {
+            expect(maxBubbleBytes(msg), `variant[${region.value}/${symptom.label}]`).toBeLessThan(
+              LINE_BUBBLE_LIMIT,
+            );
+          }
+        }
+        if (symptom.qty) {
+          expect(maxBubbleBytes(qtyPrompt(symptom)), `qty[${region.value}/${symptom.label}]`).toBeLessThan(
+            LINE_BUBBLE_LIMIT,
+          );
+        }
+      }
+    }
+  });
+
+  it('confirm bubble (全 region から 1 件ずつの大きめカート) が 10KB 未満', () => {
+    const bigCart = REGIONS.flatMap((r) =>
+      (r.symptoms ?? []).slice(0, 1).map((s) =>
+        makeLineItem({ name: `${r.label} ${s.label}`, unitPrice: 5000, qty: 2 }),
+      ),
+    );
+    for (const msg of confirmMessages(bigCart)) {
+      expect(maxBubbleBytes(msg)).toBeLessThan(LINE_BUBBLE_LIMIT);
+    }
+  });
+
+  it('その他関係 (15 件) は単一 bubble を超え carousel に分割される', () => {
+    const otherParts = REGIONS.find((r) => r.value === 'other-parts')!;
+    const msgs = symptomMessages(otherParts);
+    const serialized = JSON.stringify(msgs);
+    expect(serialized).toContain('carousel');
+    // 全 column が上限未満。
+    for (const msg of msgs) {
+      expect(maxBubbleBytes(msg)).toBeLessThan(LINE_BUBBLE_LIMIT);
+    }
+  });
+
+  it('少数件の region 一覧は従来どおり単一 bubble (見た目不変)', () => {
+    // 9 部位 = 単一 bubble に収まる (carousel に退化しない)。
+    const msgs = regionMessages(REGIONS);
+    expect(msgs).toHaveLength(1);
+    expect(JSON.stringify(msgs)).not.toContain('carousel');
+  });
+});

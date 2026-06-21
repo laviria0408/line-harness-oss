@@ -35,6 +35,7 @@ import {
   buildSectionLabel,
   buildDivider,
   buildListBubble,
+  buildPaginatedListMessages,
   TEXT_PRIMARY,
   TEXT_MUTED,
   type FlexMessage,
@@ -105,40 +106,34 @@ export function dispatchPrompt(): LineMessage {
 // ── ② 部位 (region) 選択 — 9 部位 縦リスト (REQ-PKG1-004) ──────────────────────
 
 export function regionMessages(regions: ReadonlyArray<Region>): LineMessage[] {
-  const contents: object[] = [buildSectionLabel('🔧 お困りの部位を選んでください')];
-  regions.forEach((region, i) => {
-    contents.push(
-      buildTapRow({ icon: '▸', label: region.label, data: `action=pkg1_region&value=${region.value}` }),
-    );
-    if (i < regions.length - 1) contents.push(buildDivider());
+  const tapRows = regions.map((region) =>
+    buildTapRow({ icon: '▸', label: region.label, data: `action=pkg1_region&value=${region.value}` }),
+  );
+  // 10KB を超えるなら carousel に自動分割 (件数が増えても silent reject させない)。
+  return buildPaginatedListMessages({
+    altText: 'お困りの部位を選んでください',
+    headerTitle: 'お困りの部位',
+    headerSubtitle: '整備したい部位をお選びください',
+    leadingContents: [buildSectionLabel('🔧 お困りの部位を選んでください')],
+    tapRows,
   });
-  return [
-    buildListBubble({
-      altText: 'お困りの部位を選んでください',
-      headerTitle: 'お困りの部位',
-      headerSubtitle: '整備したい部位をお選びください',
-      contents,
-    }),
-  ];
 }
 
 // ── ③ 作業 (symptom) 選択 — region 配下を縦リスト (REQ-PKG1-005) ───────────────
 
 export function symptomMessages(region: Region): LineMessage[] {
   const symptoms = region.symptoms ?? [];
-  const contents: object[] = [buildSectionLabel(`${region.label} - 作業を選んでください`)];
-  symptoms.forEach((symptom, i) => {
-    contents.push(buildTapRow({ icon: '▸', label: symptom.label, data: `action=pkg1_symptom&value=${i}` }));
-    if (i < symptoms.length - 1) contents.push(buildDivider());
+  const tapRows = symptoms.map((symptom, i) =>
+    buildTapRow({ icon: '▸', label: symptom.label, data: `action=pkg1_symptom&value=${i}` }),
+  );
+  // 「その他関係」(15 件) 等で 1 bubble が 10KB に迫るため、必要なら carousel に自動分割。
+  return buildPaginatedListMessages({
+    altText: `${region.label}の作業メニュー`,
+    headerTitle: region.label,
+    headerSubtitle: '作業内容をお選びください',
+    leadingContents: [buildSectionLabel(`${region.label} - 作業を選んでください`)],
+    tapRows,
   });
-  return [
-    buildListBubble({
-      altText: `${region.label}の作業メニュー`,
-      headerTitle: region.label,
-      headerSubtitle: '作業内容をお選びください',
-      contents,
-    }),
-  ];
 }
 
 // ── 種類 (variant) 選択 — 排他別単価を縦リスト ────────────────────────────────
@@ -147,21 +142,17 @@ export function symptomMessages(region: Region): LineMessage[] {
 
 export function variantMessages(symptom: Symptom): LineMessage[] {
   const variants = symptom.variants ?? [];
-  const contents: object[] = [buildSectionLabel(`${symptom.label} - 種類を選んでください`)];
-  variants.forEach((variant, i) => {
-    contents.push(
-      buildTapRow({ icon: '▸', label: variantLabel(variant), data: `action=pkg1_variant&value=${i}` }),
-    );
-    if (i < variants.length - 1) contents.push(buildDivider());
+  const tapRows = variants.map((variant, i) =>
+    buildTapRow({ icon: '▸', label: variantLabel(variant), data: `action=pkg1_variant&value=${i}` }),
+  );
+  // variant は通常少数だが、件数が増えても 10KB を超えないよう carousel 自動分割に乗せる。
+  return buildPaginatedListMessages({
+    altText: `${symptom.label}の種類をお選びください`,
+    headerTitle: symptom.label,
+    headerSubtitle: '種類をお選びください',
+    leadingContents: [buildSectionLabel(`${symptom.label} - 種類を選んでください`)],
+    tapRows,
   });
-  return [
-    buildListBubble({
-      altText: `${symptom.label}の種類をお選びください`,
-      headerTitle: symptom.label,
-      headerSubtitle: '種類をお選びください',
-      contents,
-    }),
-  ];
 }
 
 /** sample=null (「その他」等) は確定額を出せないため店頭相談を明示する。 */
