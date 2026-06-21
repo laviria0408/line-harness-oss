@@ -24,6 +24,7 @@ import {
   getFaqById,
   incrementFaqCounter,
   type FaqRow,
+  type FaqLinkRow,
 } from './trycle-faq-repo.js';
 import type { TrycleRepoEnv } from './trycle-repo.js';
 
@@ -426,7 +427,60 @@ function buildSearchResultsBubble(query: string, faqs: FaqRow[]): FlexMessage {
   };
 }
 
-function buildAnswerBubble(faq: FaqRow): FlexMessage {
+/** LINE footer は縦に伸びすぎると見切れるため、リンクボタンは上位 N 件のみ表示する。 */
+const MAX_FAQ_LINK_BUTTONS = 3;
+
+/**
+ * REQ-PKG8-008: faq_links を LINE button に変換する。
+ * action_type='uri'      → 外部リンク (url 必須)
+ * action_type='postback' → bot 内遷移 (postback_data 必須)
+ * 不整合 (uri なのに url が null 等) な行は安全側で除外する。
+ */
+export function buildLinkButtons(links: FaqLinkRow[]): object[] {
+  const buttons: object[] = [];
+  for (const link of links) {
+    if (buttons.length >= MAX_FAQ_LINK_BUTTONS) break;
+    if (link.action_type === 'uri') {
+      if (!link.url) continue; // 不整合 (uri なのに url なし) は安全側で除外
+      buttons.push({
+        type: 'button',
+        style: 'secondary',
+        height: 'sm',
+        action: { type: 'uri', label: link.label, uri: link.url },
+      });
+      continue;
+    }
+    if (!link.postback_data) continue; // 不整合 (postback なのに data なし) は除外
+    buttons.push({
+      type: 'button',
+      style: 'secondary',
+      height: 'sm',
+      action: { type: 'postback', label: link.label, data: link.postback_data },
+    });
+  }
+  return buttons;
+}
+
+export function buildAnswerBubble(faq: FaqRow): FlexMessage {
+  const bodyContents: object[] = [
+    { type: 'text', text: faq.answer, size: 'sm', color: TEXT_PRIMARY, wrap: true },
+  ];
+  // REQ-PKG8-006: フォローアップ案内を回答の下に追記 (truthy なときのみ)。
+  if (faq.follow_up && faq.follow_up.trim() !== '') {
+    bodyContents.push(buildDivider());
+    bodyContents.push({
+      type: 'text',
+      text: faq.follow_up,
+      size: 'sm',
+      color: TEXT_MUTED,
+      wrap: true,
+      margin: 'md',
+    });
+  }
+
+  // REQ-PKG8-008: リンクボタンは [解決した][困った][戻る] の上に配置。
+  const linkButtons = buildLinkButtons(faq.links);
+
   return {
     type: 'flex',
     altText: faq.question,
@@ -454,9 +508,7 @@ function buildAnswerBubble(faq: FaqRow): FlexMessage {
         type: 'box',
         layout: 'vertical',
         paddingAll: 'lg',
-        contents: [
-          { type: 'text', text: faq.answer, size: 'sm', color: TEXT_PRIMARY, wrap: true },
-        ],
+        contents: bodyContents,
       },
       footer: {
         type: 'box',
@@ -464,6 +516,7 @@ function buildAnswerBubble(faq: FaqRow): FlexMessage {
         spacing: 'sm',
         paddingAll: 'lg',
         contents: [
+          ...linkButtons,
           {
             type: 'box',
             layout: 'horizontal',

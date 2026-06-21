@@ -12,6 +12,21 @@
 import { supabaseSelect, supabaseUpdate } from './supabase.js';
 import { getTenantId, type TrycleRepoEnv } from './trycle-repo.js';
 
+/**
+ * FAQ 回答に紐づくリンクボタン (REQ-PKG8-008)。
+ * action_type='uri'      → url を開く外部リンク
+ * action_type='postback' → postback_data で bot 内遷移
+ * 1 FAQ : N links。dashboard PWA の faq_links テーブル canonical。
+ */
+export interface FaqLinkRow {
+  readonly id: string;
+  readonly label: string;
+  readonly action_type: 'uri' | 'postback';
+  readonly url: string | null;
+  readonly postback_data: string | null;
+  readonly sort_order: number;
+}
+
 export interface FaqRow {
   readonly id: string;
   readonly tenant_id: string;
@@ -24,17 +39,38 @@ export interface FaqRow {
   readonly view_count: number;
   readonly helpful_count: number;
   readonly unhelpful_count: number;
+  /** REQ-PKG8-006: 回答の下に出すフォローアップ案内 (任意)。 */
+  readonly follow_up: string | null;
+  /** REQ-PKG8-008: 回答 Bubble の footer に出すリンクボタン群 (sort_order asc)。 */
+  readonly links: FaqLinkRow[];
 }
 
+const FAQ_LINK_COLUMNS = 'id,label,action_type,url,postback_data,sort_order';
+
 const FAQ_COLUMNS =
-  'id,tenant_id,question,answer,category,tags,sort_order,archived,view_count,helpful_count,unhelpful_count';
+  `id,tenant_id,question,answer,category,tags,sort_order,archived,view_count,helpful_count,unhelpful_count,follow_up,faq_links(${FAQ_LINK_COLUMNS})`;
+
+/**
+ * PostgREST の embed (`faq_links(...)`) は埋め込み行の order を別パラメータ
+ * (`faq_links.order`) で指定する必要があるが、共通 supabaseSelect は単一 order のみ
+ * 対応。件数が少ない (1 FAQ あたり最大数件) ため、取得後に JS で sort_order 昇順に
+ * 安定ソートして正規化する。links が未定義 (embed 失敗時) は空配列にフォールバック。
+ */
+function normalizeFaqRow(row: FaqRow): FaqRow {
+  const links = Array.isArray(row.links) ? row.links : [];
+  return {
+    ...row,
+    follow_up: row.follow_up ?? null,
+    links: [...links].sort((a, b) => a.sort_order - b.sort_order),
+  };
+}
 
 /**
  * active (archived=false) な FAQ を全件返す。category なしの行は末尾に並ぶ。
  * 件数は数十件規模を想定。スケールしてきたら category フィルタを追加する。
  */
 export async function listActiveFaqs(env: TrycleRepoEnv): Promise<FaqRow[]> {
-  return supabaseSelect<FaqRow>(
+  const rows = await supabaseSelect<FaqRow>(
     env,
     'faqs',
     {
@@ -47,6 +83,7 @@ export async function listActiveFaqs(env: TrycleRepoEnv): Promise<FaqRow[]> {
       limit: 500,
     },
   );
+  return rows.map(normalizeFaqRow);
 }
 
 /**
@@ -57,7 +94,7 @@ export async function listTopViewedFaqs(
   env: TrycleRepoEnv,
   limit: number = 3,
 ): Promise<FaqRow[]> {
-  return supabaseSelect<FaqRow>(
+  const rows = await supabaseSelect<FaqRow>(
     env,
     'faqs',
     {
@@ -70,6 +107,7 @@ export async function listTopViewedFaqs(
       limit,
     },
   );
+  return rows.map(normalizeFaqRow);
 }
 
 /**
@@ -105,7 +143,7 @@ export async function searchFaqs(
   if (q.length === 0) return [];
   const pattern = `*${q}*`;
   const orFilter = `(question.ilike.${pattern},answer.ilike.${pattern},tags_text.ilike.${pattern})`;
-  return supabaseSelect<FaqRow>(
+  const rows = await supabaseSelect<FaqRow>(
     env,
     'faqs',
     {
@@ -119,6 +157,7 @@ export async function searchFaqs(
       limit,
     },
   );
+  return rows.map(normalizeFaqRow);
 }
 
 export async function getFaqById(env: TrycleRepoEnv, id: string): Promise<FaqRow | null> {
@@ -131,7 +170,8 @@ export async function getFaqById(env: TrycleRepoEnv, id: string): Promise<FaqRow
     },
     { select: FAQ_COLUMNS, limit: 1 },
   );
-  return rows[0] ?? null;
+  const row = rows[0];
+  return row ? normalizeFaqRow(row) : null;
 }
 
 export type FaqCounterField = 'view_count' | 'helpful_count' | 'unhelpful_count';
