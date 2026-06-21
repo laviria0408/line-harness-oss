@@ -177,6 +177,12 @@ function lastReplyText(): string {
   return JSON.stringify(msgs);
 }
 
+// 全 reply (複数ターン分) を平坦化して JSON 文字列化する。
+// postback の action/value など、テキスト以外のフィールドも含めて検証したいときに使う。
+function lastReplyAny(): string {
+  return JSON.stringify(replied);
+}
+
 function sessionStep(): string | undefined {
   const s = tables.bot_sessions.find(
     (r) => r.line_user_id === USER && r.kind === 'pkg1_estimate',
