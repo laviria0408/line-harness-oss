@@ -536,11 +536,11 @@ async function handleReservationPostback(
 
 async function onStoreSelected(ctx: Pkg1Context, storeId: string | null): Promise<void> {
   const env = repoEnv(ctx);
-  if (!storeId) return;
+  if (!storeId) return reservationLost(ctx);
   const session = await getReservationSession(env, ctx.lineUserId);
-  if (!session) return;
+  if (!session) return reservationLost(ctx);
   const store = await findStoreById(env, storeId);
-  if (!store) return;
+  if (!store) return reservationLost(ctx);
   await setReservationSession(env, ctx.lineUserId, {
     ...session,
     step: 'awaiting_datetime',
@@ -555,11 +555,11 @@ async function onStoreSelected(ctx: Pkg1Context, storeId: string | null): Promis
 
 async function onDatetimeSelected(ctx: Pkg1Context, datetime: string | undefined): Promise<void> {
   const env = repoEnv(ctx);
-  if (!datetime) return;
+  if (!datetime) return reservationLost(ctx);
   const session = await getReservationSession(env, ctx.lineUserId);
-  if (!session?.storeId) return;
+  if (!session?.storeId) return reservationLost(ctx);
   const store = await findStoreById(env, session.storeId);
-  if (!store) return;
+  if (!store) return reservationLost(ctx);
 
   const visitAt = parseJstDatetime(datetime);
   if (!visitAt) {
@@ -588,12 +588,12 @@ async function onDatetimeSelected(ctx: Pkg1Context, datetime: string | undefined
 async function onReservationConfirmed(ctx: Pkg1Context, value: string | null): Promise<void> {
   const env = repoEnv(ctx);
   const session = await getReservationSession(env, ctx.lineUserId);
-  if (!session) return;
+  if (!session) return reservationLost(ctx);
 
   if (value === 'change') {
-    if (!session.storeId) return;
+    if (!session.storeId) return reservationLost(ctx);
     const store = await findStoreById(env, session.storeId);
-    if (!store) return;
+    if (!store) return reservationLost(ctx);
     await setReservationSession(env, ctx.lineUserId, { ...session, step: 'awaiting_datetime' });
     await safeReply(ctx, [textMessage('別の日時をお選びください。'), datetimePickerMessage(store)]);
     return;
@@ -601,6 +601,20 @@ async function onReservationConfirmed(ctx: Pkg1Context, value: string | null): P
   if (value !== 'ok') return;
 
   return finalizeReservation(ctx, session);
+}
+
+/**
+ * 来店予定 session が失効/不整合のときに「タップしても無反応」になるのを防ぐ
+ * graceful フォールバック。本物 reservation-flow は silent return だが、実機で
+ * 「選択肢が動かない」体験になるため、再開導線を必ず返す (REQ-PKG1 wiring 監査)。
+ */
+async function reservationLost(ctx: Pkg1Context): Promise<void> {
+  await safeReply(ctx, [
+    textMessage(
+      'ご来店予定の受付が一度リセットされました。\nお手数ですが、もう一度はじめからお選びください。',
+    ),
+    dispatchPrompt(),
+  ]);
 }
 
 /** 来店予定確定 → cases + quote_versions 保存 → PDF 発行 → LINE 共有。 */
