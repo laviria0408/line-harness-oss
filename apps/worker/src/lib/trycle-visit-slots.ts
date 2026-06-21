@@ -1,0 +1,132 @@
+/**
+ * 来店予定スロット生成 (REQ-PKG1-023・経路 D)。
+ *
+ * 整備は STORES 予約を受けず来店順対応のため、LINE 内で「営業時間内の来店予定
+ * (時刻のみ)」を postback chain でヒアリングする (設計 v1.1.1 §3 経路 C/D・§8)。
+ * trycle-store-hours.ts の validateVisitAt と対になる「候補生成」側。
+ *
+ * 出力は LINE datetimepicker と同じ "YYYY-MM-DDtHH:mm" (JST) 文字列で、
+ * postback data=pkg1_visit_<value> に載せる。validateVisitAt で再検証する。
+ */
+import type { StoreRow, Weekday } from './trycle-repo.js';
+
+const WEEKDAY_BY_INDEX: ReadonlyArray<Weekday> = [
+  'sun',
+  'mon',
+  'tue',
+  'wed',
+  'thu',
+  'fri',
+  'sat',
+];
+
+const LABEL_BY_WEEKDAY: Record<Weekday, string> = {
+  sun: '日',
+  mon: '月',
+  tue: '火',
+  wed: '水',
+  thu: '木',
+  fri: '金',
+  sat: '土',
+};
+
+/** 1 日あたり最大スロット数 (Bubble が縦に伸びすぎないよう制限)。 */
+const MAX_SLOTS_PER_DAY = 12;
+
+export interface VisitDay {
+  /** "YYYY-MM-DD" (JST)。 */
+  readonly date: string;
+  /** "6/25 (木)" 表示用。 */
+  readonly label: string;
+  readonly slots: VisitSlot[];
+}
+
+export interface VisitSlot {
+  /** "YYYY-MM-DDtHH:mm" (JST・postback / validateVisitAt 用)。 */
+  readonly value: string;
+  /** "14:30" 表示用。 */
+  readonly label: string;
+}
+
+function hhmmToMinutes(hhmm: string): number {
+  const [h, m] = hhmm.split(':').map((s) => Number.parseInt(s, 10));
+  return h * 60 + m;
+}
+
+function pad2(n: number): string {
+  return String(n).padStart(2, '0');
+}
+
+/**
+ * `from` (JST 基準の Date) から `days` 日先までの営業日 × 営業時間内スロットを返す。
+ * 当日分は now 以降のスロットのみ含める (過ぎた時刻は出さない)。定休日はスキップ。
+ *
+ * @param store         営業時間 / slot 刻みを持つ店舗
+ * @param fromJst       基準時刻 (JST 壁時計を UTC フィールドに持たせた Date)
+ * @param days          先読みする日数 (既定 7)
+ */
+export function generateVisitDays(
+  store: StoreRow,
+  fromJst: Date,
+  days = 7,
+): VisitDay[] {
+  const result: VisitDay[] = [];
+  const slotMinutes = store.reservation_slot_minutes > 0
+    ? store.reservation_slot_minutes
+    : 30;
+
+  for (let offset = 0; offset < days; offset += 1) {
+    const day = new Date(fromJst.getTime());
+    day.setUTCDate(day.getUTCDate() + offset);
+    const weekday = WEEKDAY_BY_INDEX[day.getUTCDay()];
+    const hours = store.business_hours[weekday];
+    if (!hours || hours.length === 0) continue; // 定休日
+
+    const [openStr, closeStr] = hours;
+    const openMin = hhmmToMinutes(openStr);
+    const closeMin = hhmmToMinutes(closeStr);
+    const y = day.getUTCFullYear();
+    const mo = day.getUTCMonth() + 1;
+    const d = day.getUTCDate();
+    const dateStr = `${y}-${pad2(mo)}-${pad2(d)}`;
+
+    // 当日は現在時刻以降のみ (次の slot 境界に切り上げ)。
+    let startMin = openMin;
+    if (offset === 0) {
+      const nowMin = fromJst.getUTCHours() * 60 + fromJst.getUTCMinutes();
+      if (nowMin >= openMin) {
+        const next = Math.ceil(nowMin / slotMinutes) * slotMinutes;
+        startMin = Math.max(openMin, next);
+      }
+    }
+
+    const slots: VisitSlot[] = [];
+    for (let min = startMin; min < closeMin; min += slotMinutes) {
+      if (slots.length >= MAX_SLOTS_PER_DAY) break;
+      const hh = Math.floor(min / 60);
+      const mm = min % 60;
+      const timeLabel = `${pad2(hh)}:${pad2(mm)}`;
+      slots.push({
+        value: `${dateStr}t${timeLabel}`,
+        label: timeLabel,
+      });
+    }
+    if (slots.length === 0) continue;
+
+    result.push({
+      date: dateStr,
+      label: `${mo}/${d} (${LABEL_BY_WEEKDAY[weekday]})`,
+      slots,
+    });
+  }
+  return result;
+}
+
+/**
+ * JST の「今」を、UTC フィールドに JST 壁時計を載せた Date として返す
+ * (trycle-store-hours.parseJstDatetime と同じ表現)。Worker は UTC で動くため
+ * +9h して UTC フィールドに格納する。
+ */
+export function nowJst(now: Date = new Date()): Date {
+  return new Date(now.getTime() + 9 * 60 * 60 * 1000);
+}

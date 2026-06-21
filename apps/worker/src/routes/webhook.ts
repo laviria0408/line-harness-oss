@@ -24,6 +24,8 @@ import type { EntryRoute, Friend } from '@line-crm/db';
 import { fireEvent } from '../services/event-bus.js';
 import { buildMessage, expandVariables } from '../services/step-delivery.js';
 import { tryHandleTryclePostback } from '../lib/trycle-postback.js';
+import { isManualMode, clearManualMode } from '../lib/trycle-session.js';
+import type { TrycleRepoEnv } from '../lib/trycle-repo.js';
 import type { Env } from '../index.js';
 
 const webhook = new Hono<Env>();
@@ -392,6 +394,13 @@ async function handleEvent(
     // src/lib/trycle-postback.ts. If consumed, we still log it below.
     const replyTokenForTrycle = (event as unknown as { replyToken?: string }).replyToken;
     if (replyTokenForTrycle && workerEnv) {
+      // REQ-PKG1-024: リッチメニュー等の bot 操作を押したら有人モードを解除し
+      // bot 応答へ復帰する (整備見積/FAQ の入口・メニュー postback)。
+      if (postbackData === 'pkg1_start' || postbackData === 'faq_start' || postbackData === 'pkg8_start') {
+        await clearManualMode(workerEnv as TrycleRepoEnv, userId).catch((err) => {
+          console.error('Failed to clear manual mode', err);
+        });
+      }
       const handled = await tryHandleTryclePostback(postbackData, {
         replyToken: replyTokenForTrycle,
         lineUserId: userId,
@@ -570,6 +579,13 @@ async function handleEvent(
       )
       .bind(logId, friend.id, incomingText, now)
       .run();
+
+    // REQ-PKG1-024 有人モード: スタッフ対応中は bot 自動応答を抑止する。
+    // 受信ログ (上) は記録済。chat を unread にしてスタッフに気づかせて return。
+    if (workerEnv && (await isManualMode(workerEnv, userId))) {
+      await upsertChatOnMessage(db, friend.id);
+      return;
+    }
 
     // Cross-account trigger: send message from another account via UUID
     if (incomingText === '体験を完了する' && lineAccountId) {

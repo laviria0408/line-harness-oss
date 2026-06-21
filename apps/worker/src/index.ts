@@ -125,6 +125,9 @@ export type Env = {
     SUPABASE_SERVICE_ROLE_KEY?: string;
     TRYCLE_TENANT_ID?: string;
     GAS_WEB_APP_URL?: string;
+    // Pkg1 整備見積 (Step 4-7)。LIFF 同意書 URL・スタッフ通知先 Gmail。
+    LIFF_CONSENT_URL?: string;
+    GMAIL_NOTIFICATION_TO?: string;
   };
   Variables: {
     staff: { id: string; name: string; role: 'owner' | 'admin' | 'staff' };
