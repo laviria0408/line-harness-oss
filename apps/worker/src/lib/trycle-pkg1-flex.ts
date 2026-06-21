@@ -1,691 +1,414 @@
 /**
- * TRYCLE Pkg1 (整備見積) Flex Bubble builders.
+ * TRYCLE Pkg1 (整備見積) メッセージ builders (本物モデル・状態を持たない純関数)。
  *
- * Pkg8 (trycle-pkg8.ts) の縦リスト Bubble パターンを流用し、経路 A〜D の各画面を
- * 純関数で組む (LineClient 不要 = テスト容易)。色・余白は Pkg8 と揃える。
+ * 本物 trycle-line-harness/src/flows/pkg1-messages.ts + reservation-flow.ts の
+ * presentation 層を port:
+ *   dispatchPrompt / regionMessages (9 部位 Carousel) / symptomMessages (3/列 Carousel)
+ *   / variantMessages (≤4 Buttons / ≥5 Carousel) / qtyPrompt (pair/count・v1.2.1 で
+ *   3 本以上ボタン削除) / cartDecisionPrompt / confirmMessages (PDF だけ / 来店予定 /
+ *   やり直す) / cartSummaryText / consentPrompt (LIFF URI) / storeCarousel /
+ *   datetimePickerMessage / reservationConfirmPrompt。
  *
- * 設計: Pkg1 詳細設計 v1.1.1 §3 (page 386050ad6a7e81f8b701cd52c9201af6)。
+ * postback 命名は本物 `pkg1_X&value=Y` 形式 (設計 v1.2.1 §3)。
+ * LINE テンプレート制約: Buttons actions ≤ 4 / Carousel columns ≤ 10 /
+ * Carousel column の actions ≤ 3。
+ *
+ * 設計: Pkg1 詳細設計 v1.2.1 §3 (page 386050ad6a7e81f8b701cd52c9201af6)。
  */
-import { formatYen, type Quote } from './quote.js';
-import type { CartItem } from './trycle-session.js';
-import type { Pkg1LaborEntry } from './trycle-pkg1-repo.js';
-import type { LaborOption } from './trycle-repo.js';
-import type { VisitDay } from './trycle-visit-slots.js';
+import type { Region, Symptom, Variant } from '../data/pkg1-regions.js';
+import { buildQuote, formatQuoteText, type QuoteLineItem } from './quote.js';
+import type { StoreRow } from './trycle-repo.js';
 
-const TRYCLE_GREEN = '#06C755';
-const TEXT_PRIMARY = '#1e293b';
-const TEXT_MUTED = '#64748b';
-const ACCENT = '#0f766e';
-const DIVIDER_COLOR = '#e2e8f0';
-
-export interface FlexMessage {
-  readonly type: 'flex';
-  readonly altText: string;
-  readonly contents: object;
+// LINE メッセージ最小型 (LineClient へ渡す配列要素)。本物の messagingApi 互換。
+export interface LineMessage {
+  readonly type: string;
+  readonly [key: string]: unknown;
 }
 
-/**
- * カテゴリ表示名 (DB は英語 code・UI は日本語)。未知 code は raw を返す。
- * canonical な日本語名は将来 labor_categories マスタ化候補 (現状はここで吸収)。
- *
- * labor_master.category の canonical 14 code を全て登録する
- * (db-seeds/labor-master.json と一致・raw な英語 code が UI に出る指摘 1 の修正)。
- * 日本語訳は各カテゴリの代表メニュー名 (seed) から起こす。
- * 旧エイリアス (bottom / headset / cable …) は後方互換で残す (既存挙動を壊さない)。
- */
-const CATEGORY_LABELS: Record<string, string> = {
-  // ── canonical 14 (labor_master.category) ─────────────────────────────
-  brake: 'ブレーキ',
-  shift: '変速・シフト',
-  tire: 'タイヤ・チューブ',
-  wheel: 'ホイール・振れ取り',
-  hub: 'ハブ・ベアリング',
-  fork: 'フォーク・コラム',
-  head: 'ヘッド・ヘッドセット',
-  drivetrain: '駆動系 (チェーン/クランク)',
-  cockpit: 'ハンドル・ステム',
-  overhaul: 'オーバーホール',
-  component: 'コンポーネント組付け',
-  build: '完成車組み立て',
-  frame: 'フレーム・パーツ脱着',
-  other: 'その他',
-  // ── 後方互換エイリアス (旧 code・seed には無いが既存挙動維持) ────────────
-  bottom: 'BB・クランク',
-  'bottom-bracket': 'BB・クランク',
-  headset: 'ヘッド・ヘッドセット',
-  cable: 'ケーブル・ワイヤー',
-  assembly: 'コンポーネント組付け',
-  cleaning: '洗車・クリーニング',
-  general: 'その他・点検',
-};
+export const MAX_REPLY_MESSAGES = 5;
+const BUTTONS_MAX_ACTIONS = 4;
+const CAROUSEL_MAX_COLUMNS = 10;
+const CAROUSEL_ACTIONS_PER_COLUMN = 3;
 
-export function categoryLabel(category: string): string {
-  return CATEGORY_LABELS[category] ?? category;
-}
-
-// ── 共通パーツ ────────────────────────────────────────────────────────────────
-
-interface TapRow {
-  icon: string;
-  label: string;
-  data: string;
-  sub?: string;
-}
-
-function buildTapRow(row: TapRow): object {
-  const main: object[] = [
-    { type: 'text', text: row.icon, size: 'md', flex: 0 },
-    {
-      type: 'text',
-      text: row.label,
-      size: 'md',
-      color: TEXT_PRIMARY,
-      wrap: true,
-      flex: 1,
-      weight: 'regular',
-    },
-    { type: 'text', text: '›', size: 'lg', color: TEXT_MUTED, flex: 0, align: 'end' },
-  ];
-  return {
-    type: 'box',
-    layout: 'horizontal',
-    spacing: 'sm',
-    paddingTop: 'md',
-    paddingBottom: 'md',
-    paddingStart: 'md',
-    paddingEnd: 'md',
-    action: { type: 'postback', label: clampLabel(row.label), data: row.data },
-    contents: row.sub
-      ? [
-          {
-            type: 'box',
-            layout: 'vertical',
-            flex: 1,
-            spacing: 'xs',
-            contents: [
-              { type: 'text', text: row.label, size: 'md', color: TEXT_PRIMARY, wrap: true },
-              { type: 'text', text: row.sub, size: 'xs', color: TEXT_MUTED, wrap: true },
-            ],
-          },
-          { type: 'text', text: '›', size: 'lg', color: TEXT_MUTED, flex: 0, align: 'end' },
-        ]
-      : main,
-  };
-}
-
-function buildSectionLabel(text: string): object {
-  return {
-    type: 'box',
-    layout: 'vertical',
-    paddingTop: 'md',
-    paddingBottom: 'sm',
-    paddingStart: 'md',
-    paddingEnd: 'md',
-    contents: [{ type: 'text', text, size: 'sm', color: TEXT_MUTED, weight: 'bold' }],
-  };
-}
-
-function buildDivider(): object {
-  return { type: 'separator', color: DIVIDER_COLOR };
-}
-
-function header(title: string, subtitle?: string): object {
-  const contents: object[] = [
-    { type: 'text', text: title, size: 'lg', weight: 'bold', color: '#ffffff', wrap: true },
-  ];
-  if (subtitle) {
-    contents.push({ type: 'text', text: subtitle, size: 'sm', color: '#ffffff', margin: 'xs', wrap: true });
-  }
-  return {
-    type: 'box',
-    layout: 'vertical',
-    paddingAll: 'lg',
-    backgroundColor: TRYCLE_GREEN,
-    contents,
-  };
-}
-
-/** LINE postback label は 20 文字上限。超過は切り詰める。 */
-function clampLabel(label: string): string {
-  return label.length > 20 ? label.slice(0, 19) + '…' : label;
-}
-
-// ── 経路 A: 入口 3 択 (REQ-PKG1-002) ─────────────────────────────────────────
-//
-// 状況ふりわけ 3 択。本物 (trycle-line-harness pkg1-messages.ts / pkg1-estimate.ts)
-// の DISPATCH_LABELS と分岐に忠実:
-//   identified    原因特定済み      → 正規見積ルート (経路 B カテゴリ選択へ)
-//   comprehensive 包括メンテしたい  → 現物確認が必要なためスタッフ相談誘導 (経路 B に進めない)
-//   unknown       原因がわからない  → 同上スタッフ相談誘導
-// postback value は本物の `pkg1_dispatch&value=<key>` を OSS の prefix 規約に合わせ
-// `pkg1_dispatch_<key>` で表現する (UI の見た目・タップ行構造は維持)。
-
-export type Pkg1Dispatch = 'identified' | 'comprehensive' | 'unknown';
+export type Dispatch = 'identified' | 'comprehensive' | 'unknown';
 
 /** 状況ふりわけ 3 択のラベル (本物 DISPATCH_LABELS と一致・文言厳守)。 */
-export const DISPATCH_LABELS: Readonly<Record<Pkg1Dispatch, string>> = {
+export const DISPATCH_LABELS: Readonly<Record<Dispatch, string>> = {
   identified: '原因特定済み',
   comprehensive: '包括メンテしたい',
   unknown: '原因がわからない',
 };
 
-export function buildEntryBubble(): FlexMessage {
-  const contents: object[] = [
-    buildSectionLabel('まず、いまの状況に近いものをお選びください'),
-    buildTapRow({
-      icon: '🛠',
-      label: DISPATCH_LABELS.identified,
-      sub: '交換・調整したい箇所がもう分かっている',
-      data: 'pkg1_dispatch_identified',
-    }),
-    buildDivider(),
-    buildTapRow({
-      icon: '🔧',
-      label: DISPATCH_LABELS.comprehensive,
-      sub: '全体をまとめて点検・整備してほしい',
-      data: 'pkg1_dispatch_comprehensive',
-    }),
-    buildDivider(),
-    buildTapRow({
-      icon: '🔍',
-      label: DISPATCH_LABELS.unknown,
-      sub: '不調だけど原因が分からない・点検してほしい',
-      data: 'pkg1_dispatch_unknown',
-    }),
-  ];
+// ── 共通 ─────────────────────────────────────────────────────────────────────
+
+/** LINE のボタン label は 20 文字上限。超過は切り詰める。 */
+export function truncateLabel(label: string, max = 20): string {
+  return label.length > max ? `${label.slice(0, max - 1)}…` : label;
+}
+
+export function textMessage(text: string): LineMessage {
+  return { type: 'text', text };
+}
+
+// ── ① 状況ふりわけ 3 択 (REQ-PKG1-002) ───────────────────────────────────────
+
+export function dispatchPrompt(): LineMessage {
   return {
-    type: 'flex',
+    type: 'template',
     altText: '整備のご相談・状況をお選びください',
-    contents: {
-      type: 'bubble',
-      size: 'giga',
-      header: header('整備見積もり', '状況を下から選んでね'),
-      body: { type: 'box', layout: 'vertical', spacing: 'none', paddingAll: 'none', contents },
+    template: {
+      type: 'buttons',
+      title: '整備見積もり',
+      text: 'まず、いまの状況に近いものをお選びください。',
+      actions: (Object.keys(DISPATCH_LABELS) as Dispatch[]).map((key) => ({
+        type: 'postback',
+        label: DISPATCH_LABELS[key],
+        data: `action=pkg1_dispatch&value=${key}`,
+        displayText: DISPATCH_LABELS[key],
+      })),
     },
   };
 }
 
-// ── 経路 B: カテゴリ選択 (REQ-PKG1-004) ──────────────────────────────────────
+// ── ② 部位 (region) 選択 — 9 部位 Carousel (REQ-PKG1-004) ─────────────────────
 
-export function buildCategoryBubble(categories: ReadonlyArray<string>): FlexMessage {
-  const contents: object[] = [buildSectionLabel('整備カテゴリ')];
-  for (const cat of categories) {
-    contents.push(buildTapRow({ icon: '▸', label: categoryLabel(cat), data: `pkg1_cat_${cat}` }));
-    contents.push(buildDivider());
-  }
-  contents.push(buildTapRow({ icon: '💬', label: '一覧にない / スタッフに相談', data: 'pkg1_staff_consult' }));
-  return {
-    type: 'flex',
-    altText: '整備カテゴリを選択',
-    contents: {
-      type: 'bubble',
-      size: 'giga',
-      header: header('整備カテゴリ', '見積もりたい箇所を選んでね'),
-      body: { type: 'box', layout: 'vertical', spacing: 'none', paddingAll: 'none', contents },
-    },
-  };
-}
-
-// ── 経路 B: メニュー (labor) 選択 (REQ-PKG1-005/006) ──────────────────────────
-
-export function buildLaborListBubble(
-  category: string,
-  labors: ReadonlyArray<Pkg1LaborEntry>,
-): FlexMessage {
-  const contents: object[] = [buildSectionLabel(categoryLabel(category))];
-  for (const labor of labors) {
-    contents.push(
-      buildTapRow({
-        icon: '▸',
-        label: labor.name,
-        sub: priceLabel(labor),
-        data: `pkg1_labor_${labor.id}`,
-      }),
-    );
-    contents.push(buildDivider());
-  }
-  contents.push(buildTapRow({ icon: '←', label: 'カテゴリへ戻る', data: 'pkg1_categories' }));
-  return {
-    type: 'flex',
-    altText: `${categoryLabel(category)} のメニュー`,
-    contents: {
-      type: 'bubble',
-      size: 'giga',
-      header: header(categoryLabel(category), `${labors.length} 件のメニュー`),
-      body: { type: 'box', layout: 'vertical', spacing: 'none', paddingAll: 'none', contents },
-    },
-  };
-}
-
-/** 工賃の価格表示文字列 (range / open-ended に対応)。 */
-export function priceLabel(labor: Pkg1LaborEntry): string {
-  if (labor.price_open_ended) {
-    return `${formatYen(labor.price)}〜`;
-  }
-  if (labor.price_max != null && labor.price_max !== labor.price) {
-    return `${formatYen(labor.price)}〜${formatYen(labor.price_max)}`;
-  }
-  return formatYen(labor.price);
-}
-
-// ── 経路 B: variant (labor_options) 選択 (REQ-PKG1-005) ───────────────────────
-
-export function buildVariantBubble(
-  labor: Pkg1LaborEntry,
-  options: ReadonlyArray<LaborOption>,
-): FlexMessage {
-  const contents: object[] = [
-    buildSectionLabel('追加オプション (任意・複数選択可)'),
-  ];
-  for (const opt of options) {
-    contents.push(
-      buildTapRow({
-        icon: '＋',
-        label: opt.name,
-        sub: `+${formatYen(opt.price)}`,
-        data: `pkg1_opt_${labor.id}_${opt.id}`,
-      }),
-    );
-    contents.push(buildDivider());
-  }
-  contents.push(
-    buildTapRow({ icon: '🛒', label: 'オプションなしでカートに追加', data: `pkg1_add_${labor.id}` }),
-  );
-  return {
-    type: 'flex',
-    altText: `${labor.name} のオプション`,
-    contents: {
-      type: 'bubble',
-      size: 'giga',
-      header: header(labor.name, priceLabel(labor)),
-      body: { type: 'box', layout: 'vertical', spacing: 'none', paddingAll: 'none', contents },
-    },
-  };
-}
-
-// ── 経路 B: カート確認 (REQ-PKG1-008/021) ────────────────────────────────────
-
-export function buildCartBubble(cart: ReadonlyArray<CartItem>): FlexMessage {
-  const itemBoxes: object[] = [];
-  let subtotal = 0;
-  for (const item of cart) {
-    const lineTotal = (item.unit_price + item.option_total) * item.qty;
-    subtotal += lineTotal;
-    const sub = item.option_names.length > 0 ? `+ ${item.option_names.join(' / ')}` : undefined;
-    const rowContents: object[] = [
+export function regionMessages(regions: ReadonlyArray<Region>): LineMessage[] {
+  const columns = regions.slice(0, CAROUSEL_MAX_COLUMNS).map((region) => ({
+    title: truncateLabel(region.label, 40),
+    text: '整備したい部位',
+    actions: [
       {
-        type: 'box',
-        layout: 'vertical',
-        flex: 1,
-        spacing: 'xs',
-        contents: [
-          {
-            type: 'text',
-            text: item.qty > 1 ? `${item.name} ×${item.qty}` : item.name,
-            size: 'sm',
-            color: TEXT_PRIMARY,
-            wrap: true,
-          },
-          ...(sub ? [{ type: 'text', text: sub, size: 'xs', color: TEXT_MUTED, wrap: true }] : []),
-        ],
-      },
-      { type: 'text', text: formatYen(lineTotal), size: 'sm', color: TEXT_PRIMARY, align: 'end', flex: 0 },
-    ];
-    itemBoxes.push({
-      type: 'box',
-      layout: 'horizontal',
-      paddingAll: 'md',
-      spacing: 'sm',
-      contents: rowContents,
-    });
-    itemBoxes.push(buildDivider());
-  }
-
-  return {
-    type: 'flex',
-    altText: 'カートの内容',
-    contents: {
-      type: 'bubble',
-      size: 'giga',
-      header: header('カート', `${cart.length} 品目`),
-      body: {
-        type: 'box',
-        layout: 'vertical',
-        spacing: 'none',
-        paddingAll: 'none',
-        contents: [
-          ...itemBoxes,
-          {
-            type: 'box',
-            layout: 'horizontal',
-            paddingAll: 'md',
-            contents: [
-              { type: 'text', text: '小計 (税抜)', size: 'sm', color: TEXT_MUTED, flex: 1 },
-              { type: 'text', text: formatYen(subtotal), size: 'sm', weight: 'bold', color: TEXT_PRIMARY, align: 'end' },
-            ],
-          },
-        ],
-      },
-      footer: {
-        type: 'box',
-        layout: 'vertical',
-        spacing: 'sm',
-        paddingAll: 'lg',
-        contents: [
-          {
-            type: 'button',
-            style: 'secondary',
-            height: 'sm',
-            action: { type: 'postback', label: '＋ 他の整備を追加', data: 'pkg1_categories' },
-          },
-          {
-            type: 'button',
-            style: 'primary',
-            color: TRYCLE_GREEN,
-            height: 'sm',
-            action: { type: 'postback', label: '見積もりを確認', data: 'pkg1_confirm' },
-          },
-        ],
-      },
-    },
-  };
-}
-
-// ── 経路 C: 見積 Bubble (REQ-PKG1-009/010/011) ───────────────────────────────
-
-export function buildEstimateBubble(
-  quote: Quote,
-  partsNotice: string,
-): FlexMessage {
-  const itemRows: object[] = [];
-  for (const li of quote.lineItems) {
-    const priceStr =
-      li.amountMax != null && li.amountMax !== li.amount
-        ? `${formatYen(li.amount)}〜${formatYen(li.amountMax)}`
-        : formatYen(li.amount);
-    itemRows.push({
-      type: 'box',
-      layout: 'horizontal',
-      paddingAll: 'sm',
-      spacing: 'sm',
-      contents: [
-        {
-          type: 'text',
-          text: li.qty > 1 ? `${li.name} ×${li.qty}` : li.name,
-          size: 'sm',
-          color: TEXT_PRIMARY,
-          wrap: true,
-          flex: 1,
-        },
-        { type: 'text', text: priceStr, size: 'sm', color: TEXT_PRIMARY, align: 'end', flex: 0 },
-      ],
-    });
-  }
-
-  const totalStr =
-    quote.totalMax !== quote.total
-      ? `${formatYen(quote.total)}〜${formatYen(quote.totalMax)}`
-      : formatYen(quote.total);
-  const subtotalStr =
-    quote.subtotalMax !== quote.subtotal
-      ? `${formatYen(quote.subtotal)}〜${formatYen(quote.subtotalMax)}`
-      : formatYen(quote.subtotal);
-
-  return {
-    type: 'flex',
-    altText: 'お見積もり (概算)',
-    contents: {
-      type: 'bubble',
-      size: 'giga',
-      header: {
-        type: 'box',
-        layout: 'vertical',
-        paddingAll: 'lg',
-        backgroundColor: ACCENT,
-        contents: [
-          { type: 'text', text: '【 概算 】お見積もり', size: 'xl', weight: 'bold', color: '#ffffff' },
-          {
-            type: 'text',
-            text: '正式なお見積もりは現車確認後にご案内します',
-            size: 'xs',
-            color: '#ffffff',
-            margin: 'sm',
-            wrap: true,
-          },
-        ],
-      },
-      body: {
-        type: 'box',
-        layout: 'vertical',
-        spacing: 'none',
-        paddingAll: 'none',
-        contents: [
-          ...itemRows,
-          buildDivider(),
-          summaryRow('小計', subtotalStr, false),
-          summaryRow(`消費税 (10%)`, formatYen(quote.tax), false),
-          summaryRow('合計 (税込)', totalStr, true),
-          buildDivider(),
-          {
-            type: 'box',
-            layout: 'vertical',
-            paddingAll: 'md',
-            spacing: 'sm',
-            contents: [
-              { type: 'text', text: '※ 状況により変動する場合があります', size: 'xs', color: TEXT_MUTED, wrap: true },
-              { type: 'text', text: partsNotice, size: 'xs', color: TEXT_MUTED, wrap: true },
-            ],
-          },
-        ],
-      },
-      // 確認後 3 択 (本物 pkg1-messages.confirmMessages に忠実・指摘 3):
-      //   PDF だけ受け取る → 連絡先/同意書なしで PDF 発行して終了 (pkg1_pdf_only)
-      //   ご来店予定を伝える → 同意書ゲート → 来店日時 → cases → PDF/Drive/Gmail
-      //   スタッフに相談する → notifyStaff (会話ログ + 見積サマリ同梱)
-      footer: {
-        type: 'box',
-        layout: 'vertical',
-        spacing: 'sm',
-        paddingAll: 'lg',
-        contents: [
-          {
-            type: 'button',
-            style: 'primary',
-            color: TRYCLE_GREEN,
-            height: 'sm',
-            action: { type: 'postback', label: 'PDF だけ受け取る', data: 'pkg1_pdf_only' },
-          },
-          {
-            type: 'button',
-            style: 'secondary',
-            height: 'sm',
-            action: { type: 'postback', label: 'ご来店予定を伝える', data: 'pkg1_visit_start' },
-          },
-          {
-            type: 'button',
-            style: 'secondary',
-            height: 'sm',
-            action: { type: 'postback', label: 'スタッフに相談する', data: 'pkg1_staff_estimate' },
-          },
-        ],
-      },
-    },
-  };
-}
-
-function summaryRow(label: string, value: string, emphasize: boolean): object {
-  return {
-    type: 'box',
-    layout: 'horizontal',
-    paddingTop: 'sm',
-    paddingBottom: 'sm',
-    paddingStart: 'md',
-    paddingEnd: 'md',
-    contents: [
-      {
-        type: 'text',
-        text: label,
-        size: emphasize ? 'md' : 'sm',
-        color: emphasize ? TEXT_PRIMARY : TEXT_MUTED,
-        weight: emphasize ? 'bold' : 'regular',
-        flex: 1,
-      },
-      {
-        type: 'text',
-        text: value,
-        size: emphasize ? 'lg' : 'sm',
-        color: emphasize ? ACCENT : TEXT_PRIMARY,
-        weight: emphasize ? 'bold' : 'regular',
-        align: 'end',
+        type: 'postback',
+        label: '選ぶ',
+        data: `action=pkg1_region&value=${region.value}`,
+        displayText: region.label,
       },
     ],
-  };
-}
-
-// ── 経路 D: 同意書ゲート (REQ-PKG1-016) ───────────────────────────────────────
-
-export function buildConsentPromptBubble(liffUrl: string): FlexMessage {
-  return {
-    type: 'flex',
-    altText: '整備同意書のご確認',
-    contents: {
-      type: 'bubble',
-      size: 'mega',
-      header: header('整備同意書', 'ご来店前にご確認ください'),
-      body: {
-        type: 'box',
-        layout: 'vertical',
-        paddingAll: 'lg',
-        spacing: 'md',
-        contents: [
-          {
-            type: 'text',
-            text: '整備のご依頼にあたり、作業内容・料金・個人情報の取り扱いについて同意書のご確認をお願いします。',
-            size: 'sm',
-            color: TEXT_PRIMARY,
-            wrap: true,
-          },
-          {
-            type: 'text',
-            text: '※ 同意は 1 年間有効です。',
-            size: 'xs',
-            color: TEXT_MUTED,
-            wrap: true,
-          },
-        ],
-      },
-      footer: {
-        type: 'box',
-        layout: 'vertical',
-        paddingAll: 'lg',
-        contents: [
-          {
-            type: 'button',
-            style: 'primary',
-            color: TRYCLE_GREEN,
-            height: 'sm',
-            action: { type: 'uri', label: '同意書を確認する', uri: liffUrl },
-          },
-        ],
-      },
+  }));
+  return [
+    {
+      type: 'template',
+      altText: '整備したい部位をお選びください',
+      template: { type: 'carousel', columns },
     },
-  };
+  ];
 }
 
-// ── 経路 D: 来店予定日選択 / 時刻選択 (REQ-PKG1-023) ──────────────────────────
+// ── ③ 作業 (symptom) 選択 — Carousel に分割 (column ごとに 3 ボタン) ─────────────
 
-export function buildVisitDayBubble(days: ReadonlyArray<VisitDay>): FlexMessage {
-  const contents: object[] = [buildSectionLabel('ご来店予定日 (来店順対応・予約ではありません)')];
-  for (const day of days) {
-    contents.push(buildTapRow({ icon: '📅', label: day.label, data: `pkg1_visit_day_${day.date}` }));
-    contents.push(buildDivider());
+export function symptomMessages(region: Region): LineMessage[] {
+  const symptoms = region.symptoms ?? [];
+  const columns: object[] = [];
+  for (let i = 0; i < symptoms.length; i += CAROUSEL_ACTIONS_PER_COLUMN) {
+    const chunk = symptoms.slice(i, i + CAROUSEL_ACTIONS_PER_COLUMN);
+    columns.push({
+      title: truncateLabel(region.label, 40),
+      text: '作業メニューをお選びください',
+      actions: chunk.map((symptom, j) => symptomAction(symptom, i + j)),
+    });
+    if (columns.length >= CAROUSEL_MAX_COLUMNS) break;
   }
-  return {
-    type: 'flex',
-    altText: 'ご来店予定日を選択',
-    contents: {
-      type: 'bubble',
-      size: 'giga',
-      header: header('ご来店予定', '来店予定日を選んでね'),
-      body: { type: 'box', layout: 'vertical', spacing: 'none', paddingAll: 'none', contents },
+  return [
+    {
+      type: 'template',
+      altText: `${region.label}の作業メニュー`,
+      template: { type: 'carousel', columns },
     },
+  ];
+}
+
+function symptomAction(symptom: Symptom, index: number): object {
+  return {
+    type: 'postback',
+    label: truncateLabel(symptom.label),
+    data: `action=pkg1_symptom&value=${index}`,
+    displayText: symptom.label,
   };
 }
 
-export function buildVisitTimeBubble(day: VisitDay): FlexMessage {
-  const rows: object[] = [];
-  // 時刻ボタンは 2 列グリッドで配置する。
-  for (let i = 0; i < day.slots.length; i += 2) {
-    const pair = day.slots.slice(i, i + 2);
-    rows.push({
-      type: 'box',
-      layout: 'horizontal',
-      spacing: 'sm',
-      paddingStart: 'md',
-      paddingEnd: 'md',
-      paddingTop: 'sm',
-      paddingBottom: 'sm',
-      contents: pair.map((slot) => ({
-        type: 'button',
-        style: 'secondary',
-        height: 'sm',
-        flex: 1,
-        action: { type: 'postback', label: slot.label, data: `pkg1_visit_at_${slot.value}` },
-      })),
+// ── 種類 (variant) 選択 — 4 件以下 Buttons / 5 件以上 Carousel ──────────────────
+
+export function variantMessages(symptom: Symptom): LineMessage[] {
+  const variants = symptom.variants ?? [];
+  if (variants.length <= BUTTONS_MAX_ACTIONS) {
+    return [
+      {
+        type: 'template',
+        altText: `${symptom.label}の種類をお選びください`,
+        template: {
+          type: 'buttons',
+          title: truncateLabel(symptom.label, 40),
+          text: '種類をお選びください',
+          actions: variants.map((variant, i) => variantAction(variant, i)),
+        },
+      },
+    ];
+  }
+  const columns: object[] = [];
+  for (let i = 0; i < variants.length; i += CAROUSEL_ACTIONS_PER_COLUMN) {
+    const chunk = variants.slice(i, i + CAROUSEL_ACTIONS_PER_COLUMN);
+    columns.push({
+      title: truncateLabel(symptom.label, 40),
+      text: '種類をお選びください',
+      actions: chunk.map((variant, j) => variantAction(variant, i + j)),
     });
   }
+  return [
+    {
+      type: 'template',
+      altText: `${symptom.label}の種類をお選びください`,
+      template: { type: 'carousel', columns: columns.slice(0, CAROUSEL_MAX_COLUMNS) },
+    },
+  ];
+}
+
+function variantAction(variant: Variant, index: number): object {
   return {
-    type: 'flex',
-    altText: `${day.label} の来店時刻を選択`,
-    contents: {
-      type: 'bubble',
-      size: 'giga',
-      header: header(`${day.label} の来店時刻`, '時刻を選んでね'),
-      body: { type: 'box', layout: 'vertical', spacing: 'none', paddingAll: 'none', contents: rows },
+    type: 'postback',
+    label: truncateLabel(variant.label),
+    data: `action=pkg1_variant&value=${index}`,
+    displayText: variant.label,
+  };
+}
+
+// ── 数量 (qty) 選択 — v1.2.1: 3 本以上ボタン削除・任意数量は text 受付 ──────────
+
+export function qtyPrompt(symptom: Symptom): LineMessage {
+  const actions: object[] =
+    symptom.qty === 'pair'
+      ? [qtyAction('前後セット（2本/両側）', '2'), qtyAction('1本/片側のみ', '1')]
+      : [qtyAction('1本', '1'), qtyAction('2本', '2')];
+  return {
+    type: 'template',
+    altText: '数量をお選びください',
+    template: {
+      type: 'buttons',
+      title: '数量の確認',
+      // v1.2.1: 3 本以上はボタンを出さず、任意の本数を数字で送ってもらう。
+      text: `${truncateLabel(symptom.label, 24)}の数量をお選びください。\n3本以上は本数を数字でお送りください。`,
+      actions,
     },
   };
 }
 
-// ── 汎用 ack / 案内 Bubble ────────────────────────────────────────────────────
-
-export function buildAckBubble(
-  title: string,
-  body: string,
-  buttons: ReadonlyArray<{ label: string; data?: string; uri?: string; style: 'primary' | 'secondary' }>,
-): FlexMessage {
+function qtyAction(label: string, value: string): object {
   return {
-    type: 'flex',
-    altText: title,
-    contents: {
-      type: 'bubble',
-      size: 'mega',
-      body: {
-        type: 'box',
-        layout: 'vertical',
-        paddingAll: 'lg',
-        contents: [
-          { type: 'text', text: title, weight: 'bold', size: 'md', color: TEXT_PRIMARY, wrap: true },
-          { type: 'text', text: body, size: 'sm', color: TEXT_MUTED, wrap: true, margin: 'sm' },
-        ],
-      },
-      footer:
-        buttons.length > 0
-          ? {
-              type: 'box',
-              layout: 'vertical',
-              spacing: 'sm',
-              paddingAll: 'lg',
-              contents: buttons.map((b) => ({
-                type: 'button',
-                style: b.style,
-                color: b.style === 'primary' ? TRYCLE_GREEN : undefined,
-                height: 'sm',
-                action: b.uri
-                  ? { type: 'uri', label: b.label, uri: b.uri }
-                  : { type: 'postback', label: b.label, data: b.data ?? 'pkg1_start' },
-              })),
-            }
-          : undefined,
+    type: 'postback',
+    label: truncateLabel(label),
+    data: `action=pkg1_qty&value=${value}`,
+    displayText: label,
+  };
+}
+
+// ── カート: 追加 or 確認へ (REQ-PKG1-008 / 021) ───────────────────────────────
+
+export function cartDecisionPrompt(): LineMessage {
+  return {
+    type: 'template',
+    altText: 'ほかの整備も追加しますか？',
+    template: {
+      type: 'buttons',
+      title: 'お見積もり内容',
+      text: 'ほかの整備も追加できます。',
+      actions: [
+        {
+          type: 'postback',
+          label: '➕ 他の整備も追加',
+          data: 'action=pkg1_cart&value=add',
+          displayText: '他の整備も追加',
+        },
+        {
+          type: 'postback',
+          label: '✅ 確認へ進む',
+          data: 'action=pkg1_cart&value=confirm',
+          displayText: '確認へ進む',
+        },
+      ],
     },
   };
+}
+
+// ── 確認 (REQ-PKG1-009 概算明示) → 3 択 (本物 confirmMessages) ─────────────────
+
+export function confirmMessages(cart: ReadonlyArray<QuoteLineItem>): LineMessage[] {
+  const quote = buildQuote(cart);
+  return [
+    textMessage(formatQuoteText(quote)),
+    {
+      type: 'template',
+      altText: 'この内容でよろしいですか？',
+      template: {
+        type: 'buttons',
+        title: 'ご確認',
+        text: '上記の内容で次にどうしますか？',
+        actions: [
+          {
+            type: 'postback',
+            label: 'PDF だけ受け取る',
+            data: 'action=pkg1_confirm&value=pdf_only',
+            displayText: 'PDF だけ受け取る',
+          },
+          {
+            // TRYCLE は来店順対応のため文言は「来店予定」(本物ラベル「来店予約」を調整)。
+            type: 'postback',
+            label: 'ご来店予定を伝える',
+            data: 'action=pkg1_confirm&value=reserve',
+            displayText: 'ご来店予定を伝える',
+          },
+          {
+            type: 'postback',
+            label: 'やり直す',
+            data: 'action=pkg1_confirm&value=redo',
+            displayText: 'やり直す',
+          },
+        ],
+      },
+    },
+  ];
+}
+
+// ── 同意書ゲート (Add-B・REQ-PKG1-016) — LIFF URI ボタン ───────────────────────
+
+export function consentPrompt(liffUrl: string | undefined): LineMessage {
+  if (!liffUrl) {
+    // fail-loud: LIFF URL 未投入時は URI ボタンを出さず、スタッフ折り返しに倒す。
+    return {
+      type: 'template',
+      altText: '整備同意書 (準備中)',
+      template: {
+        type: 'buttons',
+        title: '整備同意書',
+        text: '同意書フォームは現在準備中です。スタッフよりご連絡いたします。',
+        actions: [{ type: 'message', label: '了解しました', text: '了解しました' }],
+      },
+    };
+  }
+  return {
+    type: 'template',
+    altText: '整備同意書のご確認',
+    template: {
+      type: 'buttons',
+      title: '整備同意書',
+      text: 'ご来店前に整備同意書のご記入をお願いします。\nお名前・電話番号もこちらでお預かりします。',
+      actions: [{ type: 'uri', label: '同意書を開く', uri: liffUrl }],
+    },
+  };
+}
+
+// ── カートサマリ (text) ───────────────────────────────────────────────────────
+
+export function cartSummaryText(cart: ReadonlyArray<QuoteLineItem>): string {
+  const quote = buildQuote(cart);
+  return `カートに追加しました（${cart.length}件）\n\n${formatQuoteText(quote)}`;
+}
+
+// ── 来店予定: 店舗選択 Carousel (本物 reservation-flow storeCarousel) ───────────
+
+export function storeCarousel(stores: ReadonlyArray<StoreRow>): LineMessage {
+  const columns = stores.slice(0, CAROUSEL_MAX_COLUMNS).map((s) => ({
+    title: truncateLabel(s.name, 40),
+    text: '来店店舗を選ぶ',
+    actions: [
+      {
+        type: 'postback',
+        label: '選ぶ',
+        data: `action=pkg1_reserve_store&value=${s.id}`,
+        displayText: s.name,
+      },
+    ],
+  }));
+  return {
+    type: 'template',
+    altText: '来店店舗をお選びください',
+    template: { type: 'carousel', columns },
+  };
+}
+
+// ── 来店予定: 日時 datetimepicker (本物 datetimePickerMessage・14 日先) ──────────
+
+const RESERVATION_HORIZON_DAYS = 14;
+
+export function datetimePickerMessage(store: StoreRow): LineMessage {
+  const today = new Date();
+  const min = formatDatetimePickerValue(today);
+  const max = formatDatetimePickerValue(
+    new Date(today.getTime() + RESERVATION_HORIZON_DAYS * 24 * 3600 * 1000),
+  );
+  const slot = store.reservation_slot_minutes > 0 ? store.reservation_slot_minutes : 30;
+  return {
+    type: 'template',
+    altText: '来店予定日時をお選びください',
+    template: {
+      type: 'buttons',
+      title: truncateLabel(store.name, 40),
+      text: `${RESERVATION_HORIZON_DAYS}日先まで・${slot}分刻みで選べます`,
+      actions: [
+        {
+          type: 'datetimepicker',
+          label: '日時を選ぶ',
+          data: 'action=pkg1_reserve_dt',
+          mode: 'datetime',
+          initial: min,
+          min,
+          max,
+        },
+      ],
+    },
+  };
+}
+
+// ── 来店予定: 確認 Buttons (はい / 別の日時にする) ──────────────────────────────
+
+export function reservationConfirmPrompt(storeName: string, visitAtIso: string): LineMessage {
+  const human = formatVisitAt(visitAtIso);
+  return {
+    type: 'template',
+    altText: '来店予定の確認',
+    template: {
+      type: 'buttons',
+      title: 'ご確認',
+      text: `${truncateLabel(storeName, 30)} に ${human} 来店予定でよろしいですか？`,
+      actions: [
+        {
+          type: 'postback',
+          label: 'はい',
+          data: 'action=pkg1_reserve_confirm&value=ok',
+          displayText: 'はい',
+        },
+        {
+          type: 'postback',
+          label: '別の日時にする',
+          data: 'action=pkg1_reserve_confirm&value=change',
+          displayText: '別の日時にする',
+        },
+      ],
+    },
+  };
+}
+
+// ── 日時整形 (本物 reservation-flow と同一・JST 壁時計を文字列で扱う) ───────────
+
+/** LINE datetimepicker の initial/min/max は "YYYY-MM-DDtHH:mm" 形式。 */
+function formatDatetimePickerValue(d: Date): string {
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mi = String(d.getMinutes()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}t${hh}:${mi}`;
+}
+
+export function formatVisitAt(iso: string): string {
+  // iso は "YYYY-MM-DDtHH:mm" (datetimepicker) または ISO 文字列。表示用に整形する。
+  const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})[tT](\d{2}):(\d{2})/);
+  if (m) {
+    const [, , mo, dd, hh, mi] = m;
+    return `${Number(mo)}/${Number(dd)} ${hh}:${mi}`;
+  }
+  const d = new Date(iso);
+  const mo = d.getUTCMonth() + 1;
+  const dd = d.getUTCDate();
+  const hh = String(d.getUTCHours()).padStart(2, '0');
+  const mi = String(d.getUTCMinutes()).padStart(2, '0');
+  return `${mo}/${dd} ${hh}:${mi}`;
 }

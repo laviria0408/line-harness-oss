@@ -29,6 +29,12 @@ import {
   tagFriendByLineUserId,
   TRYCLE_TAG_CONSENT,
 } from '../lib/trycle-tagging.js';
+import {
+  findRecentPdfOnlyCase,
+  linkCaseCustomer,
+} from '../lib/trycle-pkg1-repo.js';
+import { resumeReservationAfterConsent } from '../lib/trycle-pkg1.js';
+import { LineClient } from '@line-crm/line-sdk';
 
 export const consent = new Hono<Env>();
 
@@ -111,7 +117,37 @@ consent.post('/api/consent-callback', async (c) => {
       },
     });
     await tagFriendByLineUserId(c.env, parsed.lineUserId, TRYCLE_TAG_CONSENT);
-    return c.json({ ok: true });
+
+    // 経路 E (来店時補完・v1.2.1): 直近の pdf_only ルート cases (customer_id 未紐付け)
+    // を line_user_id で検索し、今登録した customer を後付け紐付けする。失敗しても
+    // 同意取得は成立しているのでフローは止めない (best-effort)。
+    if (customerId) {
+      try {
+        const recentCase = await findRecentPdfOnlyCase(c.env, parsed.lineUserId);
+        if (recentCase) {
+          await linkCaseCustomer(c.env, recentCase.id, customerId);
+        }
+      } catch (err) {
+        console.error('[consent-callback] pdf_only case link failed', err);
+      }
+    }
+
+    // 経路 D-2: 来店予定で未同意だった場合は cart を退避してある (pkg1_cart)。
+    // 同意成立後にここから来店予定フロー (店舗選択) を Push で再開する。
+    let resumedReservation = false;
+    if (c.env.LINE_CHANNEL_ACCESS_TOKEN) {
+      try {
+        const lineClient = new LineClient(c.env.LINE_CHANNEL_ACCESS_TOKEN);
+        resumedReservation = await resumeReservationAfterConsent(
+          c.env,
+          lineClient,
+          parsed.lineUserId,
+        );
+      } catch (err) {
+        console.error('[consent-callback] resume reservation failed', err);
+      }
+    }
+    return c.json({ ok: true, resumedReservation });
   } catch (err) {
     return c.json({ ok: false, error: errorMessage(err) }, 500);
   }

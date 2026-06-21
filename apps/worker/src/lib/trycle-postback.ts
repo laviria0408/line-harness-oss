@@ -1,13 +1,13 @@
 /**
  * TRYCLE postback dispatcher.
  *
- * Phase B-4 で stub として組み込まれた経路を順次実装に置き換えている。
- *   - Pkg8 (FAQ)      : Phase E-impl Step 2 で完全実装
- *   - Pkg1 (整備見積) : Phase E-impl Step 4-7 で完全実装 (handlePkg1Postback)
- *   - consent_        : 同意書は LIFF (apps/consent-liff/) → HTTP route (routes/consent.ts)
- *                       で取得するため postback では使わない (誤発火時の保険 stub)
- *   - reservation_    : 旧予約導線。Pkg1 では「来店予定ヒアリング」に統合済のため
- *                       未使用 (将来 Pkg5 Booking 用に予約・stub のまま残置)
+ *   - Pkg8 (FAQ)      : isPkg8Postback / handlePkg8Postback
+ *   - Pkg1 (整備見積) : isPkg1Postback / handlePkg1Postback (本物モデル・経路 A〜E)
+ *                       postback は本物 `action=pkg1_X&value=Y` 形式 + 素の
+ *                       `pkg1_start` / `pkg1_wage`。datetimepicker の選択値は
+ *                       postback.params.datetime で来るため datetime を渡す。
+ *   - consent_        : 同意書は LIFF (apps/consent-liff/) → HTTP route で取得 (stub)
+ *   - reservation_    : 旧予約導線。Pkg1 の「来店予定」に統合済 (stub)
  *
  * Return value:
  *   true  → TRYCLE handled it. Caller MUST NOT continue with auto-reply matching.
@@ -34,13 +34,15 @@ export interface TryclePostbackContext {
   readonly lineUserId: string;
   readonly lineClient: LineClient;
   readonly env: Env['Bindings'];
+  /** datetimepicker の選択値 (postback.params.datetime)。Pkg1 来店予定の日時。 */
+  readonly datetime?: string;
 }
 
 export async function tryHandleTryclePostback(
   data: string,
   ctx: TryclePostbackContext,
 ): Promise<boolean> {
-  // Pkg8 (FAQ) — Phase E-impl Step 2 で完全実装。
+  // Pkg8 (FAQ)
   if (isPkg8Postback(data)) {
     return handlePkg8Postback(data, {
       replyToken: ctx.replyToken,
@@ -49,9 +51,15 @@ export async function tryHandleTryclePostback(
       env: ctx.env as TrycleRepoEnv,
     });
   }
-  // Pkg1 (整備見積) — Phase E-impl Step 4-7 で完全実装。
+  // Pkg1 (整備見積・本物モデル)
   if (isPkg1Postback(data)) {
-    return handlePkg1Postback(data, ctx);
+    return handlePkg1Postback(data, {
+      replyToken: ctx.replyToken,
+      lineUserId: ctx.lineUserId,
+      lineClient: ctx.lineClient,
+      env: ctx.env,
+      datetime: ctx.datetime,
+    });
   }
   // consent_ / reservation_ は通常ここに来ない (LIFF / 来店予定ヒアリングへ統合)。
   // 誤発火しても auto-reply 経路には流さない (重複返信防止)。

@@ -4,10 +4,11 @@ import {
   cartSubtotal,
   emptyPkg1State,
   getPkg1Session,
+  getPkg1Cart,
   SESSION_STALE_MS,
 } from './trycle-session.js';
 import type { TrycleRepoEnv } from './trycle-repo.js';
-import type { CartItem } from './trycle-session.js';
+import type { QuoteLineItem } from './quote.js';
 
 type Env = TrycleRepoEnv;
 
@@ -19,24 +20,29 @@ function env(): Env {
   } as Env;
 }
 
-function item(p: Partial<CartItem> = {}): CartItem {
+function item(p: Partial<QuoteLineItem> = {}): QuoteLineItem {
   return {
-    labor_id: 'l', code: 'c', name: 'n', unit_price: 1000, unit_price_max: null,
-    qty: 1, option_ids: [], option_names: [], option_total: 0, ...p,
+    name: 'n',
+    unitPrice: 1000,
+    unitPriceMax: null,
+    qty: 1,
+    amount: 1000,
+    amountMax: 1000,
+    ...p,
   };
 }
 
-describe('emptyPkg1State', () => {
-  it('starts at category_select with an empty cart', () => {
+describe('emptyPkg1State (本物 startFlow)', () => {
+  it('starts at awaiting_dispatch with an empty cart', () => {
     const s = emptyPkg1State();
-    expect(s.step).toBe('category_select');
+    expect(s.step).toBe('awaiting_dispatch');
     expect(s.cart).toEqual([]);
   });
 });
 
 describe('cartSubtotal', () => {
-  it('sums (unit + options) * qty', () => {
-    expect(cartSubtotal([item({ unit_price: 1000, option_total: 500, qty: 2 })])).toBe(3000);
+  it('sums line item amounts', () => {
+    expect(cartSubtotal([item({ amount: 3000 }), item({ amount: 1500 })])).toBe(4500);
   });
 });
 
@@ -76,23 +82,44 @@ describe('getPkg1Session staleness', () => {
   it('returns null when the session is older than the stale window', async () => {
     const old = new Date(Date.now() - SESSION_STALE_MS - 1000).toISOString();
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(JSON.stringify([{ state: { step: 'cart_review', cart: [] }, updated_at: old }]), {
-        status: 200,
-      }),
+      new Response(
+        JSON.stringify([{ state: { step: 'awaiting_cart_decision', cart: [] }, updated_at: old }]),
+        { status: 200 },
+      ),
     );
     expect(await getPkg1Session(env(), 'U1')).toBeNull();
   });
 
-  it('returns the state when fresh', async () => {
+  it('returns the state (本物 step) when fresh', async () => {
     const fresh = new Date().toISOString();
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(
-        JSON.stringify([{ state: { step: 'cart_review', cart: [item()] }, updated_at: fresh }]),
+        JSON.stringify([
+          { state: { step: 'awaiting_cart_decision', cart: [item()] }, updated_at: fresh },
+        ]),
         { status: 200 },
       ),
     );
     const s = await getPkg1Session(env(), 'U1');
-    expect(s?.step).toBe('cart_review');
+    expect(s?.step).toBe('awaiting_cart_decision');
     expect(s?.cart).toHaveLength(1);
+  });
+});
+
+describe('getPkg1Cart (同意書未取得時の cart 退避)', () => {
+  beforeEach(() => vi.restoreAllMocks());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('returns the stashed cart array', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify([{ state: { cart: [item()] } }]), { status: 200 }),
+    );
+    const cart = await getPkg1Cart(env(), 'U1');
+    expect(cart).toHaveLength(1);
+  });
+
+  it('returns null when no stash exists', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('[]', { status: 200 }));
+    expect(await getPkg1Cart(env(), 'U1')).toBeNull();
   });
 });

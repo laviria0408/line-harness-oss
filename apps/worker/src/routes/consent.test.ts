@@ -201,7 +201,7 @@ describe('POST /api/consent-callback', () => {
     const app = buildApp();
     const res = await app.request(postReq(body), undefined, ENV as any);
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true });
+    expect(await res.json()).toMatchObject({ ok: true });
   });
 
   test('403 when access_token resolves to a different line_user_id', async () => {
@@ -249,6 +249,6 @@ describe('POST /api/consent-callback', () => {
       ENV as any,
     );
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true });
+    expect(await res.json()).toMatchObject({ ok: true });
   });
 });

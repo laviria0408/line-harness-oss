@@ -1,12 +1,16 @@
 /**
  * TRYCLE Pkg1 session state (bot_sessions) + 有人モード (manual_mode) helpers.
  *
- * 設計: Pkg1 詳細設計 v1.1.1 §4 / §7 (page 386050ad6a7e81f8b701cd52c9201af6)。
+ * 設計: Pkg1 詳細設計 v1.2.1 §4 / §7 (page 386050ad6a7e81f8b701cd52c9201af6)。
+ * モデルは本物 trycle-line-harness/src/flows/pkg1-estimate.ts の `Pkg1Session` /
+ * `Pkg1Step` に揃える (region→symptom→variant→qty→cart の症状ヒアリング)。
  *
  * - `bot_sessions` (Supabase・migration 0016) は **bot ロジックの作業メモ** =
- *   region→symptom→variant→qty→cart の状態スナップショットを保持する。
+ *   step / cart / pending の状態スナップショットを保持する。
  *   会話履歴ではない (履歴は LH 標準 messages_log = D1 が正本)。
  * - kind='pkg1_estimate' = 見積フローの作業状態。
+ * - kind='pkg1_cart'     = 同意書未取得時の cart 永続化 (callback 復帰用・経路 D-2)。
+ * - kind='reservation'   = 来店予定フロー (別 session・本物 ReservationStep)。
  * - kind='manual_mode'   = 有人切替フラグ (REQ-PKG1-024)。LH §9 Inbox に
  *   標準の bot 抑止機構は無いため (catalog grep 確認済) bot_sessions で実装する。
  *
@@ -19,41 +23,43 @@ import {
   type SupabaseEnvLike,
 } from './supabase.js';
 import { getTenantId, type TrycleRepoEnv } from './trycle-repo.js';
+import type { QuoteLineItem } from './quote.js';
 
 export const PKG1_SESSION_KIND = 'pkg1_estimate';
+export const PKG1_CART_KIND = 'pkg1_cart';
+export const RESERVATION_KIND = 'reservation';
 export const MANUAL_MODE_KIND = 'manual_mode';
 
 /** 24 時間無操作で stale 扱い (設計 §7 session ライフサイクル)。 */
 export const SESSION_STALE_MS = 24 * 60 * 60 * 1000;
 
+/** 本物 `Pkg1Step` (pkg1-estimate.ts) に揃える (CRITICAL #5・設計 v1.2.1 §4)。 */
 export type Pkg1Step =
-  | 'category_select'
-  | 'labor_select'
-  | 'cart_review'
-  | 'quoted'
-  | 'visit_time_select';
+  | 'awaiting_dispatch'
+  | 'awaiting_region'
+  | 'awaiting_symptom'
+  | 'awaiting_variant'
+  | 'awaiting_qty'
+  | 'awaiting_cart_decision'
+  | 'awaiting_confirm'
+  | 'awaiting_consent_form'
+  | 'completed';
 
-export interface CartItem {
-  readonly labor_id: string;
-  readonly code: string;
-  readonly name: string;
-  readonly unit_price: number;
-  readonly unit_price_max: number | null;
-  readonly qty: number;
-  /** 選択された labor_options (variant) の合計加算と表示名。 */
-  readonly option_ids: string[];
-  readonly option_names: string[];
-  readonly option_total: number;
+/** 選択途中保持 (本物 `PendingSelection`)。region/symptom/variant は index 参照。 */
+export interface PendingSelection {
+  readonly regionValue: string;
+  readonly symptomIndex: number;
+  readonly variantIndex?: number;
 }
 
+/**
+ * Pkg1 セッション state。cart は本物 `QuoteLineItem[]` (name/unitPrice/qty/amount …)。
+ * variant ラベル・open-ended の「〜」は name に埋め込む (buildLineItemFromPending)。
+ */
 export interface Pkg1State {
   readonly step: Pkg1Step;
-  readonly cart: CartItem[];
-  readonly selected_category?: string;
-  readonly selected_labor_id?: string;
-  /** 見積保存後に作成された case の id (経路 D の来店予定で参照)。 */
-  readonly case_id?: string;
-  readonly store_id?: string;
+  readonly cart: QuoteLineItem[];
+  readonly pending?: PendingSelection;
 }
 
 interface BotSessionRow {
@@ -61,9 +67,24 @@ interface BotSessionRow {
   readonly updated_at: string;
 }
 
-/** 空の Pkg1 セッション初期値。 */
+/** 来店予定フロー state (本物 `ReservationStep`・経路 D-2)。別 kind の session。 */
+export type ReservationStep =
+  | 'awaiting_store'
+  | 'awaiting_datetime'
+  | 'awaiting_confirm'
+  | 'completed';
+
+export interface ReservationState {
+  readonly step: ReservationStep;
+  readonly cart: QuoteLineItem[];
+  readonly storeId?: string;
+  readonly storeName?: string;
+  readonly visitAtIso?: string;
+}
+
+/** 空の Pkg1 セッション初期値 (本物 startFlow: awaiting_dispatch + 空 cart)。 */
 export function emptyPkg1State(): Pkg1State {
-  return { step: 'category_select', cart: [] };
+  return { step: 'awaiting_dispatch', cart: [] };
 }
 
 /**
@@ -124,6 +145,115 @@ export async function clearPkg1Session(
     tenant_id: `eq.${getTenantId(env)}`,
     line_user_id: `eq.${lineUserId}`,
     kind: `eq.${PKG1_SESSION_KIND}`,
+  });
+}
+
+// ── pkg1_cart (同意書未取得時の cart 永続化・経路 D-2) ─────────────────────────
+
+/**
+ * 未同意で来店予定に進んだ user の cart を永続化する (本物 enterReservation)。
+ * 同意書 callback (別 lambda) で getPkg1Cart → 来店予定フローを復帰させる。
+ */
+export async function setPkg1Cart(
+  env: TrycleRepoEnv,
+  lineUserId: string,
+  cart: QuoteLineItem[],
+): Promise<void> {
+  await supabaseUpsert(
+    env,
+    'bot_sessions',
+    [
+      {
+        tenant_id: getTenantId(env),
+        line_user_id: lineUserId,
+        kind: PKG1_CART_KIND,
+        state: { cart },
+        updated_at: new Date().toISOString(),
+      },
+    ],
+    { onConflict: 'tenant_id,line_user_id,kind' },
+  );
+}
+
+/** 退避した cart を取得する (同意書 callback の復帰用)。未存在なら null。 */
+export async function getPkg1Cart(
+  env: TrycleRepoEnv,
+  lineUserId: string,
+): Promise<QuoteLineItem[] | null> {
+  const rows = await supabaseSelect<{ state: { cart?: QuoteLineItem[] } }>(
+    env,
+    'bot_sessions',
+    {
+      tenant_id: `eq.${getTenantId(env)}`,
+      line_user_id: `eq.${lineUserId}`,
+      kind: `eq.${PKG1_CART_KIND}`,
+    },
+    { select: 'state', limit: 1 },
+  );
+  const cart = rows[0]?.state?.cart;
+  return Array.isArray(cart) ? cart : null;
+}
+
+/** 退避した cart を削除する (callback 復帰後)。 */
+export async function clearPkg1Cart(
+  env: TrycleRepoEnv,
+  lineUserId: string,
+): Promise<void> {
+  await supabaseDelete(env, 'bot_sessions', {
+    tenant_id: `eq.${getTenantId(env)}`,
+    line_user_id: `eq.${lineUserId}`,
+    kind: `eq.${PKG1_CART_KIND}`,
+  });
+}
+
+// ── reservation (来店予定フロー・経路 D-2) ────────────────────────────────────
+
+export async function getReservationSession(
+  env: TrycleRepoEnv,
+  lineUserId: string,
+): Promise<ReservationState | null> {
+  const rows = await supabaseSelect<{ state: ReservationState }>(
+    env,
+    'bot_sessions',
+    {
+      tenant_id: `eq.${getTenantId(env)}`,
+      line_user_id: `eq.${lineUserId}`,
+      kind: `eq.${RESERVATION_KIND}`,
+    },
+    { select: 'state', limit: 1 },
+  );
+  return rows[0]?.state ?? null;
+}
+
+export async function setReservationSession(
+  env: TrycleRepoEnv,
+  lineUserId: string,
+  state: ReservationState,
+): Promise<void> {
+  await supabaseUpsert(
+    env,
+    'bot_sessions',
+    [
+      {
+        tenant_id: getTenantId(env),
+        line_user_id: lineUserId,
+        kind: RESERVATION_KIND,
+        state,
+        updated_at: new Date().toISOString(),
+      },
+    ],
+    { onConflict: 'tenant_id,line_user_id,kind' },
+  );
+}
+
+export async function clearReservationSession(
+  env: TrycleRepoEnv,
+  lineUserId: string,
+): Promise<void> {
+  await supabaseDelete(env, 'bot_sessions', {
+    tenant_id: `eq.${getTenantId(env)}`,
+    line_user_id: `eq.${lineUserId}`,
+    kind: `eq.${RESERVATION_KIND}`,
   });
 }
 
@@ -200,19 +330,13 @@ export async function clearManualMode(
 /** 外部から来た state を最低限の形に正規化する (cart 欠落等を防ぐ)。 */
 function normalizeState(state: Partial<Pkg1State> | null | undefined): Pkg1State {
   return {
-    step: state?.step ?? 'category_select',
+    step: state?.step ?? 'awaiting_dispatch',
     cart: Array.isArray(state?.cart) ? state!.cart : [],
-    selected_category: state?.selected_category,
-    selected_labor_id: state?.selected_labor_id,
-    case_id: state?.case_id,
-    store_id: state?.store_id,
+    pending: state?.pending,
   };
 }
 
 /** cart の小計 (税抜・min) を返す。 */
-export function cartSubtotal(cart: ReadonlyArray<CartItem>): number {
-  return cart.reduce(
-    (sum, item) => sum + (item.unit_price + item.option_total) * item.qty,
-    0,
-  );
+export function cartSubtotal(cart: ReadonlyArray<QuoteLineItem>): number {
+  return cart.reduce((sum, item) => sum + item.amount, 0);
 }

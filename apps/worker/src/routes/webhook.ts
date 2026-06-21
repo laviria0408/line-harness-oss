@@ -396,16 +396,25 @@ async function handleEvent(
     if (replyTokenForTrycle && workerEnv) {
       // REQ-PKG1-024: リッチメニュー等の bot 操作を押したら有人モードを解除し
       // bot 応答へ復帰する (整備見積/FAQ の入口・メニュー postback)。
-      if (postbackData === 'pkg1_start' || postbackData === 'faq_start' || postbackData === 'pkg8_start') {
+      if (
+        postbackData === 'pkg1_start' ||
+        postbackData === 'pkg1_wage' ||
+        postbackData === 'faq_start' ||
+        postbackData === 'pkg8_start'
+      ) {
         await clearManualMode(workerEnv as TrycleRepoEnv, userId).catch((err) => {
           console.error('Failed to clear manual mode', err);
         });
       }
+      // datetimepicker の選択値は postback.params.datetime で来る (Pkg1 来店予定)。
+      const postbackParams = (event as unknown as { postback?: { params?: { datetime?: string } } })
+        .postback?.params;
       const handled = await tryHandleTryclePostback(postbackData, {
         replyToken: replyTokenForTrycle,
         lineUserId: userId,
         lineClient,
         env: workerEnv,
+        datetime: postbackParams?.datetime,
       });
       if (handled) {
         // Log the incoming postback so dashboard analytics still see it.
@@ -705,6 +714,26 @@ async function handleEvent(
 
         matched = true;
         break;
+      }
+    }
+
+    // TRYCLE Pkg1: 数量ヒアリング (awaiting_qty) 中の自由入力で任意本数を受ける
+    // (v1.2.1: 3 本以上は数字で送ってもらう)。active session が無ければ false。
+    if (!matched && !replyTokenConsumed && workerEnv && workerEnv.TRYCLE_TENANT_ID && event.replyToken) {
+      try {
+        const { handlePkg1Text } = await import('../lib/trycle-pkg1.js');
+        const handled = await handlePkg1Text(incomingText, {
+          replyToken: event.replyToken,
+          lineUserId: userId,
+          lineClient,
+          env: workerEnv,
+        });
+        if (handled) {
+          matched = true;
+          replyTokenConsumed = true;
+        }
+      } catch (err) {
+        console.error('[trycle-pkg1] qty text failed', err);
       }
     }
 

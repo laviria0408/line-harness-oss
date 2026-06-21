@@ -1,15 +1,18 @@
 /**
- * Pkg1 見積 PDF 発行 (REQ-PKG1-012〜015・経路 D・Step 6)。
+ * Pkg1 見積 PDF 発行 (REQ-PKG1-012〜015・経路 D-1/D-2・Step 6)。
  *
  * 個別維持 GAS (callGas estimate_pdf) で PDF を生成し Drive 保存する。
  * テンプレ正本 = 2026-06-12 ヒアリングのモック PWA 見積プレビュー (REQ-PKG1-013)。
  * GAS 側がテンプレを持つため、bot は quote payload を渡すだけ。
  *
- * 設計: Pkg1 詳細設計 v1.1.1 §3 経路 D / §5 (page 386050ad6a7e81f8b701cd52c9201af6)。
+ * 【v1.2.1: 概算見積 PDF に LINE userId 記載】callGas payload に line_user_id を
+ * 含める (店員追跡用)。GAS テンプレ側の印字位置追加は REQ-013 別 task。
+ *
+ * 設計: Pkg1 詳細設計 v1.2.1 §3 経路 D / §5 (page 386050ad6a7e81f8b701cd52c9201af6)。
  */
 import type { Env } from '../index.js';
 import { callGas } from './trycle-gas-client.js';
-import type { Quote } from './quote.js';
+import { PARTS_NOTICE, type Quote } from './quote.js';
 
 export interface EstimatePdfResult {
   readonly ok: boolean;
@@ -23,8 +26,8 @@ export interface EstimatePdfInput {
   readonly customerName: string | null;
   readonly storeName: string | null;
   readonly quoteNo: string | null;
-  readonly partsNotice: string;
-  readonly disclaimer: string;
+  /** 【v1.2.1】概算見積 PDF に印字する LINE userId (店員追跡用)。 */
+  readonly lineUserId: string;
 }
 
 /**
@@ -44,6 +47,8 @@ export async function issueEstimatePdf(
         customer_name: input.customerName,
         store_name: input.storeName,
         quote_no: input.quoteNo,
+        // 【v1.2.1】店員追跡用に LINE userId を含める。
+        line_user_id: input.lineUserId,
         line_items: input.quote.lineItems.map((li) => ({
           name: li.name,
           unit_price: li.unitPrice,
@@ -59,8 +64,8 @@ export async function issueEstimatePdf(
         tax_max: input.quote.taxMax,
         total: input.quote.total,
         total_max: input.quote.totalMax,
-        parts_notice: input.partsNotice,
-        disclaimer: input.disclaimer,
+        parts_notice: PARTS_NOTICE,
+        disclaimer: input.quote.disclaimer,
       },
     });
     if (!res.ok) {
