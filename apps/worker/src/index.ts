@@ -116,17 +116,14 @@ export type Env = {
     WORKER_PUBLIC_URL?: string;
     ADMIN_PUBLIC_URL?: string;
     LIFF_PUBLIC_URL?: string;
-    // TRYCLE business integration (Phase B). Supabase is the
-    // canonical store for business data (customers/cases/quotes);
-    // GAS handles PDF + Drive; AppSheet mirrors customer master.
+    // TRYCLE business integration (Phase B). Supabase is the canonical store
+    // for business data (customers/cases/quotes/faqs). GAS handles PDF + Drive
+    // for the quote PDF flow (Pkg1 — to be wired). AppSheet 連携は 2026-06-20
+    // に廃止確定 ([[feedback-no-appsheet-in-bot]])・関連 env は削除済。
     SUPABASE_URL?: string;
     SUPABASE_SERVICE_ROLE_KEY?: string;
     TRYCLE_TENANT_ID?: string;
     GAS_WEB_APP_URL?: string;
-    APPSHEET_APP_ID?: string;
-    APPSHEET_API_KEY?: string;
-    APPSHEET_CUSTOMER_TABLE?: string;
-    APPSHEET_CASE_TABLE?: string;
   };
   Variables: {
     staff: { id: string; name: string; role: 'owner' | 'admin' | 'staff' };
