@@ -69,18 +69,32 @@ export function textMessage(text: string): LineMessage {
   return { type: 'text', text };
 }
 
-/** wrap 付きの本文テキスト行 (Bubble body 内のサマリ等に使う)。 */
+/**
+ * wrap 付きの本文テキスト行 (Bubble body 内のサマリ等に使う)。
+ *
+ * padding (paddingStart/End/Top/Bottom) は LINE Flex 仕様上 **box 専用** で
+ * text コンポーネントには無効。text に直接付けると reply が HTTP 400 で reject
+ * され、safeReply が握り潰して利用者には「無反応」に見える (qtyPrompt /
+ * confirmMessages が awaiting_qty 以降で無反応になっていた真因)。padding を
+ * 効かせたままにするため、text を padding 付き box でラップする。
+ */
 function bodyText(text: string, opts?: { muted?: boolean; size?: 'xs' | 'sm' | 'md' }): object {
   return {
-    type: 'text',
-    text,
-    size: opts?.size ?? 'sm',
-    color: opts?.muted ? TEXT_MUTED : TEXT_PRIMARY,
-    wrap: true,
+    type: 'box',
+    layout: 'vertical',
     paddingStart: 'md',
     paddingEnd: 'md',
     paddingTop: 'sm',
     paddingBottom: 'sm',
+    contents: [
+      {
+        type: 'text',
+        text,
+        size: opts?.size ?? 'sm',
+        color: opts?.muted ? TEXT_MUTED : TEXT_PRIMARY,
+        wrap: true,
+      },
+    ],
   };
 }
 

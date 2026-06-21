@@ -111,7 +111,12 @@ export async function buildLineItemFromPending(
   } catch (err) {
     console.warn('[trycle-pkg1-repo] findLaborByCode failed', err);
   }
-  if (!labor) return null;
+  if (!labor) {
+    // No labor row for this sample code → caller escalates to staff. Logging the
+    // missing code makes a labor_master gap (vs Supabase outage) diagnosable.
+    console.error('[trycle-pkg1-repo] buildLineItemFromPending: no labor_master row for code', sample);
+    return null;
+  }
 
   const variantLabel = variant ? `（${variant.label}）` : '';
   const surcharge = variant?.surcharge;

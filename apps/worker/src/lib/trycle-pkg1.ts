@@ -124,8 +124,10 @@ function repoEnv(ctx: Pkg1Context): TrycleRepoEnv {
  */
 export async function handlePkg1Postback(data: string, ctx: Pkg1Context): Promise<boolean> {
   if (!isPkg1Postback(data)) return false;
+  console.log('[trycle-pkg1] dispatch start', JSON.stringify({ data, lineUserId: ctx.lineUserId }));
   try {
     await route(data, ctx);
+    console.log('[trycle-pkg1] dispatch done', data);
   } catch (err) {
     console.error('[trycle-pkg1] handle failed', data, err);
     await safeReply(ctx, [
@@ -169,7 +171,9 @@ async function route(data: string, ctx: Pkg1Context): Promise<void> {
 // ── ① 開始 → 状況ふりわけ (REQ-PKG1-002) ──────────────────────────────────────
 
 async function startFlow(ctx: Pkg1Context): Promise<void> {
-  await upsertPkg1Session(repoEnv(ctx), ctx.lineUserId, emptyPkg1State()).catch(() => {});
+  await upsertPkg1Session(repoEnv(ctx), ctx.lineUserId, emptyPkg1State()).catch((err) =>
+    console.error('[trycle-pkg1] startFlow upsertPkg1Session failed', err),
+  );
   await safeReply(ctx, [dispatchPrompt()]);
 }
 
@@ -179,7 +183,7 @@ async function onDispatch(ctx: Pkg1Context, value: string | null): Promise<void>
 
   // 包括メンテ・原因わからない → スタッフ相談誘導をもって完成 (本物 onDispatch)。
   if (dispatch !== 'identified') {
-    await clearPkg1Session(repoEnv(ctx), ctx.lineUserId).catch(() => {});
+    await clearPkg1Session(repoEnv(ctx), ctx.lineUserId).catch((err) => console.error('[trycle-pkg1] clearPkg1Session failed', err));
     await escalate(
       ctx,
       DISPATCH_LABELS[dispatch],
@@ -417,9 +421,9 @@ async function finishPdfOnly(ctx: Pkg1Context, session: Pkg1State): Promise<void
     lineUserId: ctx.lineUserId,
   });
   const pdfUrl = pdf.ok ? pdf.pdfUrl ?? null : null;
-  if (saved && pdfUrl) await updateQuotePdfUrl(env, saved, pdfUrl).catch(() => {});
+  if (saved && pdfUrl) await updateQuotePdfUrl(env, saved, pdfUrl).catch((err) => console.error('[trycle-pkg1] updateQuotePdfUrl failed', err));
 
-  await clearPkg1Session(env, ctx.lineUserId).catch(() => {});
+  await clearPkg1Session(env, ctx.lineUserId).catch((err) => console.error('[trycle-pkg1] clearPkg1Session failed', err));
 
   await safeReply(ctx, [
     textMessage(formatQuoteWithPdf(quote, pdfUrl)),
@@ -444,12 +448,12 @@ async function enterReservation(ctx: Pkg1Context, session: Pkg1State): Promise<v
   }
 
   if (consentValid) {
-    await clearPkg1Session(env, ctx.lineUserId).catch(() => {});
+    await clearPkg1Session(env, ctx.lineUserId).catch((err) => console.error('[trycle-pkg1] clearPkg1Session failed', err));
     return startReservationFlow(ctx, session.cart);
   }
 
   // 未同意 → cart を退避 (consent-callback で復帰) → 同意書を提示。
-  await setPkg1Cart(env, ctx.lineUserId, session.cart).catch(() => {});
+  await setPkg1Cart(env, ctx.lineUserId, session.cart).catch((err) => console.error('[trycle-pkg1] setPkg1Cart failed', err));
   await upsertPkg1Session(env, ctx.lineUserId, { ...session, step: 'awaiting_consent_form' });
   await safeReply(ctx, [consentPrompt(ctx.env.LIFF_CONSENT_URL)]);
 }
@@ -488,9 +492,9 @@ export async function resumeReservationAfterConsent(
   const stores = await listActiveStores(repo).catch(() => []);
   if (stores.length === 0) return false;
 
-  await setReservationSession(repo, lineUserId, { step: 'awaiting_store', cart }).catch(() => {});
-  await clearPkg1Cart(repo, lineUserId).catch(() => {});
-  await clearPkg1Session(repo, lineUserId).catch(() => {});
+  await setReservationSession(repo, lineUserId, { step: 'awaiting_store', cart }).catch((err) => console.error('[trycle-pkg1] setReservationSession failed', err));
+  await clearPkg1Cart(repo, lineUserId).catch((err) => console.error('[trycle-pkg1] clearPkg1Cart failed', err));
+  await clearPkg1Session(repo, lineUserId).catch((err) => console.error('[trycle-pkg1] clearPkg1Session failed', err));
   try {
     await lineClient.pushMessage(lineUserId, [
       textMessage('ご登録ありがとうございました。\nご来店店舗をお選びください。'),
@@ -641,7 +645,7 @@ async function finalizeReservation(ctx: Pkg1Context, session: ReservationState):
     lineUserId: ctx.lineUserId,
   });
   const pdfUrl = pdf.ok ? pdf.pdfUrl ?? null : null;
-  if (saved && pdfUrl) await updateQuotePdfUrl(env, saved, pdfUrl).catch(() => {});
+  if (saved && pdfUrl) await updateQuotePdfUrl(env, saved, pdfUrl).catch((err) => console.error('[trycle-pkg1] updateQuotePdfUrl failed', err));
 
   // 店舗スタッフへ Gmail 通知 (REQ-PKG1-015・見積サマリ + PDF 同梱)。
   await notifyStaff(ctx.env, {
@@ -653,8 +657,8 @@ async function finalizeReservation(ctx: Pkg1Context, session: ReservationState):
     note: visitAtIso ? `来店予定: ${formatVisitAt(visitAtIso)}` : null,
   }).catch((err) => console.error('[trycle-pkg1] notifyStaff (reservation) failed', err));
 
-  await clearReservationSession(env, ctx.lineUserId).catch(() => {});
-  await clearPkg1Session(env, ctx.lineUserId).catch(() => {});
+  await clearReservationSession(env, ctx.lineUserId).catch((err) => console.error('[trycle-pkg1] clearReservationSession failed', err));
+  await clearPkg1Session(env, ctx.lineUserId).catch((err) => console.error('[trycle-pkg1] clearPkg1Session failed', err));
 
   const visitLabel = visitAtIso ? formatVisitAt(visitAtIso) : '';
   await safeReply(ctx, [
@@ -691,8 +695,8 @@ async function escalate(ctx: Pkg1Context, reason: string, introText: string): Pr
     session && session.cart.length > 0 ? estimateSummaryText(session.cart) : null;
   const customerName = await resolveCustomerName(ctx);
 
-  await clearPkg1Session(env, ctx.lineUserId).catch(() => {});
-  await setManualMode(env, ctx.lineUserId).catch(() => {});
+  await clearPkg1Session(env, ctx.lineUserId).catch((err) => console.error('[trycle-pkg1] clearPkg1Session failed', err));
+  await setManualMode(env, ctx.lineUserId).catch((err) => console.error('[trycle-pkg1] setManualMode failed', err));
 
   await notifyStaff(ctx.env, {
     lineUserId: ctx.lineUserId,
@@ -714,7 +718,17 @@ async function escalate(ctx: Pkg1Context, reason: string, introText: string): Pr
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 async function currentSession(ctx: Pkg1Context): Promise<Pkg1State> {
-  return (await getPkg1Session(repoEnv(ctx), ctx.lineUserId).catch(() => null)) ?? emptyPkg1State();
+  const session = await getPkg1Session(repoEnv(ctx), ctx.lineUserId).catch((err) => {
+    // A read failure here silently resets the flow to an empty session, which
+    // looks like "the bot stopped responding mid-flow". Surface it explicitly.
+    console.error('[trycle-pkg1] currentSession getPkg1Session failed', err);
+    return null;
+  });
+  if (!session) {
+    console.log('[trycle-pkg1] currentSession empty (no active session)', ctx.lineUserId);
+    return emptyPkg1State();
+  }
+  return session;
 }
 
 function currentSymptom(pending: PendingSelection): Symptom | undefined {
