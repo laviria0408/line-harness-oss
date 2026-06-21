@@ -140,34 +140,51 @@ function clampLabel(label: string): string {
 }
 
 // ── 経路 A: 入口 3 択 (REQ-PKG1-002) ─────────────────────────────────────────
+//
+// 状況ふりわけ 3 択。本物 (trycle-line-harness pkg1-messages.ts / pkg1-estimate.ts)
+// の DISPATCH_LABELS と分岐に忠実:
+//   identified    原因特定済み      → 正規見積ルート (経路 B カテゴリ選択へ)
+//   comprehensive 包括メンテしたい  → 現物確認が必要なためスタッフ相談誘導 (経路 B に進めない)
+//   unknown       原因がわからない  → 同上スタッフ相談誘導
+// postback value は本物の `pkg1_dispatch&value=<key>` を OSS の prefix 規約に合わせ
+// `pkg1_dispatch_<key>` で表現する (UI の見た目・タップ行構造は維持)。
+
+export type Pkg1Dispatch = 'identified' | 'comprehensive' | 'unknown';
+
+/** 状況ふりわけ 3 択のラベル (本物 DISPATCH_LABELS と一致・文言厳守)。 */
+export const DISPATCH_LABELS: Readonly<Record<Pkg1Dispatch, string>> = {
+  identified: '原因特定済み',
+  comprehensive: '包括メンテしたい',
+  unknown: '原因がわからない',
+};
 
 export function buildEntryBubble(): FlexMessage {
   const contents: object[] = [
-    buildSectionLabel('状況をお選びください'),
+    buildSectionLabel('まず、いまの状況に近いものをお選びください'),
     buildTapRow({
       icon: '🛠',
-      label: 'メニューが決まっている',
-      sub: '交換・調整したい箇所が分かっている',
-      data: 'pkg1_route_known',
+      label: DISPATCH_LABELS.identified,
+      sub: '交換・調整したい箇所がもう分かっている',
+      data: 'pkg1_dispatch_identified',
+    }),
+    buildDivider(),
+    buildTapRow({
+      icon: '🔧',
+      label: DISPATCH_LABELS.comprehensive,
+      sub: '全体をまとめて点検・整備してほしい',
+      data: 'pkg1_dispatch_comprehensive',
     }),
     buildDivider(),
     buildTapRow({
       icon: '🔍',
-      label: '症状から相談したい',
-      sub: '原因が分からない・点検してほしい',
-      data: 'pkg1_route_staff',
-    }),
-    buildDivider(),
-    buildTapRow({
-      icon: '💬',
-      label: 'スタッフに相談する',
-      sub: '直接スタッフとやり取りしたい',
-      data: 'pkg1_staff_consult',
+      label: DISPATCH_LABELS.unknown,
+      sub: '不調だけど原因が分からない・点検してほしい',
+      data: 'pkg1_dispatch_unknown',
     }),
   ];
   return {
     type: 'flex',
-    altText: '整備見積もりを始めます',
+    altText: '整備のご相談・状況をお選びください',
     contents: {
       type: 'bubble',
       size: 'giga',
@@ -216,7 +233,7 @@ export function buildLaborListBubble(
     );
     contents.push(buildDivider());
   }
-  contents.push(buildTapRow({ icon: '←', label: 'カテゴリへ戻る', data: 'pkg1_route_known' }));
+  contents.push(buildTapRow({ icon: '←', label: 'カテゴリへ戻る', data: 'pkg1_categories' }));
   return {
     type: 'flex',
     altText: `${categoryLabel(category)} のメニュー`,
@@ -348,7 +365,7 @@ export function buildCartBubble(cart: ReadonlyArray<CartItem>): FlexMessage {
             type: 'button',
             style: 'secondary',
             height: 'sm',
-            action: { type: 'postback', label: '＋ 他の整備を追加', data: 'pkg1_route_known' },
+            action: { type: 'postback', label: '＋ 他の整備を追加', data: 'pkg1_categories' },
           },
           {
             type: 'button',

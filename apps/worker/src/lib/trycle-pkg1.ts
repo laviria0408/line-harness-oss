@@ -58,6 +58,8 @@ import {
   buildVisitDayBubble,
   buildVisitTimeBubble,
   buildAckBubble,
+  DISPATCH_LABELS,
+  type Pkg1Dispatch,
   type FlexMessage,
 } from './trycle-pkg1-flex.js';
 
@@ -91,10 +93,16 @@ export async function handlePkg1Postback(data: string, ctx: Pkg1Context): Promis
 }
 
 async function route(data: string, ctx: Pkg1Context): Promise<void> {
-  // 入口・ふりわけ (経路 A)
+  // 入口・状況ふりわけ 3 択 (経路 A・本物 pkg1-estimate.ts onDispatch に忠実)。
+  //   identified    → 正規見積ルート (カテゴリ選択へ)
+  //   comprehensive → 現物確認が必要 → スタッフ相談誘導 (経路 B には進めない)
+  //   unknown       → 同上スタッフ相談誘導
   if (data === 'pkg1_start') return replyEntry(ctx);
-  if (data === 'pkg1_route_known') return replyCategories(ctx);
-  if (data === 'pkg1_route_staff') return replySymptomStaff(ctx);
+  if (data === 'pkg1_dispatch_identified') return onDispatch(ctx, 'identified');
+  if (data === 'pkg1_dispatch_comprehensive') return onDispatch(ctx, 'comprehensive');
+  if (data === 'pkg1_dispatch_unknown') return onDispatch(ctx, 'unknown');
+  // route B 内のカテゴリ再表示 (「他の整備を追加」「カテゴリへ戻る」)。
+  if (data === 'pkg1_categories') return replyCategories(ctx);
   if (data === 'pkg1_staff_consult') return startManualMode(ctx, '相談 (入口)');
   if (data === 'pkg1_staff_estimate') return startManualMode(ctx, '見積後相談');
 
@@ -128,12 +136,35 @@ async function replyEntry(ctx: Pkg1Context): Promise<void> {
   await safeReply(ctx, [buildEntryBubble()]);
 }
 
-async function replySymptomStaff(ctx: Pkg1Context): Promise<void> {
-  // 原因不明 / 症状から → AI で無理に見積らずスタッフ送り (分岐図 v3)。
-  await startManualMode(ctx, '症状から相談 (原因不明)');
+/**
+ * 状況ふりわけ 3 択を捌く (本物 pkg1-estimate.ts onDispatch に忠実)。
+ *   - identified    → カテゴリ選択 (正規見積ルート)。
+ *   - comprehensive → 現物確認が必要なため、`「<ラベル>」ですね。…` の文言で
+ *                     スタッフ相談誘導をもって完成 (経路 B には進めない)。
+ *   - unknown       → 同上スタッフ相談誘導。
+ */
+async function onDispatch(ctx: Pkg1Context, dispatch: Pkg1Dispatch): Promise<void> {
+  if (dispatch === 'identified') {
+    return replyCategories(ctx);
+  }
+  // 包括メンテ / 原因がわからない → 見積セッションを破棄し、本物文言で
+  // スタッフ相談誘導をもって完成 (経路 B には進めない)。
+  await clearPkg1Session(ctx.env as TrycleRepoEnv, ctx.lineUserId).catch(() => {});
+  return startManualMode(ctx, DISPATCH_LABELS[dispatch], {
+    introText: `「${DISPATCH_LABELS[dispatch]}」ですね。こちらは現物確認が必要なため、スタッフがご相談を承ります。`,
+  });
 }
 
-async function startManualMode(ctx: Pkg1Context, reason: string): Promise<void> {
+interface StartManualModeOptions {
+  /** ack Bubble の前に出す導入文 (状況ふりわけのスタッフ送りで本物文言を出すため)。 */
+  readonly introText?: string;
+}
+
+async function startManualMode(
+  ctx: Pkg1Context,
+  reason: string,
+  options: StartManualModeOptions = {},
+): Promise<void> {
   await setManualMode(ctx.env as TrycleRepoEnv, ctx.lineUserId);
 
   // 見積中なら同梱物 (cart サマリ) を付ける (REQ-PKG1-017)。
@@ -152,13 +183,18 @@ async function startManualMode(ctx: Pkg1Context, reason: string): Promise<void> 
     console.error('[trycle-pkg1] notifyStaff failed', err);
   });
 
-  await safeReply(ctx, [
+  const messages: Array<FlexMessage | { type: 'text'; text: string }> = [];
+  if (options.introText) {
+    messages.push({ type: 'text', text: options.introText });
+  }
+  messages.push(
     buildAckBubble(
       'スタッフにおつなぎします',
       'この後はスタッフが直接ご対応します。ご相談内容をこのトークにお送りください。\n\nbot に戻るときは下のメニューから操作してください。',
       [],
     ),
-  ]);
+  );
+  await safeReply(ctx, messages);
 }
 
 // ── 経路 B ────────────────────────────────────────────────────────────────────
@@ -182,7 +218,7 @@ async function replyLaborList(ctx: Pkg1Context, category: string): Promise<void>
   if (labors.length === 0) {
     await safeReply(ctx, [
       buildAckBubble('該当メニューなし', `「${category}」のメニューが見つかりませんでした。`, [
-        { label: 'カテゴリへ戻る', data: 'pkg1_route_known', style: 'secondary' },
+        { label: 'カテゴリへ戻る', data: 'pkg1_categories', style: 'secondary' },
       ]),
     ]);
     return;
@@ -196,7 +232,7 @@ async function replyVariant(ctx: Pkg1Context, laborId: string): Promise<void> {
   if (!labor) {
     await safeReply(ctx, [
       buildAckBubble('メニューが見つかりません', '選択した整備メニューが見つかりませんでした。', [
-        { label: 'カテゴリへ戻る', data: 'pkg1_route_known', style: 'secondary' },
+        { label: 'カテゴリへ戻る', data: 'pkg1_categories', style: 'secondary' },
       ]),
     ]);
     return;
@@ -233,7 +269,7 @@ async function addToCart(ctx: Pkg1Context, laborId: string, optionIds: string[])
   if (!labor) {
     await safeReply(ctx, [
       buildAckBubble('追加に失敗しました', '選択したメニューが見つかりませんでした。', [
-        { label: 'カテゴリへ戻る', data: 'pkg1_route_known', style: 'secondary' },
+        { label: 'カテゴリへ戻る', data: 'pkg1_categories', style: 'secondary' },
       ]),
     ]);
     return;
@@ -277,7 +313,7 @@ async function replyEstimate(ctx: Pkg1Context): Promise<void> {
   if (!session || session.cart.length === 0) {
     await safeReply(ctx, [
       buildAckBubble('カートが空です', '見積もりたい整備メニューを先にお選びください。', [
-        { label: '整備メニューを選ぶ', data: 'pkg1_route_known', style: 'primary' },
+        { label: '整備メニューを選ぶ', data: 'pkg1_categories', style: 'primary' },
       ]),
     ]);
     return;
@@ -306,7 +342,7 @@ async function replyVisitDays(ctx: Pkg1Context): Promise<void> {
   if (!session || session.cart.length === 0) {
     await safeReply(ctx, [
       buildAckBubble('見積もりが必要です', '先に整備メニューを選んで見積もりを確認してください。', [
-        { label: '整備メニューを選ぶ', data: 'pkg1_route_known', style: 'primary' },
+        { label: '整備メニューを選ぶ', data: 'pkg1_categories', style: 'primary' },
       ]),
     ]);
     return;

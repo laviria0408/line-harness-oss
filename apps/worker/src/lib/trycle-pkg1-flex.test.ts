@@ -45,11 +45,16 @@ describe('priceLabel', () => {
 });
 
 describe('buildEntryBubble (経路 A・REQ-002)', () => {
-  it('offers exactly the 3 routing choices', () => {
+  it('offers the real 状況ふりわけ 3 択 with exact wording (本物 DISPATCH_LABELS)', () => {
     const s = serialize(buildEntryBubble());
-    expect(s).toContain('pkg1_route_known');
-    expect(s).toContain('pkg1_route_staff');
-    expect(s).toContain('pkg1_staff_consult');
+    // 3 つの postback (identified / comprehensive / unknown)
+    expect(s).toContain('pkg1_dispatch_identified');
+    expect(s).toContain('pkg1_dispatch_comprehensive');
+    expect(s).toContain('pkg1_dispatch_unknown');
+    // 本物の文言 (厳守)
+    expect(s).toContain('原因特定済み');
+    expect(s).toContain('包括メンテしたい');
+    expect(s).toContain('原因がわからない');
   });
 });
 
