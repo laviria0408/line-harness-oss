@@ -692,6 +692,26 @@ async function handleEvent(
       }
     }
 
+    // TRYCLE Pkg8: LH 標準 auto_reply に反応なし → Supabase faqs で FAQ 検索を試す
+    // (LH 標準を尊重し、それでマッチしなかった場合のみ TRYCLE 専用 search を発火)
+    if (!matched && !replyTokenConsumed && workerEnv && workerEnv.TRYCLE_TENANT_ID && event.replyToken) {
+      try {
+        const { handlePkg8Text } = await import('../lib/trycle-pkg8.js');
+        const handled = await handlePkg8Text(incomingText, {
+          replyToken: event.replyToken,
+          lineUserId: userId,
+          lineClient,
+          env: workerEnv,
+        });
+        if (handled) {
+          matched = true;
+          replyTokenConsumed = true;
+        }
+      } catch (err) {
+        console.error('[trycle-pkg8] text search failed', err);
+      }
+    }
+
     // auto_replies にマッチしなかった = 自発メッセージ → unread にする
     if (!matched) {
       await upsertChatOnMessage(db, friend.id);

@@ -20,6 +20,7 @@ import {
   listActiveFaqs,
   listFaqCategories,
   listTopViewedFaqs,
+  searchFaqs,
   getFaqById,
   incrementFaqCounter,
   type FaqRow,
@@ -28,6 +29,8 @@ import type { TrycleRepoEnv } from './trycle-repo.js';
 
 const FAQ_PREFIXES = ['faq_', 'pkg8_'] as const;
 const TOP_FAQS_COUNT = 3;
+const SEARCH_RESULTS_LIMIT = 5;
+const MIN_SEARCH_QUERY_LENGTH = 2;
 const TRYCLE_GREEN = '#06C755';
 const TEXT_PRIMARY = '#1e293b';
 const TEXT_MUTED = '#64748b';
@@ -96,6 +99,42 @@ export async function handlePkg8Postback(data: string, ctx: Pkg8Context): Promis
 
   await ctx.lineClient.replyMessage(ctx.replyToken, [{ type: 'text', text: '承りました。' }]);
   return true;
+}
+
+/**
+ * 自由入力テキストに対する FAQ 検索ハンドラ。webhook.ts の text 経路で
+ * LH 標準 auto_reply が match しなかった時に呼ぶ。
+ *
+ * Returns true if handled (caller MUST NOT continue with fallback).
+ * Returns false if the query is too short or no action taken.
+ */
+export async function handlePkg8Text(text: string, ctx: Pkg8Context): Promise<boolean> {
+  const query = text.trim();
+  if (query.length < MIN_SEARCH_QUERY_LENGTH) return false;
+
+  try {
+    const hits = await searchFaqs(ctx.env, query, SEARCH_RESULTS_LIMIT);
+    if (hits.length === 0) {
+      await replyNoHit(ctx, query);
+      return true;
+    }
+    if (hits.length === 1) {
+      // 1 件ヒット → そのまま回答
+      await incrementFaqCounter(ctx.env, hits[0]!.id, 'view_count').catch((err) => {
+        console.error('[trycle-pkg8] view_count increment failed', err);
+      });
+      const flex = buildAnswerBubble(hits[0]!);
+      await ctx.lineClient.replyMessage(ctx.replyToken, [flex]);
+      return true;
+    }
+    // 2-5 件 → 候補リスト
+    const flex = buildSearchResultsBubble(query, hits);
+    await ctx.lineClient.replyMessage(ctx.replyToken, [flex]);
+    return true;
+  } catch (err) {
+    console.error('[trycle-pkg8] handlePkg8Text failed', err);
+    return false;
+  }
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
@@ -170,6 +209,17 @@ async function replyUnhelpfulAck(ctx: Pkg8Context, faqId: string): Promise<void>
     [
       { label: '💬 スタッフに聞く', data: 'faq_staff', style: 'primary' },
       { label: '← FAQ に戻る', data: 'faq_start', style: 'secondary' },
+    ],
+  );
+  await ctx.lineClient.replyMessage(ctx.replyToken, [flex]);
+}
+
+async function replyNoHit(ctx: Pkg8Context, query: string): Promise<void> {
+  const flex = buildAckBubble(
+    'ご質問を承りました',
+    `「${query.length > 30 ? query.slice(0, 30) + '…' : query}」について、該当する FAQ が見つかりませんでした。\nスタッフから折り返しご連絡いたしますので、もう少々お待ちください。`,
+    [
+      { label: '← FAQ メニューを開く', data: 'faq_start', style: 'secondary' },
     ],
   );
   await ctx.lineClient.replyMessage(ctx.replyToken, [flex]);
@@ -318,6 +368,50 @@ function buildQuestionListBubble(category: string, faqs: FaqRow[]): FlexMessage 
             size: 'sm',
             color: '#ffffff',
             margin: 'xs',
+          },
+        ],
+      },
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        spacing: 'none',
+        paddingAll: 'none',
+        contents,
+      },
+    },
+  };
+}
+
+function buildSearchResultsBubble(query: string, faqs: FaqRow[]): FlexMessage {
+  const contents: object[] = [];
+  for (const f of faqs) {
+    const labelWithCategory = f.category ? `${f.question}` : f.question;
+    contents.push(buildTapRow({ icon: '▸', label: labelWithCategory, data: `faq_q_${f.id}` }));
+    contents.push(buildDivider());
+  }
+  contents.push(buildTapRow({ icon: '←', label: 'FAQ メニューへ', data: 'faq_start' }));
+
+  const shortQuery = query.length > 20 ? query.slice(0, 20) + '…' : query;
+  return {
+    type: 'flex',
+    altText: `「${shortQuery}」の検索結果`,
+    contents: {
+      type: 'bubble',
+      size: 'giga',
+      header: {
+        type: 'box',
+        layout: 'vertical',
+        paddingAll: 'lg',
+        backgroundColor: TRYCLE_GREEN,
+        contents: [
+          { type: 'text', text: 'こちらのご質問でしょうか？', size: 'md', weight: 'bold', color: '#ffffff', wrap: true },
+          {
+            type: 'text',
+            text: `「${shortQuery}」の検索結果 ${faqs.length} 件`,
+            size: 'xs',
+            color: '#ffffff',
+            margin: 'xs',
+            wrap: true,
           },
         ],
       },

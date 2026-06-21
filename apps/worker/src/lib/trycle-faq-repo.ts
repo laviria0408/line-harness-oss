@@ -85,6 +85,39 @@ export async function listFaqCategories(env: TrycleRepoEnv): Promise<string[]> {
   return Array.from(seen).sort();
 }
 
+/**
+ * テキスト自由入力に対する FAQ 検索。
+ * question / answer の ilike (case-insensitive partial match)。
+ * tags はサポート未 (PostgREST の OR + array 検索が複雑なため別フェーズ)。
+ *
+ * 並び順: view_count desc, sort_order asc (人気と並び順両方を考慮)。
+ */
+export async function searchFaqs(
+  env: TrycleRepoEnv,
+  query: string,
+  limit: number = 5,
+): Promise<FaqRow[]> {
+  const q = query.trim();
+  if (q.length === 0) return [];
+  // PostgREST の or= ilike. % は URI escape 不要だが念のため
+  const pattern = `*${q}*`;
+  const orFilter = `(question.ilike.${pattern},answer.ilike.${pattern})`;
+  return supabaseSelect<FaqRow>(
+    env,
+    'faqs',
+    {
+      tenant_id: `eq.${getTenantId(env)}`,
+      archived: `eq.false`,
+      or: orFilter,
+    },
+    {
+      select: FAQ_COLUMNS,
+      order: 'view_count.desc,sort_order.asc',
+      limit,
+    },
+  );
+}
+
 export async function getFaqById(env: TrycleRepoEnv, id: string): Promise<FaqRow | null> {
   const rows = await supabaseSelect<FaqRow>(
     env,
