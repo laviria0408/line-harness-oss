@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { generateVisitDays, nowJst } from './trycle-visit-slots.js';
+import { generateVisitDays, nowJst, MAX_DAYS_AHEAD } from './trycle-visit-slots.js';
 import type { StoreRow } from './trycle-repo.js';
 
 const store: StoreRow = {
@@ -55,6 +55,36 @@ describe('generateVisitDays', () => {
   it('emits a value parseable as datetimepicker', () => {
     const days = generateVisitDays(store, fromJst(), 1);
     expect(days[0]!.slots[0]!.value).toBe('2026-06-23t11:00');
+  });
+
+  // 指摘 2: 来店予定は今日から 14 日後までに制限する。
+  it('limits the lookahead to MAX_DAYS_AHEAD (= 14)', () => {
+    expect(MAX_DAYS_AHEAD).toBe(14);
+  });
+
+  it('never emits a day beyond 14 days ahead even when more is requested', () => {
+    // 1000 日要求しても horizon は 14 日に clamp される。
+    const days = generateVisitDays(store, fromJst(), 1000);
+    const fromTime = fromJst().getTime();
+    const dayMs = 24 * 60 * 60 * 1000;
+    for (const d of days) {
+      const offsetDays = Math.round(
+        (new Date(`${d.date}T00:00:00Z`).getTime() -
+          new Date(Date.UTC(2026, 5, 23)).getTime()) /
+          dayMs,
+      );
+      expect(offsetDays).toBeLessThan(MAX_DAYS_AHEAD);
+      expect(offsetDays).toBeGreaterThanOrEqual(0);
+    }
+    // 店は月曜定休のみ → 14 日窓で 12 営業日 (月曜 2 回除外)。
+    expect(days.length).toBe(12);
+    // fromTime は参照のみ (lint 回避)。
+    expect(fromTime).toBeGreaterThan(0);
+  });
+
+  it('defaults to the 14-day horizon when days is omitted', () => {
+    const days = generateVisitDays(store, fromJst());
+    expect(days.length).toBe(12); // 14 日窓・月曜定休 2 回
   });
 });
 

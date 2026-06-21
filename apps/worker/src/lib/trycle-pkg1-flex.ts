@@ -27,25 +27,36 @@ export interface FlexMessage {
 /**
  * カテゴリ表示名 (DB は英語 code・UI は日本語)。未知 code は raw を返す。
  * canonical な日本語名は将来 labor_categories マスタ化候補 (現状はここで吸収)。
+ *
+ * labor_master.category の canonical 14 code を全て登録する
+ * (db-seeds/labor-master.json と一致・raw な英語 code が UI に出る指摘 1 の修正)。
+ * 日本語訳は各カテゴリの代表メニュー名 (seed) から起こす。
+ * 旧エイリアス (bottom / headset / cable …) は後方互換で残す (既存挙動を壊さない)。
  */
 const CATEGORY_LABELS: Record<string, string> = {
+  // ── canonical 14 (labor_master.category) ─────────────────────────────
   brake: 'ブレーキ',
   shift: '変速・シフト',
-  drivetrain: '駆動系 (チェーン/スプロケット)',
   tire: 'タイヤ・チューブ',
   wheel: 'ホイール・振れ取り',
   hub: 'ハブ・ベアリング',
+  fork: 'フォーク・コラム',
+  head: 'ヘッド・ヘッドセット',
+  drivetrain: '駆動系 (チェーン/クランク)',
+  cockpit: 'ハンドル・ステム',
+  overhaul: 'オーバーホール',
+  component: 'コンポーネント組付け',
+  build: '完成車組み立て',
+  frame: 'フレーム・パーツ脱着',
+  other: 'その他',
+  // ── 後方互換エイリアス (旧 code・seed には無いが既存挙動維持) ────────────
   bottom: 'BB・クランク',
   'bottom-bracket': 'BB・クランク',
-  headset: 'ヘッドセット',
-  frame: 'フレーム・フォーク',
+  headset: 'ヘッド・ヘッドセット',
   cable: 'ケーブル・ワイヤー',
-  build: '組立・コンポーネント',
-  assembly: '組立・コンポーネント',
-  overhaul: 'オーバーホール',
+  assembly: 'コンポーネント組付け',
   cleaning: '洗車・クリーニング',
   general: 'その他・点検',
-  other: 'その他',
 };
 
 export function categoryLabel(category: string): string {
@@ -467,6 +478,10 @@ export function buildEstimateBubble(
           },
         ],
       },
+      // 確認後 3 択 (本物 pkg1-messages.confirmMessages に忠実・指摘 3):
+      //   PDF だけ受け取る → 連絡先/同意書なしで PDF 発行して終了 (pkg1_pdf_only)
+      //   ご来店予定を伝える → 同意書ゲート → 来店日時 → cases → PDF/Drive/Gmail
+      //   スタッフに相談する → notifyStaff (会話ログ + 見積サマリ同梱)
       footer: {
         type: 'box',
         layout: 'vertical',
@@ -477,6 +492,12 @@ export function buildEstimateBubble(
             type: 'button',
             style: 'primary',
             color: TRYCLE_GREEN,
+            height: 'sm',
+            action: { type: 'postback', label: 'PDF だけ受け取る', data: 'pkg1_pdf_only' },
+          },
+          {
+            type: 'button',
+            style: 'secondary',
             height: 'sm',
             action: { type: 'postback', label: 'ご来店予定を伝える', data: 'pkg1_visit_start' },
           },

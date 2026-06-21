@@ -121,3 +121,72 @@ describe('dispatch 3 択 (REQ-PKG1-002・本物 onDispatch 準拠)', () => {
     expect(s).toContain('pkg1_dispatch_unknown');
   });
 });
+
+/**
+ * cart を 1 件持つ bot_sessions を返す Supabase mock (pdf_only 経路の入力)。
+ * cases insert が走らないことを確かめるため、cases への POST を捕捉する。
+ */
+function mockSupabaseWithCart(casePosts: string[]) {
+  return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+    const url = typeof input === 'string' ? input : (input as Request).url ?? String(input);
+    const method = (init?.method ?? 'GET').toUpperCase();
+    if (method === 'POST' && url.includes('/cases')) {
+      casePosts.push(url);
+      return new Response('[{"id":"case-1"}]', { status: 201 });
+    }
+    if (method === 'GET' && url.includes('bot_sessions')) {
+      return new Response(
+        JSON.stringify([
+          {
+            state: {
+              step: 'quoted',
+              cart: [
+                {
+                  labor_id: 'l1', code: 'brake-adjust', name: 'ブレーキ調整',
+                  unit_price: 2000, unit_price_max: null, qty: 1,
+                  option_ids: [], option_names: [], option_total: 0,
+                },
+              ],
+            },
+            updated_at: new Date().toISOString(),
+          },
+        ]),
+        { status: 200 },
+      );
+    }
+    if (method === 'GET') {
+      return new Response('[]', { status: 200 });
+    }
+    return new Response(null, { status: 204 });
+  });
+}
+
+describe('pkg1_pdf_only (経路 C・本物 finishPdfOnly 準拠・指摘 3)', () => {
+  beforeEach(() => vi.restoreAllMocks());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('PDF 発行完了の ack を返し、cases は作らない (連絡先・同意書スキップ)', async () => {
+    const casePosts: string[] = [];
+    mockSupabaseWithCart(casePosts);
+    const captured: unknown[][] = [];
+    const handled = await handlePkg1Postback('pkg1_pdf_only', fakeContext(captured));
+
+    expect(handled).toBe(true);
+    const s = serialize(lastReply(captured));
+    expect(s).toContain('お見積書 (PDF) を発行しました');
+    // 来店予定 (経路 D) には進まない = cases insert は走らない。
+    expect(casePosts.length).toBe(0);
+    // 同意書ゲートにも来店日選択にも行かない。
+    expect(s).not.toContain('pkg1_visit_day_');
+    expect(s).not.toContain('同意書');
+  });
+
+  it('cart が空なら「カートが空です」案内を出す', async () => {
+    mockSupabaseFetch(); // bot_sessions GET は [] (空) を返す
+    const captured: unknown[][] = [];
+    await handlePkg1Postback('pkg1_pdf_only', fakeContext(captured));
+
+    const s = serialize(lastReply(captured));
+    expect(s).toContain('カートが空です');
+  });
+});

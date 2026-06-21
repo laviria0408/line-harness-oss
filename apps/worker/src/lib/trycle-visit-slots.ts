@@ -33,6 +33,13 @@ const LABEL_BY_WEEKDAY: Record<Weekday, string> = {
 /** 1 日あたり最大スロット数 (Bubble が縦に伸びすぎないよう制限)。 */
 const MAX_SLOTS_PER_DAY = 12;
 
+/**
+ * 来店予定の先読み上限 (今日から 14 日後まで)。
+ * 本物 (trycle-line-harness reservation 系) の運用に合わせ、遠すぎる来店予定は
+ * 出さない (在庫・空き状況が読めないため)。指摘 2 の修正。
+ */
+export const MAX_DAYS_AHEAD = 14;
+
 export interface VisitDay {
   /** "YYYY-MM-DD" (JST)。 */
   readonly date: string;
@@ -63,19 +70,23 @@ function pad2(n: number): string {
  *
  * @param store         営業時間 / slot 刻みを持つ店舗
  * @param fromJst       基準時刻 (JST 壁時計を UTC フィールドに持たせた Date)
- * @param days          先読みする日数 (既定 7)
+ * @param days          先読みする日数 (既定 = 今日含め 14 日先・MAX_DAYS_AHEAD で上限固定)
  */
 export function generateVisitDays(
   store: StoreRow,
   fromJst: Date,
-  days = 7,
+  days = MAX_DAYS_AHEAD,
 ): VisitDay[] {
   const result: VisitDay[] = [];
   const slotMinutes = store.reservation_slot_minutes > 0
     ? store.reservation_slot_minutes
     : 30;
 
-  for (let offset = 0; offset < days; offset += 1) {
+  // 来店予定は今日から MAX_DAYS_AHEAD 日後までに制限 (指摘 2)。
+  // 呼び出し側が大きい days を渡しても上限を超えない。
+  const horizon = Math.min(days, MAX_DAYS_AHEAD);
+
+  for (let offset = 0; offset < horizon; offset += 1) {
     const day = new Date(fromJst.getTime());
     day.setUTCDate(day.getUTCDate() + offset);
     const weekday = WEEKDAY_BY_INDEX[day.getUTCDay()];

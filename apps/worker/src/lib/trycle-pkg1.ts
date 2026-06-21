@@ -115,6 +115,10 @@ async function route(data: string, ctx: Pkg1Context): Promise<void> {
   // 経路 C: 見積確認
   if (data === 'pkg1_confirm') return replyEstimate(ctx);
 
+  // 経路 C: PDF だけ受け取る (本物 pkg1-estimate.ts finishPdfOnly に忠実)。
+  // 連絡先・同意書・cases を取らずに PDF を発行して LINE に送り、終了する。
+  if (data === 'pkg1_pdf_only') return replyPdfOnly(ctx);
+
   // 経路 D: 来店予定 → 同意書 → cases → PDF
   if (data === 'pkg1_visit_start') return replyVisitDays(ctx);
   if (data.startsWith('pkg1_visit_day_')) return replyVisitTimes(ctx, data.slice('pkg1_visit_day_'.length));
@@ -321,6 +325,69 @@ async function replyEstimate(ctx: Pkg1Context): Promise<void> {
   const quote = buildQuoteFromCart(session.cart);
   await upsertPkg1Session(ctx.env as TrycleRepoEnv, ctx.lineUserId, { ...session, step: 'quoted' });
   await safeReply(ctx, [buildEstimateBubble(quote, PARTS_NOTICE)]);
+}
+
+/**
+ * PDF だけ受け取る (本物 pkg1-estimate.ts finishPdfOnly に忠実)。
+ *
+ * 連絡先入力・同意書・cases 作成をスキップし、見積 PDF を発行して Drive 保存 +
+ * 店舗へ Gmail 通知 (graceful degrade) のうえ、LINE に PDF URL を送って終了する。
+ * 来店予定 (経路 D) とは違い案件 (cases) は作らない。
+ */
+async function replyPdfOnly(ctx: Pkg1Context): Promise<void> {
+  const session = await getPkg1Session(ctx.env as TrycleRepoEnv, ctx.lineUserId);
+  if (!session || session.cart.length === 0) {
+    await safeReply(ctx, [
+      buildAckBubble('カートが空です', '見積もりたい整備メニューを先にお選びください。', [
+        { label: '整備メニューを選ぶ', data: 'pkg1_categories', style: 'primary' },
+      ]),
+    ]);
+    return;
+  }
+
+  const quote = buildQuoteFromCart(session.cart);
+  const customerName = await resolveCustomerName(ctx);
+
+  // PDF 発行 + Drive 保存 (失敗してもフローを止めない)。
+  const pdf = await issueEstimatePdf(ctx.env, {
+    quote,
+    customerName,
+    storeName: null,
+    quoteNo: null,
+    partsNotice: PARTS_NOTICE,
+    disclaimer: quote.disclaimer,
+  });
+  const pdfUrl = pdf.ok ? (pdf.pdfUrl ?? null) : null;
+
+  // 店舗へ Gmail 通知 (PDF 発行のみ・cases なし)。未設定なら no-op。
+  await notifyStaff(ctx.env, {
+    lineUserId: ctx.lineUserId,
+    customerName,
+    reason: 'PDF 発行のみ',
+    estimateSummary: cartSummaryText(session.cart),
+    pdfUrl,
+    note: '来店予定・同意書なしで PDF のみ発行',
+  }).catch((err) => console.error('[trycle-pkg1] notifyStaff (pdf_only) failed', err));
+
+  // session を完了させる (cases は作らない・履歴は messages_log)。
+  await clearPkg1Session(ctx.env as TrycleRepoEnv, ctx.lineUserId).catch(() => {});
+
+  const doneButtons = pdfUrl
+    ? [{ label: '見積書 PDF を開く', uri: pdfUrl, style: 'primary' as const }]
+    : [];
+  await safeReply(ctx, [
+    buildAckBubble(
+      'お見積書 (PDF) を発行しました',
+      [
+        pdfUrl
+          ? '下のボタンから PDF をご確認いただけます。'
+          : '見積書はスタッフよりご案内します。',
+        '※ 概算のお見積もりです。正式なお見積もりは現車確認後にご案内します。',
+        'またのお問い合わせをお待ちしております。',
+      ].join('\n'),
+      doneButtons,
+    ),
+  ]);
 }
 
 export function buildQuoteFromCart(cart: ReadonlyArray<CartItem>) {
