@@ -88,8 +88,11 @@ export async function listFaqCategories(env: TrycleRepoEnv): Promise<string[]> {
 
 /**
  * テキスト自由入力に対する FAQ 検索。
- * question / answer の ilike (case-insensitive partial match)。
- * tags はサポート未 (PostgREST の OR + array 検索が複雑なため別フェーズ)。
+ * question / answer / tags_text の ilike (case-insensitive partial match)。
+ *
+ * tags_text は migration 0017 で追加した tags 配列を空白区切りで連結した
+ * 派生列 (trigger で自動同期)。「バラ」→ tags=["バラカン"] のような
+ * 部分一致を可能にする。詳細は dashboard PWA migration 参照。
  *
  * 並び順: view_count desc, sort_order asc (人気と並び順両方を考慮)。
  */
@@ -100,9 +103,8 @@ export async function searchFaqs(
 ): Promise<FaqRow[]> {
   const q = query.trim();
   if (q.length === 0) return [];
-  // PostgREST の or= ilike. % は URI escape 不要だが念のため
   const pattern = `*${q}*`;
-  const orFilter = `(question.ilike.${pattern},answer.ilike.${pattern})`;
+  const orFilter = `(question.ilike.${pattern},answer.ilike.${pattern},tags_text.ilike.${pattern})`;
   return supabaseSelect<FaqRow>(
     env,
     'faqs',
