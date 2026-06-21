@@ -50,6 +50,29 @@ export async function listActiveFaqs(env: TrycleRepoEnv): Promise<FaqRow[]> {
 }
 
 /**
+ * 閲覧数 (view_count) 上位 N 件の active FAQ を返す (人気トップ表示用)。
+ * 同数の場合は sort_order 昇順で安定化。
+ */
+export async function listTopViewedFaqs(
+  env: TrycleRepoEnv,
+  limit: number = 3,
+): Promise<FaqRow[]> {
+  return supabaseSelect<FaqRow>(
+    env,
+    'faqs',
+    {
+      tenant_id: `eq.${getTenantId(env)}`,
+      archived: `eq.false`,
+    },
+    {
+      select: FAQ_COLUMNS,
+      order: 'view_count.desc,sort_order.asc',
+      limit,
+    },
+  );
+}
+
+/**
  * active FAQ から unique category を昇順で返す。null/空は除外。
  * カテゴリ master を別 table に切り出すまでの暫定実装。
  */

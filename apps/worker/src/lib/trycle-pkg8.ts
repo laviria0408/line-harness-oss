@@ -19,6 +19,7 @@ import type { LineClient } from '@line-crm/line-sdk';
 import {
   listActiveFaqs,
   listFaqCategories,
+  listTopViewedFaqs,
   getFaqById,
   incrementFaqCounter,
   type FaqRow,
@@ -100,19 +101,22 @@ export async function handlePkg8Postback(data: string, ctx: Pkg8Context): Promis
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 async function replyEntry(ctx: Pkg8Context): Promise<void> {
-  const [categories, faqs] = await Promise.all([
+  // 人気トップ 3 = view_count desc・カテゴリ一覧 = distinct from active faqs
+  const [topFaqs, categories, faqsCount] = await Promise.all([
+    listTopViewedFaqs(ctx.env, TOP_FAQS_COUNT),
     listFaqCategories(ctx.env),
-    listActiveFaqs(ctx.env),
+    listActiveFaqs(ctx.env).then((f) => f.length),
   ]);
-  if (categories.length === 0 && faqs.length === 0) {
+  if (categories.length === 0 && faqsCount === 0) {
     await ctx.lineClient.replyMessage(ctx.replyToken, [
       { type: 'text', text: '現在ご案内できる FAQ がありません。スタッフへ直接ご連絡ください。' },
     ]);
     return;
   }
 
-  const topFaqs = faqs.slice(0, TOP_FAQS_COUNT);
-  const flex = buildEntryBubble(topFaqs, categories);
+  // 閲覧数が 0 の FAQ は人気として出さない (新規 deploy 直後は空)
+  const topFaqsFiltered = topFaqs.filter((f) => f.view_count > 0);
+  const flex = buildEntryBubble(topFaqsFiltered, categories);
   await ctx.lineClient.replyMessage(ctx.replyToken, [flex]);
 }
 
