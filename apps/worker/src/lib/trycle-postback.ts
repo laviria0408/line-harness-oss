@@ -1,78 +1,69 @@
 /**
  * TRYCLE postback dispatcher.
  *
- * Phase B-4 で stub として組み込まれた経路を、Phase E-impl Step 2 で Pkg8
- * (FAQ) は完全実装に置き換えた。Pkg1 (整備見積) / consent / reservation は
- * Step 4-6 で書き直す対象として stub のまま残置 (LH 標準 + 個別維持の混成
- * 設計に従う・「LH 標準活用設計 v1.0 (Phase C-3)」§5 / §6 参照)。
+ * Phase B-4 で stub として組み込まれた経路を順次実装に置き換えている。
+ *   - Pkg8 (FAQ)      : Phase E-impl Step 2 で完全実装
+ *   - Pkg1 (整備見積) : Phase E-impl Step 4-7 で完全実装 (handlePkg1Postback)
+ *   - consent_        : 同意書は LIFF (apps/consent-liff/) → HTTP route (routes/consent.ts)
+ *                       で取得するため postback では使わない (誤発火時の保険 stub)
+ *   - reservation_    : 旧予約導線。Pkg1 では「来店予定ヒアリング」に統合済のため
+ *                       未使用 (将来 Pkg5 Booking 用に予約・stub のまま残置)
  *
  * Return value:
- *   true  → TRYCLE handled it. Caller MUST NOT continue with auto-reply
- *           matching (we already replied via the LINE Client).
- *   false → not a TRYCLE postback; caller continues with stock LINE Harness
- *           auto_reply / scenario matching.
+ *   true  → TRYCLE handled it. Caller MUST NOT continue with auto-reply matching.
+ *   false → not a TRYCLE postback; caller continues with stock auto_reply / scenario.
  */
 import type { LineClient } from '@line-crm/line-sdk';
+import type { Env } from '../index.js';
 import { handlePkg8Postback, isPkg8Postback } from './trycle-pkg8.js';
+import { handlePkg1Postback, isPkg1Postback } from './trycle-pkg1.js';
 import type { TrycleRepoEnv } from './trycle-repo.js';
 
-const TRYCLE_STUB_PREFIXES = [
-  'pkg1_',
-  'consent_',
-  'reservation_',
-] as const;
+const TRYCLE_STUB_PREFIXES = ['consent_', 'reservation_'] as const;
 
 export function isTryclePostback(data: string): boolean {
-  return isPkg8Postback(data) || TRYCLE_STUB_PREFIXES.some((prefix) => data.startsWith(prefix));
+  return (
+    isPkg8Postback(data) ||
+    isPkg1Postback(data) ||
+    TRYCLE_STUB_PREFIXES.some((prefix) => data.startsWith(prefix))
+  );
 }
 
 export interface TryclePostbackContext {
   readonly replyToken: string;
   readonly lineUserId: string;
   readonly lineClient: LineClient;
-  readonly env: TrycleRepoEnv;
+  readonly env: Env['Bindings'];
 }
 
 export async function tryHandleTryclePostback(
   data: string,
   ctx: TryclePostbackContext,
 ): Promise<boolean> {
-  // Pkg8 (FAQ) は Phase E-impl Step 2 で完全実装
+  // Pkg8 (FAQ) — Phase E-impl Step 2 で完全実装。
   if (isPkg8Postback(data)) {
-    return handlePkg8Postback(data, ctx);
+    return handlePkg8Postback(data, {
+      replyToken: ctx.replyToken,
+      lineUserId: ctx.lineUserId,
+      lineClient: ctx.lineClient,
+      env: ctx.env as TrycleRepoEnv,
+    });
   }
-  // Pkg1 / consent / reservation は Phase E-impl Step 4-6 で書き直す対象。
-  // 暫定 ack で auto-reply 経路には流さない (重複返信防止)。
+  // Pkg1 (整備見積) — Phase E-impl Step 4-7 で完全実装。
+  if (isPkg1Postback(data)) {
+    return handlePkg1Postback(data, ctx);
+  }
+  // consent_ / reservation_ は通常ここに来ない (LIFF / 来店予定ヒアリングへ統合)。
+  // 誤発火しても auto-reply 経路には流さない (重複返信防止)。
   if (TRYCLE_STUB_PREFIXES.some((prefix) => data.startsWith(prefix))) {
-    const message = trycleStubAckMessage(data);
     try {
-      await ctx.lineClient.replyMessage(ctx.replyToken, [{ type: 'text', text: message }]);
+      await ctx.lineClient.replyMessage(ctx.replyToken, [
+        { type: 'text', text: '承りました。スタッフよりご案内いたします。' },
+      ]);
     } catch (err) {
       console.error('[trycle-postback] stub reply failed', err);
     }
     return true;
   }
   return false;
-}
-
-function trycleStubAckMessage(data: string): string {
-  if (data.startsWith('pkg1_start')) {
-    return '整備見積もりフローを準備中です。スタッフからご連絡いたします。';
-  }
-  if (data.startsWith('pkg1_wage')) {
-    return '工賃表と同意書のご案内を準備中です。';
-  }
-  if (data.startsWith('pkg1_staff')) {
-    return 'スタッフへの相談を準備中です。担当者から折り返しご連絡いたします。';
-  }
-  if (data.startsWith('pkg1_')) {
-    return '整備関連のフローを準備中です。';
-  }
-  if (data.startsWith('consent_')) {
-    return '同意書フローを準備中です。';
-  }
-  if (data.startsWith('reservation_')) {
-    return '来店予約フローを準備中です。';
-  }
-  return `承りました: ${data}`;
 }
