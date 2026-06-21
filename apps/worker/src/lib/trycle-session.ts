@@ -67,10 +67,14 @@ interface BotSessionRow {
   readonly updated_at: string;
 }
 
-/** 来店予定フロー state (本物 `ReservationStep`・経路 D-2)。別 kind の session。 */
+/**
+ * 来店予定フロー state (経路 D-2)。別 kind の session。
+ *
+ * Option A (日時候補 縦リスト) で「店舗選択 → datetimepicker」の 2 ステップを
+ * 「店舗内包の候補を 1 タップ」= `awaiting_reservation_slot` の 1 ステップに統合した。
+ */
 export type ReservationStep =
-  | 'awaiting_store'
-  | 'awaiting_datetime'
+  | 'awaiting_reservation_slot'
   | 'awaiting_confirm'
   | 'completed';
 

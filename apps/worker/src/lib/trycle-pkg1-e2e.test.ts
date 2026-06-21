@@ -9,7 +9,7 @@
  *   経路 B: dispatch(identified) → region → symptom → variant → qty → cart
  *   経路 C: cart(confirm) → confirm(概算見積)
  *   経路 D-1: confirm(pdf_only) → cases 保存 + 完了文言
- *   経路 D-2: confirm(reserve) → (同意済) → store → datetime → reserve_confirm(ok)
+ *   経路 D-2: confirm(reserve) → (同意済) → 日時候補 縦リスト → reserve_slot → reserve_confirm(ok)
  *   経路 redo / cart(add) / reserve_confirm(change) も検証。
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -295,7 +295,7 @@ describe('Pkg1 全動線 E2E (postback wiring・経路 B→C→D)', () => {
     expect(s).toContain('action=pkg1_region&value=brake');
   });
 
-  it('経路 D-2 (同意済): confirm(reserve)→store→datetime→reserve_confirm(ok) が全段通る', async () => {
+  it('経路 D-2 (同意済): confirm(reserve)→slot→reserve_confirm(ok) が全段通る', async () => {
     buildStatefulSupabase({ consentValid: true });
     const captured: unknown[][] = [];
     const ctx = fakeContext(captured);
@@ -306,18 +306,15 @@ describe('Pkg1 全動線 E2E (postback wiring・経路 B→C→D)', () => {
     await handlePkg1Postback('action=pkg1_variant&value=0', ctx);
     await handlePkg1Postback('action=pkg1_cart&value=confirm', ctx);
 
-    // reserve → 同意済なので店舗選択へ
+    // reserve → 同意済なので来店日時候補の縦リストへ (店舗選択ステップは無い)
     await handlePkg1Postback('action=pkg1_confirm&value=reserve', ctx);
-    expect(last(captured)).toContain('action=pkg1_reserve_store&value=s1');
+    const sList = last(captured);
+    expect(sList).toContain('action=pkg1_reserve_slot&value=s1|');
+    expect(sList).not.toContain('pkg1_reserve_store');
 
-    // store 選択 → datetimepicker
-    await handlePkg1Postback('action=pkg1_reserve_store&value=s1', ctx);
-    expect(last(captured)).toContain('action=pkg1_reserve_dt');
-
-    // datetimepicker 確定 (postback.params.datetime 経由・平日昼想定の未来日時)
+    // 候補 (store 内包) を 1 タップ → 確認 3 択
     const dt = futureWeekdayNoon();
-    const ctxDt = fakeContext(captured, dt);
-    await handlePkg1Postback('action=pkg1_reserve_dt', ctxDt);
+    await handlePkg1Postback(`action=pkg1_reserve_slot&value=s1|${dt}`, ctx);
     const sConfirm = last(captured);
     expect(sConfirm).toContain('action=pkg1_reserve_confirm&value=ok');
     expect(sConfirm).toContain('action=pkg1_reserve_confirm&value=change');
@@ -327,24 +324,16 @@ describe('Pkg1 全動線 E2E (postback wiring・経路 B→C→D)', () => {
     expect(last(captured)).toContain('お待ちしております');
   });
 
-  it('reservation session 失効中に reserve_store をタップしても無反応にならない (graceful)', async () => {
-    // session を一切作らずに store 選択 postback を投げる (失効/期限切れの再現)。
+  it('reservation session 失効中に reserve_slot をタップしても無反応にならない (graceful)', async () => {
+    // session を一切作らずに候補選択 postback を投げる (失効/期限切れの再現)。
     buildStatefulSupabase();
     const captured: unknown[][] = [];
     const ctx = fakeContext(captured);
-    await handlePkg1Postback('action=pkg1_reserve_store&value=s1', ctx);
+    await handlePkg1Postback(`action=pkg1_reserve_slot&value=s1|${futureWeekdayNoon()}`, ctx);
     // 旧実装は silent return (無反応) だった。再開導線が返ることを保証する。
     const s = last(captured);
     expect(s).toContain('もう一度はじめから');
     expect(s).toContain('action=pkg1_dispatch&value=identified');
-  });
-
-  it('reservation session 失効中に reserve_dt をタップしても無反応にならない (graceful)', async () => {
-    buildStatefulSupabase();
-    const captured: unknown[][] = [];
-    const ctx = fakeContext(captured, futureWeekdayNoon());
-    await handlePkg1Postback('action=pkg1_reserve_dt', ctx);
-    expect(last(captured)).toContain('もう一度はじめから');
   });
 
   it('reservation session 失効中に reserve_confirm をタップしても無反応にならない (graceful)', async () => {
@@ -355,7 +344,7 @@ describe('Pkg1 全動線 E2E (postback wiring・経路 B→C→D)', () => {
     expect(last(captured)).toContain('もう一度はじめから');
   });
 
-  it('経路 D-2: reserve_confirm(change) で再度日時選択に戻る', async () => {
+  it('経路 D-2: reserve_confirm(change) で再度日時候補リストに戻る', async () => {
     buildStatefulSupabase({ consentValid: true });
     const captured: unknown[][] = [];
     const ctx = fakeContext(captured);
@@ -366,11 +355,10 @@ describe('Pkg1 全動線 E2E (postback wiring・経路 B→C→D)', () => {
     await handlePkg1Postback('action=pkg1_variant&value=0', ctx);
     await handlePkg1Postback('action=pkg1_cart&value=confirm', ctx);
     await handlePkg1Postback('action=pkg1_confirm&value=reserve', ctx);
-    await handlePkg1Postback('action=pkg1_reserve_store&value=s1', ctx);
     const dt = futureWeekdayNoon();
-    await handlePkg1Postback('action=pkg1_reserve_dt', fakeContext(captured, dt));
+    await handlePkg1Postback(`action=pkg1_reserve_slot&value=s1|${dt}`, ctx);
     await handlePkg1Postback('action=pkg1_reserve_confirm&value=change', ctx);
-    expect(last(captured)).toContain('action=pkg1_reserve_dt');
+    expect(last(captured)).toContain('action=pkg1_reserve_slot&value=s1|');
   });
 });
 

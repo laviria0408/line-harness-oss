@@ -11,8 +11,8 @@
  *   symptomMessages (region 配下の作業) / variantMessages (排他別単価の種類) /
  *   qtyPrompt (pair/count・v1.2.1 で任意数量は text 受付) / cartDecisionPrompt /
  *   confirmMessages (概算見積 + PDF だけ / 来店予定 / やり直す) / cartSummaryText /
- *   consentPrompt (LIFF URI) / storeCarousel (店舗選択) / datetimePickerMessage /
- *   reservationConfirmPrompt。
+ *   consentPrompt (LIFF URI) / reservationSlotMessages (来店日時候補 縦リスト・
+ *   Option A: 店舗内包の 1 タップ選択) / reservationConfirmPrompt。
  *
  * postback 命名は本物 `action=pkg1_X&value=Y` 形式 (設計 v1.2.1 §3) を維持。
  * ロジック (state machine / dispatcher / postback format) は dfba733 のまま不変。
@@ -29,7 +29,7 @@ import {
   TAX_RATE,
   type QuoteLineItem,
 } from './quote.js';
-import type { StoreRow } from './trycle-repo.js';
+import type { ReservationSlot } from './trycle-visit-slots.js';
 import {
   buildTapRow,
   buildSectionLabel,
@@ -371,71 +371,69 @@ export function cartSummaryText(cart: ReadonlyArray<QuoteLineItem>): string {
   return `カートに追加しました（${cart.length}件）\n\n${formatQuoteText(quote)}`;
 }
 
-// ── 来店予定: 店舗選択 縦リスト (本物 reservation-flow storeCarousel) ───────────
-
-export function storeCarousel(stores: ReadonlyArray<StoreRow>): LineMessage {
-  const contents: object[] = [buildSectionLabel('🏬 ご来店店舗を選んでください')];
-  stores.forEach((s, i) => {
-    contents.push(buildTapRow({ icon: '▸', label: s.name, data: `action=pkg1_reserve_store&value=${s.id}` }));
-    if (i < stores.length - 1) contents.push(buildDivider());
-  });
-  return buildListBubble({
-    altText: '来店店舗をお選びください',
-    headerTitle: 'ご来店店舗',
-    headerSubtitle: '来店する店舗をお選びください',
-    contents,
-  });
-}
-
-// ── 来店予定: 日時 datetimepicker (本物 datetimePickerMessage・14 日先) ──────────
+// ── 来店予定: 日時候補 縦リスト (Option A・店舗内包・1 タップ選択) ────────────────
+//
+// 旧 UI (店舗 carousel + datetimepicker 自由カレンダー) は「分かりにくい」評価を受けた
+// ため、14 日分の「日付 × 店舗 × 時刻」候補を Pkg8 LH 準拠の縦リスト (section label +
+// tap row + divider) で提示する。候補が店舗を内包するので店舗選択ステップは不要。
+// 候補は数百件になりうるため buildPaginatedListMessages の byte 予算 carousel 分割に乗せ、
+// section label / tap row / divider を自前で組んで dividers=false で渡す。
 
 const RESERVATION_HORIZON_DAYS = 14;
 
-export function datetimePickerMessage(store: StoreRow): LineMessage {
-  const today = new Date();
-  const min = formatDatetimePickerValue(today);
-  const max = formatDatetimePickerValue(
-    new Date(today.getTime() + RESERVATION_HORIZON_DAYS * 24 * 3600 * 1000),
-  );
-  const slot = store.reservation_slot_minutes > 0 ? store.reservation_slot_minutes : 30;
-  // datetimepicker は LINE 標準 action (Pkg8 に対応物が無いため標準を使う)。
-  // tap row と同じ見た目の box に datetimepicker action を載せる。
-  const pickerRow = {
-    type: 'box',
-    layout: 'horizontal',
-    spacing: 'sm',
-    paddingTop: 'md',
-    paddingBottom: 'md',
-    paddingStart: 'md',
-    paddingEnd: 'md',
-    action: {
-      type: 'datetimepicker',
-      label: '日時を選ぶ',
-      data: 'action=pkg1_reserve_dt',
-      mode: 'datetime',
-      initial: min,
-      min,
-      max,
-    },
-    contents: [
-      { type: 'text', text: '📅', size: 'md', flex: 0 },
-      {
-        type: 'text',
-        text: '日時を選ぶ',
-        size: 'md',
-        color: TEXT_PRIMARY,
-        wrap: true,
-        flex: 1,
-        weight: 'bold',
-      },
-      { type: 'text', text: '›', size: 'lg', color: TEXT_MUTED, flex: 0, align: 'end' },
-    ],
-  };
-  return buildListBubble({
-    altText: '来店予定日時をお選びください',
-    headerTitle: store.name,
-    headerSubtitle: `${RESERVATION_HORIZON_DAYS}日先まで・${slot}分刻みで選べます`,
-    contents: [buildSectionLabel('🗓 ご来店予定の日時'), pickerRow],
+/** 1 候補の tap row。「{HH:MM} {店舗略称}」を 1 行で。postback に店舗 + 日時を内包。 */
+function reservationSlotRow(slot: ReservationSlot): object {
+  return buildTapRow({
+    icon: '▸',
+    label: `${slot.timeLabel} ${slot.storeAbbr}`,
+    data: `action=pkg1_reserve_slot&value=${slot.storeId}|${slot.datetime}`,
+  });
+}
+
+/**
+ * 来店日時候補の縦リスト。日付ごとに section label を挟み、その配下に候補 tap row を
+ * 並べる。10KB を超えるなら carousel に自動分割する (件数が増えても silent reject させない)。
+ * 候補ゼロ (全店休業/枠切れ) は空配列でなく「準備中」1 Bubble を返し fail-loud にする。
+ */
+export function reservationSlotMessages(slots: ReadonlyArray<ReservationSlot>): LineMessage[] {
+  if (slots.length === 0) {
+    return [
+      buildListBubble({
+        altText: 'ご来店予定の候補が見つかりません',
+        headerTitle: 'ご来店予定',
+        headerSubtitle: '候補が見つかりませんでした',
+        contents: [
+          bodyText(
+            'ただいまご案内できる来店枠が見つかりませんでした。スタッフよりご連絡いたします。',
+            { muted: true },
+          ),
+        ],
+      }),
+    ];
+  }
+
+  // 日付が変わるたびに section label を差し込みつつ row を 1 本の配列に積む。
+  // buildPaginatedListMessages の自動 divider は使わず (section label を跨ぐと不自然)、
+  // 候補 row の間にだけ自前で divider を入れる。
+  const rows: object[] = [];
+  let prevDate: string | null = null;
+  slots.forEach((slot) => {
+    if (slot.date !== prevDate) {
+      rows.push(buildSectionLabel(`📅 ${slot.dateLabel}`));
+      prevDate = slot.date;
+    } else {
+      rows.push(buildDivider());
+    }
+    rows.push(reservationSlotRow(slot));
+  });
+
+  return buildPaginatedListMessages({
+    altText: 'ご来店予定の日時をお選びください',
+    headerTitle: '📅 ご来店予定',
+    headerSubtitle: `${RESERVATION_HORIZON_DAYS}日先までの候補からお選びください`,
+    leadingContents: [buildSectionLabel('🗓 ご希望の日時を選んでください')],
+    tapRows: rows,
+    dividers: false,
   });
 }
 
@@ -459,16 +457,6 @@ export function reservationConfirmPrompt(storeName: string, visitAtIso: string):
 }
 
 // ── 日時整形 (本物 reservation-flow と同一・JST 壁時計を文字列で扱う) ───────────
-
-/** LINE datetimepicker の initial/min/max は "YYYY-MM-DDtHH:mm" 形式。 */
-function formatDatetimePickerValue(d: Date): string {
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  const hh = String(d.getHours()).padStart(2, '0');
-  const mi = String(d.getMinutes()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}t${hh}:${mi}`;
-}
 
 export function formatVisitAt(iso: string): string {
   // iso は "YYYY-MM-DDtHH:mm" (datetimepicker) または ISO 文字列。表示用に整形する。

@@ -55,6 +55,26 @@ export interface VisitSlot {
   readonly label: string;
 }
 
+/**
+ * 来店候補 1 件 (店舗 × 日 × 時刻を平坦化した row)。Option A の縦リスト UI 用。
+ * 店舗 carousel + datetimepicker (自由カレンダー) は「分かりにくい」評価を受けたため、
+ * 候補を 1 タップで選べる縦リストに置き換える (reservationSlotMessages が消費する)。
+ */
+export interface ReservationSlot {
+  readonly storeId: string;
+  /** 店舗略称 (stores.code・LINE Bubble 字数節約用・無ければ name で代替)。 */
+  readonly storeAbbr: string;
+  readonly storeName: string;
+  /** "YYYY-MM-DD" (JST)。section label の日付グルーピング用。 */
+  readonly date: string;
+  /** "06/22 (土)" 表示用 (date 別 section label・MM/DD zero-pad)。 */
+  readonly dateLabel: string;
+  /** "10:00" 表示用 (tap row)。 */
+  readonly timeLabel: string;
+  /** "YYYY-MM-DDtHH:mm" (JST・postback / validateVisitAt 用)。 */
+  readonly datetime: string;
+}
+
 function hhmmToMinutes(hhmm: string): number {
   const [h, m] = hhmm.split(':').map((s) => Number.parseInt(s, 10));
   return h * 60 + m;
@@ -131,6 +151,66 @@ export function generateVisitDays(
     });
   }
   return result;
+}
+
+/** stores.code を表示用略称に。null/空なら店舗名で代替する (字数節約は best-effort)。 */
+function storeAbbr(store: StoreRow): string {
+  const code = store.code?.trim();
+  return code && code.length > 0 ? code : store.name;
+}
+
+/** "YYYY-MM-DD" → "06/22 (土)" (MM/DD zero-pad・曜日付き・JST)。 */
+function dateLabelOf(dateStr: string): string {
+  const [y, mo, d] = dateStr.split('-').map((s) => Number.parseInt(s, 10));
+  // 正午 UTC で曜日を引く (日付境界の TZ ずれ回避)。曜日は date 文字列由来で確定。
+  const wday = WEEKDAY_BY_INDEX[new Date(Date.UTC(y, mo - 1, d, 12)).getUTCDay()];
+  return `${pad2(mo)}/${pad2(d)} (${LABEL_BY_WEEKDAY[wday]})`;
+}
+
+/**
+ * 全営業店舗 × 今日から `days` 日先までの来店候補を「日付昇順 → 店舗の並び順」で
+ * 平坦化した配列を返す (Option A の縦リスト UI 用)。各候補は店舗を内包するため、
+ * 利用者は店舗 + 時刻の組を 1 タップで選べる (店舗選択ステップが不要になる)。
+ *
+ * 既存の generateVisitDays (店舗単位の営業日 × slot 列挙・定休/過去除外/14 日 clamp) を
+ * 再利用するので、定休除外・slot grid・先読み上限のロジックは 1 箇所に集約される (DRY)。
+ *
+ * @param stores  営業中の店舗 (listActiveStores の結果・sort_order 昇順を保つ)
+ * @param fromJst 基準時刻 (JST 壁時計を UTC フィールドに載せた Date・nowJst())
+ * @param days    先読み日数 (既定 = MAX_DAYS_AHEAD・generateVisitDays 側で clamp)
+ */
+export function buildReservationSlots(
+  stores: ReadonlyArray<StoreRow>,
+  fromJst: Date,
+  days = MAX_DAYS_AHEAD,
+): ReservationSlot[] {
+  // date → (store 並び順を保った) 候補。Map は挿入順を保つので店舗ループ後に
+  // 日付昇順へ並べ替えるだけで「日付 → 店舗」順になる。
+  const byDate = new Map<string, ReservationSlot[]>();
+
+  for (const store of stores) {
+    const abbr = storeAbbr(store);
+    for (const day of generateVisitDays(store, fromJst, days)) {
+      const bucket = byDate.get(day.date) ?? [];
+      for (const slot of day.slots) {
+        bucket.push({
+          storeId: store.id,
+          storeAbbr: abbr,
+          storeName: store.name,
+          date: day.date,
+          dateLabel: dateLabelOf(day.date),
+          timeLabel: slot.label,
+          datetime: slot.value,
+        });
+      }
+      byDate.set(day.date, bucket);
+    }
+  }
+
+  // 日付昇順 (YYYY-MM-DD は辞書順 = 時系列順) に並べて平坦化。
+  return [...byDate.keys()]
+    .sort()
+    .flatMap((date) => byDate.get(date) ?? []);
 }
 
 /**

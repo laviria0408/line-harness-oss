@@ -9,14 +9,14 @@ import {
   confirmMessages,
   consentPrompt,
   cartSummaryText,
-  storeCarousel,
+  reservationSlotMessages,
   reservationConfirmPrompt,
   formatVisitAt,
   DISPATCH_LABELS,
 } from './trycle-pkg1-flex.js';
 import { REGIONS, findRegionByValue } from '../data/pkg1-regions.js';
 import { makeLineItem, type QuoteLineItem } from './quote.js';
-import type { StoreRow } from './trycle-repo.js';
+import type { ReservationSlot } from './trycle-visit-slots.js';
 
 function serialize(o: unknown): string {
   return JSON.stringify(o);
@@ -197,22 +197,85 @@ describe('consentPrompt (経路 D・REQ-016)', () => {
   });
 });
 
-// ── store list (経路 D-2) ─────────────────────────────────────────────────────
+// ── reservation slot list (経路 D-2・Option A 日時候補 縦リスト) ────────────────
 
-describe('storeCarousel (経路 D-2・店舗選択 縦リスト)', () => {
-  const stores: StoreRow[] = [
-    { id: 's1', name: '矢野口本店', code: 'Y', business_hours: {}, reservation_slot_minutes: 30, is_active: true },
-    { id: 's2', name: '宮ヶ瀬店', code: 'M', business_hours: {}, reservation_slot_minutes: 30, is_active: true },
-  ];
-  it('renders one tap row per store with pkg1_reserve_store postbacks in a Flex bubble', () => {
-    const msg = storeCarousel(stores);
-    expectNotTemplate(msg);
-    expectBubble(msg);
-    const s = serialize(msg);
-    expect(s).toContain('action=pkg1_reserve_store&value=s1');
-    expect(s).toContain('action=pkg1_reserve_store&value=s2');
-    expect(s).toContain('矢野口本店');
-    expect(s).toContain('宮ヶ瀬店');
+function slot(p: Partial<ReservationSlot>): ReservationSlot {
+  return {
+    storeId: 's1',
+    storeAbbr: 'Y',
+    storeName: '矢野口本店',
+    date: '2026-06-22',
+    dateLabel: '06/22 (土)',
+    timeLabel: '10:00',
+    datetime: '2026-06-22t10:00',
+    ...p,
+  };
+}
+
+describe('reservationSlotMessages (経路 D-2・Option A 日時候補 縦リスト)', () => {
+  it('renders one tap row per candidate with store+datetime in the postback', () => {
+    const msgs = reservationSlotMessages([
+      slot({ storeId: 's1', storeAbbr: 'Y', timeLabel: '10:00', datetime: '2026-06-22t10:00' }),
+      slot({ storeId: 's2', storeAbbr: 'M', storeName: '宮ヶ瀬店', timeLabel: '10:30', datetime: '2026-06-22t10:30' }),
+    ]);
+    expect(msgs).toHaveLength(1);
+    expectNotTemplate(msgs[0]);
+    expectBubble(msgs[0]);
+    const s = serialize(msgs);
+    // postback は store と ISO 日時を内包する ({storeId}|{datetime})。
+    expect(s).toContain('action=pkg1_reserve_slot&value=s1|2026-06-22t10:00');
+    expect(s).toContain('action=pkg1_reserve_slot&value=s2|2026-06-22t10:30');
+    // tap row ラベルは「{HH:MM} {店舗略称}」。
+    expect(s).toContain('10:00 Y');
+    expect(s).toContain('10:30 M');
+  });
+
+  it('inserts a per-date section label and keeps dates in chronological order', () => {
+    const msgs = reservationSlotMessages([
+      slot({ date: '2026-06-22', dateLabel: '06/22 (土)', timeLabel: '10:00', datetime: '2026-06-22t10:00' }),
+      slot({ date: '2026-06-23', dateLabel: '06/23 (日)', timeLabel: '11:00', datetime: '2026-06-23t11:00' }),
+    ]);
+    const s = serialize(msgs);
+    expect(s).toContain('📅 06/22 (土)');
+    expect(s).toContain('📅 06/23 (日)');
+    expect(s.indexOf('06/22')).toBeLessThan(s.indexOf('06/23'));
+  });
+
+  it('splits into a carousel when many candidates exceed the bubble byte budget', () => {
+    // 14 日 × 2 店舗 × 5 slot/day = 140 候補相当。10KB を超えるので carousel 分割される。
+    const slots: ReservationSlot[] = [];
+    for (let day = 0; day < 14; day += 1) {
+      const date = `2026-07-${String(day + 1).padStart(2, '0')}`;
+      for (const [id, abbr] of [['s1', 'Y'], ['s2', 'M']] as const) {
+        for (let h = 10; h < 15; h += 1) {
+          const time = `${String(h).padStart(2, '0')}:00`;
+          slots.push(
+            slot({ storeId: id, storeAbbr: abbr, date, dateLabel: `07/${String(day + 1).padStart(2, '0')} (—)`, timeLabel: time, datetime: `${date}t${time}` }),
+          );
+        }
+      }
+    }
+    expect(slots).toHaveLength(140);
+    const msgs = reservationSlotMessages(slots);
+    // 単一 Flex メッセージだが contents は carousel (複数 bubble)。
+    expect(msgs).toHaveLength(1);
+    const contents = (msgs[0] as { contents: { type: string; contents?: unknown[] } }).contents;
+    expect(contents.type).toBe('carousel');
+    expect((contents.contents ?? []).length).toBeGreaterThan(1);
+    // 全 140 候補の postback が漏れず載る。
+    const s = serialize(msgs);
+    expect(s).toContain('action=pkg1_reserve_slot&value=s1|2026-07-01t10:00');
+    expect(s).toContain('action=pkg1_reserve_slot&value=s2|2026-07-14t14:00');
+  });
+
+  it('fails loud (準備中) with no postback when there are no candidates', () => {
+    const msgs = reservationSlotMessages([]);
+    expect(msgs).toHaveLength(1);
+    expectNotTemplate(msgs[0]);
+    expectBubble(msgs[0]);
+    const s = serialize(msgs);
+    expect(s).not.toContain('pkg1_reserve_slot');
+    expect(s).toContain('見つかりませんでした');
   });
 });
 
