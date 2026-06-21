@@ -73,8 +73,9 @@ export async function listTopViewedFaqs(
 }
 
 /**
- * active FAQ から unique category を昇順で返す。null/空は除外。
- * カテゴリ master を別 table に切り出すまでの暫定実装。
+ * active FAQ から unique category を返す。null/空は除外。
+ * 並び順は listActiveFaqs (sort_order asc) の登場順を保持
+ * → dashboard でのカテゴリ並び替えがそのまま反映される。
  */
 export async function listFaqCategories(env: TrycleRepoEnv): Promise<string[]> {
   const faqs = await listActiveFaqs(env);
@@ -82,7 +83,7 @@ export async function listFaqCategories(env: TrycleRepoEnv): Promise<string[]> {
   for (const f of faqs) {
     if (f.category && f.category.trim() !== '') seen.add(f.category);
   }
-  return Array.from(seen).sort();
+  return Array.from(seen);
 }
 
 /**
