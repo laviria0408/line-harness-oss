@@ -161,7 +161,7 @@ export const REGIONS: ReadonlyArray<Region> = [
       { label: 'チェーン交換', sample: 'chain-swap' },
       { label: 'チェーンリング交換', sample: 'chainring-swap' },
       { label: 'クランク交換', sample: 'crank-swap' },
-      { label: 'スプロケット交換', sample: 'cassette-swap' },
+      { label: 'スプロケット交換', sample: 'sprocket-swap' },
       { label: 'BB 交換', sample: 'bb-swap' },
       { label: 'BB グリスアップ', sample: 'bb-grease' },
       { label: 'その他', sample: null },
@@ -188,7 +188,7 @@ export const REGIONS: ReadonlyArray<Region> = [
         ],
       },
       { label: 'スポーク交換', sample: 'spoke-swap', qty: 'count' },
-      { label: 'スポーク作成（カット長さ調整・1本）', sample: 'spoke-make', qty: 'count' },
+      { label: 'スポーク作成（カット長さ調整・1本）', sample: 'spoke-make-cut', qty: 'count' },
       {
         label: 'ホイール組み立て',
         variants: [
