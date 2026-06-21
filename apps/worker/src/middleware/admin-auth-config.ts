@@ -203,6 +203,20 @@ export function resolveCorsOrigin(
     return origin;
   }
 
+  // Pkg1 案 B: Consent LIFF endpoints (/api/consent-*) are protected by LINE
+  // access_token verify (not staff/cookie auth), so CORS can echo any origin
+  // back. Without this, browsers block the LIFF → worker fetch with "Failed
+  // to fetch" because resolveAdminAuthConfig only allows ADMIN_ORIGIN.
+  let requestPath = '';
+  try {
+    requestPath = new URL(requestUrl).pathname;
+  } catch {
+    requestPath = '';
+  }
+  if (requestPath.startsWith('/api/consent-')) {
+    return origin;
+  }
+
   const { allowedOrigins } = resolveAdminAuthConfig(env);
   const allowed = new Set(
     [...allowedOrigins, requestOrigin].filter(Boolean).map(stripTrailingSlash),

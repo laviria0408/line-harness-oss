@@ -68,6 +68,23 @@ export async function upsertCustomer(
   );
 }
 
+/** tenant スコープで line_user_id から customer_id を取得 (upsertCustomer の後で紐付け用)。 */
+export async function findCustomerIdByLineUserId(
+  env: TrycleRepoEnv,
+  lineUserId: string,
+): Promise<string | null> {
+  const rows = await supabaseSelect<{ id: string }>(
+    env,
+    'customers',
+    {
+      tenant_id: `eq.${getTenantId(env)}`,
+      line_user_id: `eq.${lineUserId}`,
+    },
+    { select: 'id', limit: 1 },
+  );
+  return rows[0]?.id ?? null;
+}
+
 // ── Consent (maintenance-consent etc.) ──────────────────────────────────────
 
 export interface ConsentRow {
@@ -80,6 +97,42 @@ export interface ConsentRow {
 
 export const MAINTENANCE_CONSENT_SOURCE = 'maintenance-consent';
 export const CONSENT_VALIDITY_DAYS = 365;
+
+// ── Consent document (Pkg1 LIFF 案 B) ────────────────────────────────────────
+//
+// 同意書文面の version 管理マスタ。LIFF 同意書 (apps/consent-liff/) の Step 1 が
+// 最新の有効版を取得して body_md を render する。設計: Notion consent_documents
+// 設計書 v1.0 (386050ad6a7e81a9a388c11d68355bfd)。
+
+export interface ConsentDocumentRow {
+  readonly id: string;
+  readonly version: string;
+  readonly title: string;
+  readonly body_md: string;
+}
+
+/**
+ * 最新の有効な同意書文面 (archived=false を valid_from desc で先頭 1 件) を返す。
+ * 文面が未投入なら null。
+ */
+export async function findActiveConsentDocument(
+  env: TrycleRepoEnv,
+): Promise<ConsentDocumentRow | null> {
+  const rows = await supabaseSelect<ConsentDocumentRow>(
+    env,
+    'consent_documents',
+    {
+      tenant_id: `eq.${getTenantId(env)}`,
+      archived: 'eq.false',
+    },
+    {
+      select: 'id,version,title,body_md',
+      order: 'valid_from.desc',
+      limit: 1,
+    },
+  );
+  return rows[0] ?? null;
+}
 
 export async function hasValidMaintenanceConsent(
   env: TrycleRepoEnv,
@@ -109,6 +162,7 @@ export async function upsertConsent(
   env: TrycleRepoEnv,
   patch: {
     lineUserId: string;
+    customerId?: string | null;
     source: string;
     payload?: Record<string, unknown>;
   },
@@ -120,6 +174,7 @@ export async function upsertConsent(
       {
         tenant_id: getTenantId(env),
         line_user_id: patch.lineUserId,
+        customer_id: patch.customerId ?? null,
         source: patch.source,
         consented_at: new Date().toISOString(),
         payload: patch.payload ?? {},
