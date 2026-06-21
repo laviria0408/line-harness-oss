@@ -47,8 +47,10 @@ export interface FaqRow {
 
 const FAQ_LINK_COLUMNS = 'id,label,action_type,url,postback_data,sort_order';
 
+// PostgREST の embed (faq_links(*)) は default でテーブル名のキー (faq_links) になるため、
+// FaqRow.links に対応させるため `links:faq_links(...)` で alias 化。
 const FAQ_COLUMNS =
-  `id,tenant_id,question,answer,category,tags,sort_order,archived,view_count,helpful_count,unhelpful_count,follow_up,faq_links(${FAQ_LINK_COLUMNS})`;
+  `id,tenant_id,question,answer,category,tags,sort_order,archived,view_count,helpful_count,unhelpful_count,follow_up,links:faq_links(${FAQ_LINK_COLUMNS})`;
 
 /**
  * PostgREST の embed (`faq_links(...)`) は埋め込み行の order を別パラメータ
