@@ -46,6 +46,10 @@ WORKER_PUBLIC_URL = "https://trycle-poc.trycle-g1st-dev.workers.dev"
 ADMIN_PUBLIC_URL = "https://trycle-poc-admin-155f311f.pages.dev"
 LIFF_PUBLIC_URL = "https://trycle-poc-liff.pages.dev"
 CF_ACCOUNT_ID = "375ccebf7904d6088d4ba97c643533d5"
+# Consent LIFF (Pkg1 案 B) endpoints (/api/consent-document, /api/consent-callback)
+# need no new vars: they reuse SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY /
+# TRYCLE_TENANT_ID (secrets) and verify the LIFF access_token against LINE's
+# public Profile API (https://api.line.me/v2/profile).
 
 # ═══════════════════════════════════════════════════════════════
 # 本番環境

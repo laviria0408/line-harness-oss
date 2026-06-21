@@ -78,6 +78,7 @@ import adminUpdate from './routes/admin-update.js';
 // TRYCLE business endpoints (Phase B). Mounted alongside LINE Harness
 // stock routes; tenant-scoped Supabase access is opt-in via env vars.
 import { trycle } from './routes/trycle.js';
+import { consent } from './routes/consent.js';
 
 export type Env = {
   Bindings: {
@@ -168,6 +169,7 @@ app.route('/', liffRoutes);
 
 // TRYCLE business endpoints (Phase B)
 app.route('/', trycle);
+app.route('/', consent);
 
 // Mount route groups — Round 3
 app.route('/', webhooks);
