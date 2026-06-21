@@ -33,6 +33,7 @@ export async function callGas(
   req: GasRequest,
 ): Promise<GasResponse> {
   if (!env.GAS_WEB_APP_URL) {
+    console.error(`[gas-client] GAS_WEB_APP_URL not configured (type=${req.type})`);
     return { ok: false, error: 'GAS_WEB_APP_URL not configured' };
   }
   try {
@@ -42,10 +43,21 @@ export async function callGas(
       body: JSON.stringify(req),
     });
     if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      console.error(
+        `[gas-client] GAS responded ${res.status} (type=${req.type}): ${body.slice(0, 300)}`,
+      );
       return { ok: false, error: `GAS responded ${res.status}` };
     }
-    return (await res.json()) as GasResponse;
+    const parsed = (await res.json()) as GasResponse;
+    if (!parsed.ok) {
+      console.error(
+        `[gas-client] GAS returned ok=false (type=${req.type}): ${parsed.error ?? 'no error field'}`,
+      );
+    }
+    return parsed;
   } catch (err) {
+    console.error(`[gas-client] GAS request threw (type=${req.type}):`, err);
     return {
       ok: false,
       error: err instanceof Error ? err.message : String(err),

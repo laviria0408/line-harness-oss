@@ -59,7 +59,7 @@ import {
 } from './trycle-session.js';
 import { parseJstDatetime, validateVisitAt } from './trycle-store-hours.js';
 import { notifyStaff } from './trycle-staff.js';
-import { issueEstimatePdf } from './trycle-pkg1-pdf.js';
+import { issueEstimatePdf, type EstimatePdfResult } from './trycle-pkg1-pdf.js';
 import {
   dispatchPrompt,
   regionMessages,
@@ -420,7 +420,7 @@ async function finishPdfOnly(ctx: Pkg1Context, session: Pkg1State): Promise<void
     quoteNo: saved?.quoteNo ?? null,
     lineUserId: ctx.lineUserId,
   });
-  const pdfUrl = pdf.ok ? pdf.pdfUrl ?? null : null;
+  const pdfUrl = resolvePdfUrl(pdf, 'pdf_only', ctx.lineUserId);
   if (saved && pdfUrl) await updateQuotePdfUrl(env, saved, pdfUrl).catch((err) => console.error('[trycle-pkg1] updateQuotePdfUrl failed', err));
 
   await clearPkg1Session(env, ctx.lineUserId).catch((err) => console.error('[trycle-pkg1] clearPkg1Session failed', err));
@@ -644,7 +644,7 @@ async function finalizeReservation(ctx: Pkg1Context, session: ReservationState):
     quoteNo: saved?.quoteNo ?? null,
     lineUserId: ctx.lineUserId,
   });
-  const pdfUrl = pdf.ok ? pdf.pdfUrl ?? null : null;
+  const pdfUrl = resolvePdfUrl(pdf, '来店予定', ctx.lineUserId);
   if (saved && pdfUrl) await updateQuotePdfUrl(env, saved, pdfUrl).catch((err) => console.error('[trycle-pkg1] updateQuotePdfUrl failed', err));
 
   // 店舗スタッフへ Gmail 通知 (REQ-PKG1-015・見積サマリ + PDF 同梱)。
@@ -810,13 +810,31 @@ function estimateSummaryText(cart: ReadonlyArray<QuoteLineItem>): string {
   return lines.join('\n');
 }
 
-/** 見積 text に PDF URL (発行できていれば) を添える。 */
+/**
+ * PDF 発行結果から URL を取り出す。失敗 (ok=false) または URL 欠落の場合は
+ * 必ず root cause を console.error に出す (silent fail 防止・前回 commit の方針継続)。
+ * GAS 側のテンプレ未刷新 / 404 / 500 / 応答不正はここに error 文字列として現れる。
+ */
+function resolvePdfUrl(
+  pdf: EstimatePdfResult,
+  flow: string,
+  lineUserId: string,
+): string | null {
+  if (pdf.ok && pdf.pdfUrl) return pdf.pdfUrl;
+  console.error(
+    `[trycle-pkg1] estimate PDF unavailable (flow=${flow} user=${lineUserId} ok=${pdf.ok}):`,
+    pdf.error ?? (pdf.ok ? 'GAS responded ok but pdfUrl missing' : 'unknown error'),
+  );
+  return null;
+}
+
+/** 見積 text に PDF URL (発行できていれば) を添える。失敗時は明示エラー文言。 */
 function formatQuoteWithPdf(quote: Quote, pdfUrl: string | null): string {
   const head = formatQuoteText(quote);
   if (pdfUrl) {
     return `${head}\n\nお見積書（PDF）を発行しました。\n${pdfUrl}`;
   }
-  return `${head}\n\nお見積書（PDF）は準備中です。お見積もり内容はスタッフへ共有しました。`;
+  return `${head}\n\nお見積書（PDF）の生成に失敗しました。お見積もり内容はスタッフへ共有しましたので、スタッフが確認のうえご連絡いたします。`;
 }
 
 async function safeReply(ctx: Pkg1Context, messages: LineMessage[]): Promise<void> {
