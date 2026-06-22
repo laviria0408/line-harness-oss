@@ -87,7 +87,7 @@ describe('buildLineItemFromPending (本物 sample 解決)', () => {
     expect(item!.notes).toContain('油圧加算');
   });
 
-  it('appends 〜 for price_open_ended labor', async () => {
+  it('sets unitPriceMax=null for price_open_ended labor (= "¥X〜" via formatItemPrice)', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(
         JSON.stringify([laborRow({ code: 'chain-swap', name: 'チェーン交換', price_open_ended: true })]),
@@ -100,7 +100,27 @@ describe('buildLineItemFromPending (本物 sample 解決)', () => {
       regionValue: 'drivetrain',
       symptomIndex,
     });
-    expect(item!.name).toContain('〜');
+    // 旧仕様: name 末尾に "〜" を付与。新仕様: 名前は素のまま (= "チェーン交換")、
+    // 上限なし表現は unitPriceMax=null に任せ formatItemPrice が "¥X〜" を出す。
+    expect(item!.name).not.toContain('〜');
+    expect(item!.unitPriceMax).toBeNull();
+  });
+
+  it('sets unitPriceMax=unitPrice for fixed-price labor (no "〜")', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify([laborRow({ code: 'chain-swap', name: 'チェーン交換', price_open_ended: false, price: 2500 })]),
+        { status: 200 },
+      ),
+    );
+    const region = findRegionByValue('drivetrain')!;
+    const symptomIndex = region.symptoms!.findIndex((s) => s.label === 'チェーン交換');
+    const item = await buildLineItemFromPending(env(), {
+      regionValue: 'drivetrain',
+      symptomIndex,
+    });
+    expect(item!.unitPrice).toBe(2500);
+    expect(item!.unitPriceMax).toBe(2500);
   });
 
   it('returns null when sample is null (その他)', async () => {
@@ -154,11 +174,15 @@ describe('saveQuote (cases + quotes + quote_versions・v1.2.1)', () => {
     expect(saved.caseId).toBe('case-1');
     expect(saved.quoteId).toBe('quote-1');
     expect(saved.quoteVersionId).toBe('qv-1');
-    expect(saved.quoteNo).toMatch(/^Q-Y-/);
+    // estimate なので E- prefix (2026-06-22 prefix 動的化)
+    expect(saved.quoteNo).toMatch(/^E-Y-/);
     // cases / quotes / quote_versions all inserted
     expect(calls.some((c) => c.url.includes('/cases') && c.method === 'POST')).toBe(true);
     expect(calls.some((c) => c.url.includes('/quotes') && c.method === 'POST')).toBe(true);
     expect(calls.some((c) => c.url.includes('/quote_versions') && c.method === 'POST')).toBe(true);
+    // Step 5/6 は UPDATE (PATCH) で current_version_id / quote_no を紐付ける (UPSERT は NOT NULL 違反になる)
+    expect(calls.some((c) => c.url.includes('/quotes') && c.method === 'PATCH')).toBe(true);
+    expect(calls.some((c) => c.url.includes('/cases') && c.method === 'PATCH')).toBe(true);
     // quote_versions payload carries tax/total from the quote
     const qvCall = calls.find((c) => c.url.includes('/quote_versions') && c.method === 'POST');
     const qvBody = JSON.parse(qvCall!.body as string)[0];

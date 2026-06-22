@@ -30,8 +30,13 @@ const LABEL_BY_WEEKDAY: Record<Weekday, string> = {
   sat: '土',
 };
 
-/** 1 日あたり最大スロット数 (Bubble が縦に伸びすぎないよう制限)。 */
-const MAX_SLOTS_PER_DAY = 12;
+/**
+ * 1 日あたり最大スロット数。営業時間 8-9h × 30 分刻み = 16-18 slot を全て出せるよう
+ * 24 まで広げる (旧 12 では矢野口 11:00-19:00 が 11:00-17:00 で頭打ちになる事故あり)。
+ * Flex bubble 1 つは BUBBLE_BYTE_BUDGET=8500 で paginate されるため、この上限は
+ * セーフティネット (異常店舗時間で bubble 爆発を防ぐ用)。
+ */
+const MAX_SLOTS_PER_DAY = 24;
 
 /**
  * 来店予定の先読み上限 (今日から 14 日後まで)。

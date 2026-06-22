@@ -29,10 +29,12 @@ import {
   hasValidMaintenanceConsent,
   listActiveStores,
   findStoreById,
+  getTenantQuoteSettings,
   type TrycleRepoEnv,
 } from './trycle-repo.js';
 import {
   buildLineItemFromPending,
+  findCaseStatusByKey,
   findInitialCaseStatus,
   findDefaultStore,
   findStoreCode,
@@ -57,8 +59,8 @@ import {
   type PendingSelection,
   type ReservationState,
 } from './trycle-session.js';
-import { parseJstDatetime, validateVisitAt } from './trycle-store-hours.js';
-import { buildReservationSlots, nowJst } from './trycle-visit-slots.js';
+import { jstWallToIsoZ, parseJstDatetime, validateVisitAt } from './trycle-store-hours.js';
+import { generateVisitDays, nowJst, type VisitDay } from './trycle-visit-slots.js';
 import { notifyStaff } from './trycle-staff.js';
 import { issueEstimatePdf, type EstimatePdfResult } from './trycle-pkg1-pdf.js';
 import {
@@ -71,7 +73,9 @@ import {
   confirmMessages,
   consentPrompt,
   cartSummaryText,
-  reservationSlotMessages,
+  reservationStoreCarousel,
+  reservationDateList,
+  reservationTimeList,
   reservationConfirmPrompt,
   textMessage,
   formatVisitAt,
@@ -352,7 +356,8 @@ async function addLineItemAndAskCart(
     step: 'awaiting_cart_decision',
     pending: undefined,
   });
-  await safeReply(ctx, [textMessage(cartSummaryText(cart)), cartDecisionPrompt()]);
+  const taxOptions = await getTenantQuoteSettings(repoEnv(ctx));
+  await safeReply(ctx, [textMessage(cartSummaryText(cart, taxOptions)), cartDecisionPrompt()]);
 }
 
 async function onCartDecision(ctx: Pkg1Context, value: string | null): Promise<void> {
@@ -368,7 +373,8 @@ async function onCartDecision(ctx: Pkg1Context, value: string | null): Promise<v
     return;
   }
   await upsertPkg1Session(repoEnv(ctx), ctx.lineUserId, { ...session, step: 'awaiting_confirm' });
-  await safeReply(ctx, confirmMessages(session.cart));
+  const taxOptions = await getTenantQuoteSettings(repoEnv(ctx));
+  await safeReply(ctx, confirmMessages(session.cart, taxOptions));
 }
 
 // ── 確認 → 3 択 (REQ-PKG1-009/011) ────────────────────────────────────────────
@@ -401,7 +407,7 @@ async function finishPdfOnly(ctx: Pkg1Context, session: Pkg1State): Promise<void
     return;
   }
   const env = repoEnv(ctx);
-  const quote = buildQuote(session.cart);
+  const quote = buildQuote(session.cart, await getTenantQuoteSettings(env));
 
   // 見積保存 (v1.2.1 §7 #3): cases(status pdf_only・customer_id=null) + quote_versions。
   const saved = await saveQuoteSafely(ctx, {
@@ -409,13 +415,15 @@ async function finishPdfOnly(ctx: Pkg1Context, session: Pkg1State): Promise<void
     customerId: null,
     visitScheduledAt: null,
     caseLabel: 'pdf_only',
+    statusKey: 'quote',
   });
 
   // PDF 発行 (payload に line_user_id 含む・v1.2.1)。失敗してもフローは止めない。
-  const customerName = await resolveCustomerName(ctx);
+  const customer = await resolveCustomerContact(ctx);
   const pdf = await issueEstimatePdf(ctx.env, {
     quote,
-    customerName,
+    customerName: customer.name,
+    customerPhone: customer.phone,
     storeName: null,
     quoteNo: saved?.quoteNo ?? null,
     lineUserId: ctx.lineUserId,
@@ -471,7 +479,7 @@ async function startConsentLiff(ctx: Pkg1Context): Promise<void> {
 
 /**
  * 経路 D-2: 同意書 submit 後 (consent-callback) に Push で来店予定フローを再開する。
- * 退避した cart (pkg1_cart) があれば来店日時候補の縦リストを Push し、cart 退避を消す。
+ * 退避した cart (pkg1_cart) があれば店舗選択 carousel を Push し、cart 退避を消す。
  * reply token は使えない (元 webhook でない) ため pushMessage のみ。
  * cart が無い (経路 E の純粋な同意書だけ) なら no-op で false を返す。
  */
@@ -489,16 +497,16 @@ export async function resumeReservationAfterConsent(
   }
   if (!cart || cart.length === 0) return false;
 
-  const slotMessages = await buildReservationSlotMessages(repo).catch(() => null);
-  if (!slotMessages) return false;
+  const stores = await listActiveStores(repo).catch(() => [] as Awaited<ReturnType<typeof listActiveStores>>);
+  if (stores.length === 0) return false;
 
-  await setReservationSession(repo, lineUserId, { step: 'awaiting_reservation_slot', cart }).catch((err) => console.error('[trycle-pkg1] setReservationSession failed', err));
+  await setReservationSession(repo, lineUserId, { step: 'awaiting_store', cart }).catch((err) => console.error('[trycle-pkg1] setReservationSession failed', err));
   await clearPkg1Cart(repo, lineUserId).catch((err) => console.error('[trycle-pkg1] clearPkg1Cart failed', err));
   await clearPkg1Session(repo, lineUserId).catch((err) => console.error('[trycle-pkg1] clearPkg1Session failed', err));
   try {
     await lineClient.pushMessage(lineUserId, [
-      textMessage('ご登録ありがとうございました。\nご来店予定の日時をお選びください。'),
-      ...slotMessages,
+      textMessage('ご登録ありがとうございました。\nご来店店舗をお選びください。'),
+      reservationStoreCarousel(stores),
     ] as never);
   } catch (err) {
     console.error('[trycle-pkg1] resume reservation push failed', err);
@@ -507,29 +515,21 @@ export async function resumeReservationAfterConsent(
   return true;
 }
 
-// ── 来店予定フロー (Option A・日時候補 縦リスト → 確認) ─────────────────────────
+// ── 来店予定フロー (3 段階: 店舗 → 日付 → 時間 → 確認) ─────────────────────────
 
-/**
- * 全営業店舗 × 14 日分の来店候補を縦リスト Flex に組む。候補ゼロや店舗未取得は
- * null を返し、呼び出し側が fail-loud に倒せるようにする (silent 無反応を防ぐ)。
- */
-async function buildReservationSlotMessages(env: TrycleRepoEnv): Promise<LineMessage[] | null> {
-  const stores = await listActiveStores(env);
-  if (stores.length === 0) return null;
-  const slots = buildReservationSlots(stores, nowJst());
-  return reservationSlotMessages(slots);
-}
-
-/** 同意 OK / 既存顧客 で entry。来店日時候補の縦リストを返す。 */
+/** 同意 OK / 既存顧客 で entry。店舗選択 carousel を返す。 */
 async function startReservationFlow(ctx: Pkg1Context, cart: QuoteLineItem[]): Promise<void> {
   const env = repoEnv(ctx);
-  const slotMessages = await buildReservationSlotMessages(env);
-  if (!slotMessages) {
+  const stores = await listActiveStores(env).catch((err) => {
+    console.error('[trycle-pkg1] listActiveStores failed', err);
+    return [] as Awaited<ReturnType<typeof listActiveStores>>;
+  });
+  if (stores.length === 0) {
     await safeReply(ctx, [textMessage('来店予約の準備でエラーが発生しました。スタッフが折り返します。')]);
     return;
   }
-  await setReservationSession(env, ctx.lineUserId, { step: 'awaiting_reservation_slot', cart });
-  await safeReply(ctx, [textMessage('ご来店予定の日時をお選びください。'), ...slotMessages]);
+  await setReservationSession(env, ctx.lineUserId, { step: 'awaiting_store', cart });
+  await safeReply(ctx, [textMessage('ご来店店舗をお選びください。'), reservationStoreCarousel(stores)]);
 }
 
 async function handleReservationPostback(
@@ -538,8 +538,12 @@ async function handleReservationPostback(
   ctx: Pkg1Context,
 ): Promise<void> {
   switch (action) {
-    case 'pkg1_reserve_slot':
-      return onReservationSlotSelected(ctx, value);
+    case 'pkg1_reserve_store':
+      return onStoreSelected(ctx, value);
+    case 'pkg1_reserve_date':
+      return onDateSelected(ctx, value);
+    case 'pkg1_reserve_time':
+      return onTimeSelected(ctx, value);
     case 'pkg1_reserve_confirm':
       return onReservationConfirmed(ctx, value);
     default:
@@ -547,52 +551,107 @@ async function handleReservationPostback(
   }
 }
 
-/**
- * 候補 (store + datetime を内包した postback) を 1 タップで受ける。value は
- * "{storeId}|{YYYY-MM-DDtHH:mm}"。slot 生成時に営業時間/grid は満たしているが、
- * 念のため validateVisitAt で二重チェックしてから確認画面へ進む。
- */
-async function onReservationSlotSelected(ctx: Pkg1Context, value: string | null): Promise<void> {
+// ── ① 店舗選択 → 日付候補 ──────────────────────────────────────────────────────
+
+async function onStoreSelected(ctx: Pkg1Context, storeId: string | null): Promise<void> {
   const env = repoEnv(ctx);
-  const parsed = parseReservationSlotValue(value);
-  if (!parsed) return reservationLost(ctx);
+  if (!storeId) return reservationLost(ctx);
   const session = await getReservationSession(env, ctx.lineUserId);
   if (!session) return reservationLost(ctx);
-  const store = await findStoreById(env, parsed.storeId);
+  const store = await findStoreById(env, storeId);
   if (!store) return reservationLost(ctx);
 
-  const visitAt = parseJstDatetime(parsed.datetime);
+  await setReservationSession(env, ctx.lineUserId, {
+    ...session,
+    step: 'awaiting_date',
+    storeId: store.id,
+    storeName: store.name,
+    date: undefined,
+    visitAtIso: undefined,
+  });
+  await safeReply(ctx, [reservationDateList(store, generateVisitDays(store, nowJst()))]);
+}
+
+// ── ② 日付選択 → 時間候補 ──────────────────────────────────────────────────────
+
+async function onDateSelected(ctx: Pkg1Context, date: string | null): Promise<void> {
+  const env = repoEnv(ctx);
+  if (!date) return reservationLost(ctx);
+  const session = await getReservationSession(env, ctx.lineUserId);
+  if (!session?.storeId) return reservationLost(ctx);
+  const store = await findStoreById(env, session.storeId);
+  if (!store) return reservationLost(ctx);
+
+  const day = findVisitDay(store, date);
+  if (!day || day.slots.length === 0) {
+    // 候補に無い日 / 枠切れ → 日付選択をやり直してもらう (無反応を防ぐ)。
+    await safeReply(ctx, [
+      textMessage('恐れ入りますが、別の日をお選びください。'),
+      reservationDateList(store, generateVisitDays(store, nowJst())),
+    ]);
+    return;
+  }
+
+  await setReservationSession(env, ctx.lineUserId, {
+    ...session,
+    step: 'awaiting_time',
+    date,
+    visitAtIso: undefined,
+  });
+  await safeReply(ctx, [reservationTimeList(store, day)]);
+}
+
+// ── ③ 時間選択 → 確認 ──────────────────────────────────────────────────────────
+
+async function onTimeSelected(ctx: Pkg1Context, datetime: string | null): Promise<void> {
+  const env = repoEnv(ctx);
+  if (!datetime) return reservationLost(ctx);
+  const session = await getReservationSession(env, ctx.lineUserId);
+  if (!session?.storeId) return reservationLost(ctx);
+  const store = await findStoreById(env, session.storeId);
+  if (!store) return reservationLost(ctx);
+
+  // 候補から出た値だが、stale タップ対策で営業時間/grid を再検証する。
+  const visitAt = parseJstDatetime(datetime);
   if (!visitAt || !validateVisitAt(store, visitAt).ok) {
-    // 候補からは出ないはずだが、stale な候補をタップした場合に再提示する。
-    await reofferReservationSlots(ctx, '恐れ入りますが、別の日時をお選びください。');
+    await reofferTimeOrDate(ctx, store, session.date ?? null, '恐れ入りますが、別の時間をお選びください。');
     return;
   }
 
   await setReservationSession(env, ctx.lineUserId, {
     ...session,
     step: 'awaiting_confirm',
-    storeId: store.id,
     storeName: store.name,
-    visitAtIso: parsed.datetime,
+    visitAtIso: datetime,
   });
-  await safeReply(ctx, [reservationConfirmPrompt(store.name, parsed.datetime)]);
+  await safeReply(ctx, [reservationConfirmPrompt(store.name, datetime)]);
 }
 
-/** "{storeId}|{datetime}" を分解する。形式不正は null。 */
-function parseReservationSlotValue(
-  value: string | null,
-): { readonly storeId: string; readonly datetime: string } | null {
-  if (!value) return null;
-  const sep = value.indexOf('|');
-  if (sep <= 0 || sep >= value.length - 1) return null;
-  return { storeId: value.slice(0, sep), datetime: value.slice(sep + 1) };
+/** session の date から VisitDay を引く。無効/未存在は null。 */
+function findVisitDay(
+  store: Awaited<ReturnType<typeof findStoreById>>,
+  date: string,
+): VisitDay | null {
+  if (!store) return null;
+  return generateVisitDays(store, nowJst()).find((d) => d.date === date) ?? null;
 }
 
-/** 候補リストを (フォールバック文言付きで) もう一度提示する。 */
-async function reofferReservationSlots(ctx: Pkg1Context, lead: string): Promise<void> {
-  const slotMessages = await buildReservationSlotMessages(repoEnv(ctx));
-  if (!slotMessages) return reservationLost(ctx);
-  await safeReply(ctx, [textMessage(lead), ...slotMessages]);
+/** 時間選択へ戻れるなら戻し、日付が失われていれば日付選択へ倒す (無反応を防ぐ)。 */
+async function reofferTimeOrDate(
+  ctx: Pkg1Context,
+  store: NonNullable<Awaited<ReturnType<typeof findStoreById>>>,
+  date: string | null,
+  lead: string,
+): Promise<void> {
+  const day = date ? findVisitDay(store, date) : null;
+  if (day && day.slots.length > 0) {
+    await safeReply(ctx, [textMessage(lead), reservationTimeList(store, day)]);
+    return;
+  }
+  await safeReply(ctx, [
+    textMessage(lead),
+    reservationDateList(store, generateVisitDays(store, nowJst())),
+  ]);
 }
 
 async function onReservationConfirmed(ctx: Pkg1Context, value: string | null): Promise<void> {
@@ -601,8 +660,11 @@ async function onReservationConfirmed(ctx: Pkg1Context, value: string | null): P
   if (!session) return reservationLost(ctx);
 
   if (value === 'change') {
-    await setReservationSession(env, ctx.lineUserId, { ...session, step: 'awaiting_reservation_slot' });
-    await reofferReservationSlots(ctx, '別の日時をお選びください。');
+    // 時間選択に戻る (date は維持)。store/date が引けなければ日付選択に倒す。
+    const store = session.storeId ? await findStoreById(env, session.storeId) : null;
+    if (!store) return reservationLost(ctx);
+    await setReservationSession(env, ctx.lineUserId, { ...session, step: 'awaiting_time', visitAtIso: undefined });
+    await reofferTimeOrDate(ctx, store, session.date ?? null, '別の時間をお選びください。');
     return;
   }
   if (value !== 'ok') return;
@@ -627,22 +689,29 @@ async function reservationLost(ctx: Pkg1Context): Promise<void> {
 /** 来店予定確定 → cases + quote_versions 保存 → PDF 発行 → LINE 共有。 */
 async function finalizeReservation(ctx: Pkg1Context, session: ReservationState): Promise<void> {
   const env = repoEnv(ctx);
-  const quote = buildQuote(session.cart);
+  const quote = buildQuote(session.cart, await getTenantQuoteSettings(env));
+  // 表示用 (notifyStaff の文言)・JST 壁時計のまま (formatVisitAt が wall-clock parse する)
   const visitAtIso = session.visitAtIso ?? null;
+  // DB 保存用 (cases.visit_scheduled_at は timestamptz)。TZ 無しで投げると UTC 解釈されて
+  // dashboard 側 JST 表示で +9h ズレるため "+09:00" 付き ISO に揃える (2026-06-22 事故)
+  const visitAtIsoForDb = visitAtIso ? jstWallToIsoZ(visitAtIso) : null;
 
   const customerId = await findCustomerIdByLineUserId(env, ctx.lineUserId).catch(() => null);
   const saved = await saveQuoteSafely(ctx, {
     quote,
     customerId,
     storeId: session.storeId ?? null,
-    visitScheduledAt: visitAtIso,
+    visitScheduledAt: visitAtIsoForDb,
     caseLabel: '来店予定',
+    statusKey: 'booked',
   });
 
-  const customerName = await resolveCustomerName(ctx);
+  const customer = await resolveCustomerContact(ctx);
+  const customerName = customer.name; // notifyStaff (下) でも使う
   const pdf = await issueEstimatePdf(ctx.env, {
     quote,
     customerName,
+    customerPhone: customer.phone,
     storeName: session.storeName ?? null,
     quoteNo: saved?.quoteNo ?? null,
     lineUserId: ctx.lineUserId,
@@ -743,13 +812,24 @@ function parseDispatch(value: string | null): Dispatch | null {
   return null;
 }
 
-async function resolveCustomerName(ctx: Pkg1Context): Promise<string | null> {
+/**
+ * customers テーブルから name + phone を引く。pdf_only / reserve とも同じ仕様:
+ * - 引ければ name / phone 両方使う (PDF の「お客様」「TEL」欄に反映)
+ * - 引けなければ呼び出し側で `'お客様'` / `'—'` にフォールバック (trycle-pkg1-pdf.ts)
+ */
+async function resolveCustomerContact(
+  ctx: Pkg1Context,
+): Promise<{ name: string | null; phone: string | null }> {
   try {
     const customer = await findCustomerByLineUserId(repoEnv(ctx), ctx.lineUserId);
-    return customer?.name ?? null;
+    return { name: customer?.name ?? null, phone: customer?.phone ?? null };
   } catch {
-    return null;
+    return { name: null, phone: null };
   }
+}
+
+async function resolveCustomerName(ctx: Pkg1Context): Promise<string | null> {
+  return (await resolveCustomerContact(ctx)).name;
 }
 
 interface SaveQuoteArgs {
@@ -758,6 +838,12 @@ interface SaveQuoteArgs {
   readonly storeId?: string | null;
   readonly visitScheduledAt: string | null;
   readonly caseLabel: string;
+  /**
+   * cases.status_id 振り分けの key (経路別)。dashboard 側 case_statuses.key と一致
+   * させると正しく振り分け、不一致なら findInitialCaseStatus に fallback する。
+   * 既定 (未指定) は fallback と同じく初期 status。
+   */
+  readonly statusKey?: string;
 }
 
 /**
@@ -768,7 +854,10 @@ interface SaveQuoteArgs {
 async function saveQuoteSafely(ctx: Pkg1Context, args: SaveQuoteArgs): Promise<SavedQuote | null> {
   const env = repoEnv(ctx);
   try {
-    const status = await findInitialCaseStatus(env);
+    const statusByKey = args.statusKey
+      ? await findCaseStatusByKey(env, args.statusKey).catch(() => null)
+      : null;
+    const status = statusByKey ?? await findInitialCaseStatus(env);
     if (!status) {
       console.error('[trycle-pkg1] saveQuote skipped: no case_statuses');
       return null;

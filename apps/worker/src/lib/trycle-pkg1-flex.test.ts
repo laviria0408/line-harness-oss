@@ -9,14 +9,17 @@ import {
   confirmMessages,
   consentPrompt,
   cartSummaryText,
-  reservationSlotMessages,
+  reservationStoreCarousel,
+  reservationDateList,
+  reservationTimeList,
   reservationConfirmPrompt,
   formatVisitAt,
   DISPATCH_LABELS,
 } from './trycle-pkg1-flex.js';
 import { REGIONS, findRegionByValue } from '../data/pkg1-regions.js';
 import { makeLineItem, type QuoteLineItem } from './quote.js';
-import type { ReservationSlot } from './trycle-visit-slots.js';
+import type { VisitDay } from './trycle-visit-slots.js';
+import type { StoreRow } from './trycle-repo.js';
 
 function serialize(o: unknown): string {
   return JSON.stringify(o);
@@ -197,85 +200,105 @@ describe('consentPrompt (経路 D・REQ-016)', () => {
   });
 });
 
-// ── reservation slot list (経路 D-2・Option A 日時候補 縦リスト) ────────────────
+// ── reservation 3 段階フロー (店舗 → 日付 → 時間) ──────────────────────────────
 
-function slot(p: Partial<ReservationSlot>): ReservationSlot {
+function store(p: Partial<StoreRow> = {}): StoreRow {
   return {
-    storeId: 's1',
-    storeAbbr: 'Y',
-    storeName: '矢野口本店',
-    date: '2026-06-22',
-    dateLabel: '06/22 (土)',
-    timeLabel: '10:00',
-    datetime: '2026-06-22t10:00',
+    id: 's1',
+    name: '矢野口本店',
+    code: 'Y',
+    business_hours: { mon: ['11:00', '19:00'] },
+    reservation_slot_minutes: 30,
+    is_active: true,
     ...p,
   };
 }
 
-describe('reservationSlotMessages (経路 D-2・Option A 日時候補 縦リスト)', () => {
-  it('renders one tap row per candidate with store+datetime in the postback', () => {
-    const msgs = reservationSlotMessages([
-      slot({ storeId: 's1', storeAbbr: 'Y', timeLabel: '10:00', datetime: '2026-06-22t10:00' }),
-      slot({ storeId: 's2', storeAbbr: 'M', storeName: '宮ヶ瀬店', timeLabel: '10:30', datetime: '2026-06-22t10:30' }),
+function visitDay(p: Partial<VisitDay> = {}): VisitDay {
+  return {
+    date: '2026-06-22',
+    label: '6/22 (月)',
+    slots: [
+      { value: '2026-06-22t11:00', label: '11:00' },
+      { value: '2026-06-22t11:30', label: '11:30' },
+    ],
+    ...p,
+  };
+}
+
+describe('reservationStoreCarousel (① 店舗選択・Flex 縦リスト)', () => {
+  it('renders one tap row per store with a store postback', () => {
+    const msg = reservationStoreCarousel([
+      store({ id: 's1', name: '矢野口本店' }),
+      store({ id: 's2', name: '宮ヶ瀬店' }),
     ]);
-    expect(msgs).toHaveLength(1);
-    expectNotTemplate(msgs[0]);
-    expectBubble(msgs[0]);
-    const s = serialize(msgs);
-    // postback は store と ISO 日時を内包する ({storeId}|{datetime})。
-    expect(s).toContain('action=pkg1_reserve_slot&value=s1|2026-06-22t10:00');
-    expect(s).toContain('action=pkg1_reserve_slot&value=s2|2026-06-22t10:30');
-    // tap row ラベルは「{HH:MM} {店舗略称}」。
-    expect(s).toContain('10:00 Y');
-    expect(s).toContain('10:30 M');
+    // 日付・時間と同じ Flex 縦リストに統一 (template carousel から変更)。
+    expectNotTemplate(msg);
+    expectBubble(msg);
+    const s = serialize(msg);
+    expect(s).toContain('action=pkg1_reserve_store&value=s1');
+    expect(s).toContain('action=pkg1_reserve_store&value=s2');
+    expect(s).toContain('矢野口本店');
+    expect(s).toContain('宮ヶ瀬店');
   });
+});
 
-  it('inserts a per-date section label and keeps dates in chronological order', () => {
-    const msgs = reservationSlotMessages([
-      slot({ date: '2026-06-22', dateLabel: '06/22 (土)', timeLabel: '10:00', datetime: '2026-06-22t10:00' }),
-      slot({ date: '2026-06-23', dateLabel: '06/23 (日)', timeLabel: '11:00', datetime: '2026-06-23t11:00' }),
+describe('reservationDateList (② 日付選択・Flex 縦リスト)', () => {
+  it('renders one tap row per business day with a date postback', () => {
+    const msg = reservationDateList(store(), [
+      visitDay({ date: '2026-06-22', label: '6/22 (月)' }),
+      visitDay({ date: '2026-06-24', label: '6/24 (水)' }),
     ]);
-    const s = serialize(msgs);
-    expect(s).toContain('📅 06/22 (土)');
-    expect(s).toContain('📅 06/23 (日)');
-    expect(s.indexOf('06/22')).toBeLessThan(s.indexOf('06/23'));
+    expectNotTemplate(msg);
+    expectBubble(msg);
+    const s = serialize(msg);
+    expect(s).toContain('action=pkg1_reserve_date&value=2026-06-22');
+    expect(s).toContain('action=pkg1_reserve_date&value=2026-06-24');
+    expect(s).toContain('6/22 (月)');
+    expect(s).toContain('6/24 (水)');
+    // 時間 postback はこの段階では出ない。
+    expect(s).not.toContain('pkg1_reserve_time');
   });
 
-  it('splits into a carousel when many candidates exceed the bubble byte budget', () => {
-    // 14 日 × 2 店舗 × 5 slot/day = 140 候補相当。10KB を超えるので carousel 分割される。
-    const slots: ReservationSlot[] = [];
-    for (let day = 0; day < 14; day += 1) {
-      const date = `2026-07-${String(day + 1).padStart(2, '0')}`;
-      for (const [id, abbr] of [['s1', 'Y'], ['s2', 'M']] as const) {
-        for (let h = 10; h < 15; h += 1) {
-          const time = `${String(h).padStart(2, '0')}:00`;
-          slots.push(
-            slot({ storeId: id, storeAbbr: abbr, date, dateLabel: `07/${String(day + 1).padStart(2, '0')} (—)`, timeLabel: time, datetime: `${date}t${time}` }),
-          );
-        }
-      }
-    }
-    expect(slots).toHaveLength(140);
-    const msgs = reservationSlotMessages(slots);
-    // 単一 Flex メッセージだが contents は carousel (複数 bubble)。
-    expect(msgs).toHaveLength(1);
-    const contents = (msgs[0] as { contents: { type: string; contents?: unknown[] } }).contents;
-    expect(contents.type).toBe('carousel');
-    expect((contents.contents ?? []).length).toBeGreaterThan(1);
-    // 全 140 候補の postback が漏れず載る。
-    const s = serialize(msgs);
-    expect(s).toContain('action=pkg1_reserve_slot&value=s1|2026-07-01t10:00');
-    expect(s).toContain('action=pkg1_reserve_slot&value=s2|2026-07-14t14:00');
-  });
-
-  it('fails loud (準備中) with no postback when there are no candidates', () => {
-    const msgs = reservationSlotMessages([]);
-    expect(msgs).toHaveLength(1);
-    expectNotTemplate(msgs[0]);
-    expectBubble(msgs[0]);
-    const s = serialize(msgs);
-    expect(s).not.toContain('pkg1_reserve_slot');
+  it('fails loud (準備中) with no date postback when there are no days', () => {
+    const msg = reservationDateList(store(), []);
+    expectNotTemplate(msg);
+    expectBubble(msg);
+    const s = serialize(msg);
+    expect(s).not.toContain('pkg1_reserve_date');
     expect(s).toContain('見つかりませんでした');
+  });
+});
+
+describe('reservationTimeList (③ 時間選択・Flex 縦リスト)', () => {
+  it('renders one tap row per slot with a datetime postback', () => {
+    const msg = reservationTimeList(
+      store(),
+      visitDay({
+        date: '2026-06-22',
+        label: '6/22 (月)',
+        slots: [
+          { value: '2026-06-22t11:00', label: '11:00' },
+          { value: '2026-06-22t11:30', label: '11:30' },
+        ],
+      }),
+    );
+    expectNotTemplate(msg);
+    expectBubble(msg);
+    const s = serialize(msg);
+    expect(s).toContain('action=pkg1_reserve_time&value=2026-06-22t11:00');
+    expect(s).toContain('action=pkg1_reserve_time&value=2026-06-22t11:30');
+    expect(s).toContain('11:00');
+    expect(s).toContain('11:30');
+  });
+
+  it('fails loud (別の日を) with no time postback when there are no slots', () => {
+    const msg = reservationTimeList(store(), visitDay({ slots: [] }));
+    expectNotTemplate(msg);
+    expectBubble(msg);
+    const s = serialize(msg);
+    expect(s).not.toContain('pkg1_reserve_time');
+    expect(s).toContain('別の日');
   });
 });
 

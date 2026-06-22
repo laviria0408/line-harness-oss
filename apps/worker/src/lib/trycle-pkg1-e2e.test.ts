@@ -295,7 +295,7 @@ describe('Pkg1 全動線 E2E (postback wiring・経路 B→C→D)', () => {
     expect(s).toContain('action=pkg1_region&value=brake');
   });
 
-  it('経路 D-2 (同意済): confirm(reserve)→slot→reserve_confirm(ok) が全段通る', async () => {
+  it('経路 D-2 (同意済): confirm(reserve)→store→date→time→reserve_confirm(ok) が全段通る', async () => {
     buildStatefulSupabase({ consentValid: true });
     const captured: unknown[][] = [];
     const ctx = fakeContext(captured);
@@ -306,15 +306,24 @@ describe('Pkg1 全動線 E2E (postback wiring・経路 B→C→D)', () => {
     await handlePkg1Postback('action=pkg1_variant&value=0', ctx);
     await handlePkg1Postback('action=pkg1_cart&value=confirm', ctx);
 
-    // reserve → 同意済なので来店日時候補の縦リストへ (店舗選択ステップは無い)
+    // ① reserve → 同意済なので店舗選択 carousel へ
     await handlePkg1Postback('action=pkg1_confirm&value=reserve', ctx);
-    const sList = last(captured);
-    expect(sList).toContain('action=pkg1_reserve_slot&value=s1|');
-    expect(sList).not.toContain('pkg1_reserve_store');
+    const sStore = last(captured);
+    expect(sStore).toContain('action=pkg1_reserve_store&value=s1');
+    expect(sStore).not.toContain('pkg1_reserve_slot');
 
-    // 候補 (store 内包) を 1 タップ → 確認 3 択
+    // ② store → 日付リスト
+    await handlePkg1Postback('action=pkg1_reserve_store&value=s1', ctx);
     const dt = futureWeekdayNoon();
-    await handlePkg1Postback(`action=pkg1_reserve_slot&value=s1|${dt}`, ctx);
+    const date = dt.slice(0, 10);
+    expect(last(captured)).toContain(`action=pkg1_reserve_date&value=${date}`);
+
+    // ③ date → 時間リスト
+    await handlePkg1Postback(`action=pkg1_reserve_date&value=${date}`, ctx);
+    expect(last(captured)).toContain(`action=pkg1_reserve_time&value=${date}t`);
+
+    // ④ time → 確認 3 択
+    await handlePkg1Postback(`action=pkg1_reserve_time&value=${dt}`, ctx);
     const sConfirm = last(captured);
     expect(sConfirm).toContain('action=pkg1_reserve_confirm&value=ok');
     expect(sConfirm).toContain('action=pkg1_reserve_confirm&value=change');
@@ -324,12 +333,12 @@ describe('Pkg1 全動線 E2E (postback wiring・経路 B→C→D)', () => {
     expect(last(captured)).toContain('お待ちしております');
   });
 
-  it('reservation session 失効中に reserve_slot をタップしても無反応にならない (graceful)', async () => {
-    // session を一切作らずに候補選択 postback を投げる (失効/期限切れの再現)。
+  it('reservation session 失効中に reserve_store をタップしても無反応にならない (graceful)', async () => {
+    // session を一切作らずに店舗選択 postback を投げる (失効/期限切れの再現)。
     buildStatefulSupabase();
     const captured: unknown[][] = [];
     const ctx = fakeContext(captured);
-    await handlePkg1Postback(`action=pkg1_reserve_slot&value=s1|${futureWeekdayNoon()}`, ctx);
+    await handlePkg1Postback('action=pkg1_reserve_store&value=s1', ctx);
     // 旧実装は silent return (無反応) だった。再開導線が返ることを保証する。
     const s = last(captured);
     expect(s).toContain('もう一度はじめから');
@@ -344,7 +353,7 @@ describe('Pkg1 全動線 E2E (postback wiring・経路 B→C→D)', () => {
     expect(last(captured)).toContain('もう一度はじめから');
   });
 
-  it('経路 D-2: reserve_confirm(change) で再度日時候補リストに戻る', async () => {
+  it('経路 D-2: reserve_confirm(change) で時間リストに戻る (date 維持)', async () => {
     buildStatefulSupabase({ consentValid: true });
     const captured: unknown[][] = [];
     const ctx = fakeContext(captured);
@@ -355,10 +364,13 @@ describe('Pkg1 全動線 E2E (postback wiring・経路 B→C→D)', () => {
     await handlePkg1Postback('action=pkg1_variant&value=0', ctx);
     await handlePkg1Postback('action=pkg1_cart&value=confirm', ctx);
     await handlePkg1Postback('action=pkg1_confirm&value=reserve', ctx);
+    await handlePkg1Postback('action=pkg1_reserve_store&value=s1', ctx);
     const dt = futureWeekdayNoon();
-    await handlePkg1Postback(`action=pkg1_reserve_slot&value=s1|${dt}`, ctx);
+    const date = dt.slice(0, 10);
+    await handlePkg1Postback(`action=pkg1_reserve_date&value=${date}`, ctx);
+    await handlePkg1Postback(`action=pkg1_reserve_time&value=${dt}`, ctx);
     await handlePkg1Postback('action=pkg1_reserve_confirm&value=change', ctx);
-    expect(last(captured)).toContain('action=pkg1_reserve_slot&value=s1|');
+    expect(last(captured)).toContain(`action=pkg1_reserve_time&value=${date}t`);
   });
 });
 

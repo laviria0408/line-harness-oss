@@ -201,6 +201,147 @@ app.route('/', booking);
 app.route('/', events);
 app.route('/', accountSettings);
 app.route('/', meetCallback);
+
+app.get('/__debug/line-push-test', async (c) => {
+  const env = c.env as { LINE_CHANNEL_ACCESS_TOKEN?: string };
+  const lineUserId = c.req.query('u') ?? 'U7e0ecb59e79375606d3c5b5513bdd175';
+  const token = env.LINE_CHANNEL_ACCESS_TOKEN;
+  if (!token) return c.json({ ok: false, error: 'no token' });
+  // bot info で token 検証
+  const info = await fetch('https://api.line.me/v2/bot/info', {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const infoJson = await info.json();
+  // 実際の push 試行
+  const push = await fetch('https://api.line.me/v2/bot/message/push', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      to: lineUserId,
+      messages: [{ type: 'text', text: 'debug: 同意書ゲート後 push test' }],
+    }),
+  });
+  const pushBody = await push.text();
+  return c.json({
+    ok: true,
+    botInfoStatus: info.status,
+    botInfo: infoJson,
+    pushStatus: push.status,
+    pushBody,
+  });
+});
+
+app.get('/__debug/line-quota', async (c) => {
+  const env = c.env as { LINE_CHANNEL_ACCESS_TOKEN?: string };
+  const token = env.LINE_CHANNEL_ACCESS_TOKEN;
+  if (!token) return c.json({ ok: false, error: 'no token' });
+  const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  const [quota, consumption] = await Promise.all([
+    fetch('https://api.line.me/v2/message/quota', { headers: { Authorization: `Bearer ${token}` } }).then(r => r.json()),
+    fetch(`https://api.line.me/v2/message/quota/consumption?date=${today}`, { headers: { Authorization: `Bearer ${token}` } }).then(r => r.json()),
+  ]);
+  return c.json({ ok: true, quota, consumption_today: consumption });
+});
+
+app.get('/__debug/force-resume', async (c) => {
+  const env = c.env as unknown as { [key: string]: unknown };
+  const lineUserId = c.req.query('u') ?? 'U7e0ecb59e79375606d3c5b5513bdd175';
+  try {
+    const { LineClient } = await import('@line-crm/line-sdk');
+    const { resumeReservationAfterConsent } = await import('./lib/trycle-pkg1.js');
+    const accessToken = (env as { LINE_CHANNEL_ACCESS_TOKEN?: string }).LINE_CHANNEL_ACCESS_TOKEN;
+    if (!accessToken) return c.json({ ok: false, error: 'no LINE_CHANNEL_ACCESS_TOKEN' });
+    const lineClient = new LineClient(accessToken);
+    const result = await resumeReservationAfterConsent(env as never, lineClient, lineUserId);
+    return c.json({ ok: true, resumed: result });
+  } catch (err) {
+    const e = err as { message?: string; stack?: string };
+    return c.json({ ok: false, error: String(e?.message ?? err), stack: e?.stack });
+  }
+});
+
+app.get('/__debug/build-slot', async (c) => {
+  const env = c.env as unknown as { [key: string]: unknown };
+  try {
+    const { listActiveStores } = await import('./lib/trycle-repo.js');
+    const { buildReservationSlots, nowJst } = await import('./lib/trycle-visit-slots.js');
+    const { reservationSlotMessages } = await import('./lib/trycle-pkg1-flex.js');
+    const stores = await listActiveStores(env as never);
+    const slots = buildReservationSlots(stores, nowJst());
+    const messages = reservationSlotMessages(slots);
+    const perMessageBytes = messages.map((m) => JSON.stringify(m).length);
+    const totalBytes = perMessageBytes.reduce((a, b) => a + b, 0);
+    return c.json({
+      ok: true,
+      storesCount: stores.length,
+      slotsCount: slots.length,
+      messagesCount: messages.length,
+      pushArrayLengthWithText: messages.length + 1,
+      pushApiLimit: 5,
+      wouldExceedPushLimit: messages.length + 1 > 5,
+      totalBytes,
+      perMessageBytes,
+    });
+  } catch (err) {
+    const e = err as { message?: string; stack?: string };
+    return c.json({ ok: false, error: String(e?.message ?? err), stack: e?.stack });
+  }
+});
+
+app.get('/__debug/delete-test-customer', async (c) => {
+  const env = c.env as unknown as { [key: string]: unknown };
+  const lineUserId = c.req.query('u');
+  if (!lineUserId || !lineUserId.startsWith('U')) {
+    return c.json({ ok: false, error: 'query param u (LINE userId) required' }, 400);
+  }
+  const supa = await import('./lib/supabase.js');
+  const result: Record<string, unknown> = { lineUserId };
+  try {
+    await supa.supabaseDelete(env as never, 'bot_sessions', { line_user_id: `eq.${lineUserId}` });
+    result.bot_sessions = 'deleted';
+  } catch (err) { result.bot_sessions = `err: ${String(err)}`; }
+  try {
+    await supa.supabaseDelete(env as never, 'consents', { line_user_id: `eq.${lineUserId}` });
+    result.consents = 'deleted';
+  } catch (err) { result.consents = `err: ${String(err)}`; }
+  try {
+    await supa.supabaseDelete(env as never, 'cases', { line_user_id: `eq.${lineUserId}` });
+    result.cases = 'deleted';
+  } catch (err) { result.cases = `err: ${String(err)}`; }
+  try {
+    await supa.supabaseDelete(env as never, 'customers', { line_user_id: `eq.${lineUserId}` });
+    result.customers = 'deleted';
+  } catch (err) { result.customers = `err: ${String(err)}`; }
+  return c.json({ ok: true, ...result });
+});
+
+app.get('/__debug/case-statuses-raw', async (c) => {
+  const env = c.env as unknown as { [key: string]: unknown };
+  const supa = await import('./lib/supabase.js');
+  const statuses = await supa.supabaseSelect(env as never, 'case_statuses',
+    {}, { limit: 30, select: 'id,key,label,sort_order', order: 'sort_order.asc' });
+  return c.json({ ok: true, statuses });
+});
+
+app.get('/__debug/stores-raw', async (c) => {
+  const env = c.env as unknown as { [key: string]: unknown };
+  const supa = await import('./lib/supabase.js');
+  const stores = await supa.supabaseSelect(env as never, 'stores',
+    { is_active: 'eq.true' }, { limit: 10, select: 'id,name,code,business_hours,reservation_slot_minutes,sort_order' });
+  return c.json({ ok: true, stores });
+});
+
+app.get('/__debug/consent-state', async (c) => {
+  const env = c.env as unknown as { [key: string]: unknown };
+  const lineUserId = c.req.query('u') ?? 'U7e0ecb59e79375606d3c5b5513bdd175';
+  const supa = await import('./lib/supabase.js');
+  const sessions = await supa.supabaseSelect(env as never, 'bot_sessions',
+    { line_user_id: `eq.${lineUserId}` }, { limit: 10 });
+  const consents = await supa.supabaseSelect(env as never, 'consents',
+    { line_user_id: `eq.${lineUserId}` }, { limit: 5 });
+  return c.json({ ok: true, lineUserId, sessions, consents });
+});
+
 app.route('/', messageTemplates);
 app.route('/', dedupPreview);
 app.route('/', profileRefresh);

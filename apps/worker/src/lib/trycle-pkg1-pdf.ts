@@ -38,6 +38,8 @@ export interface EstimatePdfResult {
 export interface EstimatePdfInput {
   readonly quote: Quote;
   readonly customerName: string | null;
+  /** customers.phone (Supabase で引ければ。引けなければ payload で '—' フォールバック) */
+  readonly customerPhone: string | null;
   readonly storeName: string | null;
   readonly quoteNo: string | null;
   /** 【v1.2.1】概算見積 PDF / GAS ログに残す LINE userId (店員追跡用)。 */
@@ -64,7 +66,7 @@ export async function issueEstimatePdf(
         userId: input.lineUserId, // 店員追跡用 (GAS logUsage)
         contact: {
           name: input.customerName ?? 'お客様',
-          phone: '—',
+          phone: input.customerPhone ?? '—',
         },
         // GAS テンプレは it.name / it.unitPrice / it.qty / it.amount / it.priceOpenEnded を読む。
         // worker の QuoteLineItem は既に camelCase。unitPriceMax があれば上限なし扱い (〜表示)。
@@ -81,10 +83,18 @@ export async function issueEstimatePdf(
         total: quote.total,
         totalMax: quote.totalMax,
         disclaimer: quote.disclaimer,
-        // ── worker 拡張 (GAS が無視しても害なし。Notion/店舗識別の補助) ──
+        // 税率・端数処理 (dashboard と同じ source of truth)。GAS テンプレが再計算する
+        // 場合に備えて camelCase で渡す (GAS が無視しても害なし)。
+        taxRate: quote.taxRate,
+        taxRounding: quote.taxRounding,
+        // ── worker 拡張 ──
+        // 採番済 quoteNo: GAS templates.gs (buildQuoteHtml) と handlers.gs (handleEstimatePdf)
+        // が camelCase `payload.quoteNo` で読むため camelCase キーで送信する (snake_case にすると
+        // GAS が undefined として扱い fallback generateQuoteNo() の旧フォーマットに退化する)。
+        quoteNo: input.quoteNo,
+        // 以下 2 つは GAS が無視しても害なしの補助情報。
         is_estimate: true, // 「概算」明示 (REQ-PKG1-009)
         store_name: input.storeName,
-        quote_no: input.quoteNo,
       },
     });
     if (!res.ok) {

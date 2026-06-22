@@ -11,7 +11,7 @@
  * canonical は Tenant Supabase 直読み (Pkg8 と同方針)。設計: Pkg1 詳細設計 v1.2.1
  * §4 / §5 (page 386050ad6a7e81f8b701cd52c9201af6)。
  */
-import { supabaseSelect, supabaseUpsert } from './supabase.js';
+import { supabaseSelect, supabaseUpsert, supabaseUpdate } from './supabase.js';
 import { getTenantId, type TrycleRepoEnv } from './trycle-repo.js';
 import { findRegionByValue } from '../data/pkg1-regions.js';
 import { makeLineItem, type Quote, type QuoteLineItem } from './quote.js';
@@ -124,11 +124,16 @@ export async function buildLineItemFromPending(
   if (labor.notes) notesParts.push(labor.notes);
   if (surcharge) notesParts.push(`${surcharge.name} +¥${surcharge.amount.toLocaleString('ja-JP')}`);
 
+  const unitPrice = labor.price + (surcharge?.amount ?? 0);
   return makeLineItem({
-    name: `${labor.name}${variantLabel}${labor.price_open_ended ? '〜' : ''}`,
-    unitPrice: labor.price + (surcharge?.amount ?? 0),
-    // price_max は deprecated。range は priceOpenEnded の「〜」表示で表現 (本物準拠)。
-    unitPriceMax: null,
+    // 名前末尾の "〜" は廃止 (旧仕様)。金額側 (formatItemPrice) で「¥X〜」を出すため
+    // 名前にも付くと二重表示になる。Open-ended は unitPriceMax=null で表現する。
+    name: `${labor.name}${variantLabel}`,
+    unitPrice,
+    // 上限なし (異音解消等) は unitPriceMax=null → "¥X〜" 表示。固定額は unitPrice と
+    // 同値 → "¥X" 表示。range (上下違う) を表現したい場合は別途上限値を渡す (現状 master
+    // には range 列が無いので open_ended/固定 の 2 値運用)。
+    unitPriceMax: labor.price_open_ended ? null : unitPrice,
     qty: 1,
     ...(notesParts.length ? { notes: notesParts.join(' / ') } : {}),
   });
@@ -153,6 +158,23 @@ export async function findInitialCaseStatus(env: TrycleRepoEnv): Promise<CaseSta
     'case_statuses',
     { tenant_id: `eq.${getTenantId(env)}` },
     { select: 'id,key,label,sort_order', order: 'sort_order.asc', limit: 1 },
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * 経路ごとに status を振り分ける用 (PDF only → 'pdf_only' / 来店予定 → 'visit_scheduled' 等)。
+ * 一致が無ければ null。呼び出し側で findInitialCaseStatus に fallback する。
+ */
+export async function findCaseStatusByKey(
+  env: TrycleRepoEnv,
+  key: string,
+): Promise<CaseStatusRow | null> {
+  const rows = await supabaseSelect<CaseStatusRow>(
+    env,
+    'case_statuses',
+    { tenant_id: `eq.${getTenantId(env)}`, key: `eq.${key}` },
+    { select: 'id,key,label,sort_order', limit: 1 },
   );
   return rows[0] ?? null;
 }
@@ -294,24 +316,19 @@ export async function saveQuote(env: TrycleRepoEnv, input: SaveQuoteInput): Prom
   if (!quoteVersionId) throw new Error('saveQuote: quote_versions insert returned no id');
 
   // 5) quotes.current_version_id + cases.quote_no を最新版に紐付け
-  await supabaseUpsert(
+  // UPSERT は INSERT 試行を伴うため、case_id 等の NOT NULL 列が無いと 23502 違反になる。
+  // ここは既存行の UPDATE しか想定していないので PATCH (supabaseUpdate) を使う。
+  await supabaseUpdate(
     env,
     'quotes',
-    [
-      {
-        id: quoteId,
-        tenant_id: tenantId,
-        current_version_id: quoteVersionId,
-        updated_at: new Date().toISOString(),
-      },
-    ],
-    { onConflict: 'id' },
+    { id: `eq.${quoteId}`, tenant_id: `eq.${tenantId}` },
+    { current_version_id: quoteVersionId, updated_at: new Date().toISOString() },
   );
-  await supabaseUpsert(
+  await supabaseUpdate(
     env,
     'cases',
-    [{ id: caseId, tenant_id: tenantId, quote_no: issued.quoteNo, updated_at: new Date().toISOString() }],
-    { onConflict: 'id' },
+    { id: `eq.${caseId}`, tenant_id: `eq.${tenantId}` },
+    { quote_no: issued.quoteNo, updated_at: new Date().toISOString() },
   );
 
   return { caseId, quoteId, quoteVersionId, quoteNo: issued.quoteNo };

@@ -51,10 +51,12 @@ export interface QuoteNumberParts {
   readonly timestamp: string;
   readonly seqNo: number;
   readonly version: number;
+  readonly quoteType: QuoteType;
 }
 
 export function formatQuoteNo(parts: QuoteNumberParts): string {
-  return `Q-${parts.storeCode}-${parts.timestamp}-${pad6(parts.seqNo)}-v${parts.version}`;
+  const prefix = parts.quoteType === 'official' ? 'Q' : 'E';
+  return `${prefix}-${parts.storeCode}-${parts.timestamp}-${pad6(parts.seqNo)}-v${parts.version}`;
 }
 
 interface CounterRow {
@@ -125,6 +127,7 @@ export async function issueQuoteNo(
     timestamp: jstTimestamp(now),
     seqNo,
     version,
+    quoteType: input.quoteType,
   });
   return { quoteNo, seqNo, fyYear, version };
 }

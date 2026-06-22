@@ -70,11 +70,14 @@ interface BotSessionRow {
 /**
  * 来店予定フロー state (経路 D-2)。別 kind の session。
  *
- * Option A (日時候補 縦リスト) で「店舗選択 → datetimepicker」の 2 ステップを
- * 「店舗内包の候補を 1 タップ」= `awaiting_reservation_slot` の 1 ステップに統合した。
+ * 3 段階フロー (店舗 → 日付 → 時間 → 確認)。Option A の単一 carousel は 287 候補で
+ * 168KB → LINE Flex 50KB 上限超過で Push が reject される事故の原因だったため、各画面を
+ * 軽量に保てる 3 段階に分解した。`date` は YYYY-MM-DD・`visitAtIso` は YYYY-MM-DDtHH:mm。
  */
 export type ReservationStep =
-  | 'awaiting_reservation_slot'
+  | 'awaiting_store'
+  | 'awaiting_date'
+  | 'awaiting_time'
   | 'awaiting_confirm'
   | 'completed';
 
@@ -83,6 +86,9 @@ export interface ReservationState {
   readonly cart: QuoteLineItem[];
   readonly storeId?: string;
   readonly storeName?: string;
+  /** "YYYY-MM-DD" (選択した来店日)。 */
+  readonly date?: string;
+  /** "YYYY-MM-DDtHH:mm" (選択した来店日時)。 */
   readonly visitAtIso?: string;
 }
 

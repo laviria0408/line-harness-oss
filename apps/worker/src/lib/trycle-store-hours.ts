@@ -29,6 +29,20 @@ const LABEL_BY_WEEKDAY: Record<Weekday, string> = {
 };
 
 /**
+ * "YYYY-MM-DDtHH:mm" (LINE datetimepicker JST 壁時計) を Postgres timestamptz が
+ * 正しく解釈できる ISO 文字列に変換する。"+09:00" 付きで投げないと TZ 無しと
+ * 見なされ UTC 11:00 として保存 → dashboard 側で JST 表示すると +9h ズレる
+ * (2026-06-22 cases.visit_scheduled_at で踏んだ事故)。
+ * @returns "2026-06-27T11:00:00+09:00" 形式。形式不一致なら null。
+ */
+export function jstWallToIsoZ(value: string): string | null {
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})[tT](\d{2}):(\d{2})$/);
+  if (!match) return null;
+  const [, y, mo, d, h, mi] = match;
+  return `${y}-${mo}-${d}T${h}:${mi}:00+09:00`;
+}
+
+/**
  * Parse "YYYY-MM-DDtHH:mm" (LINE datetimepicker format) as JST. Returns null on
  * malformed input. The result is a Date whose UTC fields match the JST clock
  * (Y/M/D/H/M); local-TZ accessors on the Worker (which runs in UTC) would

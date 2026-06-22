@@ -190,6 +190,13 @@ function sessionStep(): string | undefined {
   return (s?.state as { step?: string } | undefined)?.step;
 }
 
+function sessionReservationStep(): string | undefined {
+  const s = tables.bot_sessions.find(
+    (r) => r.line_user_id === USER && r.kind === 'reservation',
+  );
+  return (s?.state as { step?: string } | undefined)?.step;
+}
+
 function cart(): unknown[] {
   const s = tables.bot_sessions.find(
     (r) => r.line_user_id === USER && r.kind === 'pkg1_estimate',
@@ -223,7 +230,8 @@ describe('isPkg1Postback', () => {
     expect(isPkg1Postback('pkg1_start')).toBe(true);
     expect(isPkg1Postback('pkg1_wage')).toBe(true);
     expect(isPkg1Postback('action=pkg1_dispatch&value=identified')).toBe(true);
-    expect(isPkg1Postback('action=pkg1_reserve_slot&value=s1|2026-06-22t14:00')).toBe(true);
+    expect(isPkg1Postback('action=pkg1_reserve_store&value=s1')).toBe(true);
+    expect(isPkg1Postback('action=pkg1_reserve_time&value=s1|2026-06-22t14:00')).toBe(true);
     expect(isPkg1Postback('pkg8_start')).toBe(false);
     expect(isPkg1Postback('action=faq_x')).toBe(false);
   });
@@ -344,7 +352,7 @@ describe('reserve route (経路 D-2・同意書ゲート)', () => {
     expect(tables.bot_sessions.some((r) => r.kind === 'pkg1_cart')).toBe(true);
   });
 
-  it('同意済なら同意書をスキップして来店日時候補の縦リストに進む', async () => {
+  it('同意済なら同意書をスキップして店舗選択 carousel に進む', async () => {
     tables.consents.push({
       tenant_id: TENANT,
       line_user_id: USER,
@@ -353,18 +361,18 @@ describe('reserve route (経路 D-2・同意書ゲート)', () => {
     });
     await walkToConfirm();
     await postback('action=pkg1_confirm&value=reserve');
-    expect(lastReplyText()).toContain('ご来店予定の日時をお選びください');
-    // 候補は店舗を内包した postback で出る。
-    expect(lastReplyAny()).toContain('action=pkg1_reserve_slot&value=s1|');
+    expect(lastReplyText()).toContain('ご来店店舗をお選びください');
+    // 店舗選択は店舗を指す postback で出る (3 段階フローの ①)。
+    expect(lastReplyAny()).toContain('action=pkg1_reserve_store&value=s1');
     const reservation = tables.bot_sessions.find((r) => r.kind === 'reservation');
-    expect((reservation?.state as { step?: string })?.step).toBe('awaiting_reservation_slot');
+    expect((reservation?.state as { step?: string })?.step).toBe('awaiting_store');
   });
 });
 
-// ── 来店予定: Option A 日時候補 縦リスト → 確認 → 完了 (cases + quote_versions) ──
+// ── 来店予定: 3 段階フロー (店舗 → 日付 → 時間 → 確認 → 完了) ──────────────────
 
-describe('reservation flow (日時候補 縦リスト → 確認)', () => {
-  async function reachSlotSelection() {
+describe('reservation flow (店舗 → 日付 → 時間 → 確認)', () => {
+  async function reachStoreSelection() {
     tables.consents.push({
       tenant_id: TENANT,
       line_user_id: USER,
@@ -380,46 +388,78 @@ describe('reservation flow (日時候補 縦リスト → 確認)', () => {
     await postback('action=pkg1_confirm&value=reserve');
   }
 
-  it('shows a store-internalized slot list directly after 来店予定 (no store step)', async () => {
-    await reachSlotSelection();
+  it('① shows a store carousel directly after 来店予定 (3 段階フローの起点)', async () => {
+    await reachStoreSelection();
     const s = lastReplyAny();
-    // 旧 store carousel postback は出ない。
-    expect(s).not.toContain('pkg1_reserve_store');
-    // 候補は両店舗ぶん出る (矢野口=s1・宮ヶ瀬=s2 は business_hours 空なので候補ゼロ → s1 のみ)。
-    expect(s).toContain('action=pkg1_reserve_slot&value=s1|');
+    expect(s).toContain('action=pkg1_reserve_store&value=s1');
+    // 旧 Option A の店舗内包 slot postback は出ない。
+    expect(s).not.toContain('pkg1_reserve_slot');
+    expect(sessionReservationStep()).toBe('awaiting_store');
   });
 
-  it('walks slot → confirm → ok and saves a 来店予定 case', async () => {
-    await reachSlotSelection();
-    // 矢野口は毎日 10:00-19:00・30分刻み。次の月曜 14:00 は 14 日窓内の有効候補。
+  it('② store → date list (定休日除外済みの営業日)', async () => {
+    await reachStoreSelection();
+    await postback('action=pkg1_reserve_store&value=s1');
+    const s = lastReplyAny();
+    // 矢野口 (s1) は毎日 10:00-19:00。営業日が日付 postback で出る。
+    expect(s).toContain('action=pkg1_reserve_date&value=');
+    expect(sessionReservationStep()).toBe('awaiting_date');
+  });
+
+  it('③ date → time list (選んだ日の slots)', async () => {
+    await reachStoreSelection();
+    await postback('action=pkg1_reserve_store&value=s1');
     const dt = nextMondayAt14();
-    await postback(`action=pkg1_reserve_slot&value=s1|${dt}`);
+    const date = dt.slice(0, 10);
+    await postback(`action=pkg1_reserve_date&value=${date}`);
+    const s = lastReplyAny();
+    expect(s).toContain(`action=pkg1_reserve_time&value=${date}t`);
+    expect(sessionReservationStep()).toBe('awaiting_time');
+  });
+
+  it('walks store → date → time → confirm → ok and saves a 来店予定 case', async () => {
+    await reachStoreSelection();
+    await postback('action=pkg1_reserve_store&value=s1');
+    const dt = nextMondayAt14();
+    const date = dt.slice(0, 10);
+    await postback(`action=pkg1_reserve_date&value=${date}`);
+    await postback(`action=pkg1_reserve_time&value=${dt}`);
     expect(lastReplyText()).toContain('来店予定でよろしいですか');
     await postback('action=pkg1_reserve_confirm&value=ok');
     expect(lastReplyText()).toContain('お待ちしております');
     expect(tables.cases).toHaveLength(1);
     expect(tables.cases[0].work_note).toBe('来店予定');
-    expect(tables.cases[0].visit_scheduled_at).toBe(dt);
+    // visit_scheduled_at は JST 壁時計 ("YYYY-MM-DDtHH:mm") を timestamptz 用に
+    // "+09:00" 付き ISO に変換して保存 (dashboard 表示の +9h ズレ防止・jstWallToIsoZ)。
+    expect(tables.cases[0].visit_scheduled_at).toBe(
+      dt.replace('t', 'T') + ':00+09:00',
+    );
     expect(tables.quote_versions).toHaveLength(1);
     // reservation session is cleared
     expect(tables.bot_sessions.some((r) => r.kind === 'reservation')).toBe(false);
   });
 
-  it('re-offers the slot list when a stale/invalid slot value is tapped (二重チェック)', async () => {
-    await reachSlotSelection();
-    // 03:00 は営業時間外。候補からは出ないが、stale な値が来ても無反応にせず再提示する。
-    await postback('action=pkg1_reserve_slot&value=s1|2026-06-22t03:00');
-    expect(lastReplyText()).toContain('別の日時をお選びください');
+  it('re-offers a date when a non-business-day date value is tapped (二重チェック)', async () => {
+    await reachStoreSelection();
+    await postback('action=pkg1_reserve_store&value=s1');
+    // 1900-01-01 は候補 (14 日窓) に無い → 別日選択を促し無反応にしない。
+    await postback('action=pkg1_reserve_date&value=1900-01-01');
+    expect(lastReplyText()).toContain('別の日をお選びください');
     expect(tables.cases).toHaveLength(0);
   });
 
-  it('「別の日時にする」 re-offers the slot list and keeps the reservation session', async () => {
-    await reachSlotSelection();
+  it('「別の日時にする」 returns to the time list keeping the date', async () => {
+    await reachStoreSelection();
+    await postback('action=pkg1_reserve_store&value=s1');
     const dt = nextMondayAt14();
-    await postback(`action=pkg1_reserve_slot&value=s1|${dt}`);
+    const date = dt.slice(0, 10);
+    await postback(`action=pkg1_reserve_date&value=${date}`);
+    await postback(`action=pkg1_reserve_time&value=${dt}`);
     await postback('action=pkg1_reserve_confirm&value=change');
-    expect(lastReplyText()).toContain('別の日時をお選びください');
-    expect(lastReplyAny()).toContain('action=pkg1_reserve_slot&value=s1|');
+    expect(lastReplyText()).toContain('別の時間をお選びください');
+    // 同じ日の time list に戻る (date 維持)。
+    expect(lastReplyAny()).toContain(`action=pkg1_reserve_time&value=${date}t`);
+    expect(sessionReservationStep()).toBe('awaiting_time');
     expect(tables.cases).toHaveLength(0);
   });
 });

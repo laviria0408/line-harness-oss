@@ -27,13 +27,19 @@ describe('fiscalYearFromDate (4月始まり)', () => {
 });
 
 describe('jstTimestamp / pad6 / formatQuoteNo', () => {
-  it('builds the Q-{code}-{ts}-{seq}-v{n} format', () => {
+  it('official → Q-{code}-{ts}-{seq}-v{n}', () => {
     expect(pad6(42)).toBe('000042');
     const ts = jstTimestamp(new Date('2026-06-21T13:05:09+09:00'));
     expect(ts).toBe('20260621130509');
-    expect(formatQuoteNo({ storeCode: 'Y', timestamp: ts, seqNo: 7, version: 1 })).toBe(
-      'Q-Y-20260621130509-000007-v1',
-    );
+    expect(
+      formatQuoteNo({ storeCode: 'Y', timestamp: ts, seqNo: 7, version: 1, quoteType: 'official' }),
+    ).toBe('Q-Y-20260621130509-000007-v1');
+  });
+  it('estimate → E-{code}-{ts}-{seq}-v{n}', () => {
+    const ts = jstTimestamp(new Date('2026-06-21T13:05:09+09:00'));
+    expect(
+      formatQuoteNo({ storeCode: 'Y', timestamp: ts, seqNo: 7, version: 1, quoteType: 'estimate' }),
+    ).toBe('E-Y-20260621130509-000007-v1');
   });
 });
 
@@ -78,6 +84,7 @@ describe('issueQuoteNo', () => {
     expect(r.version).toBe(1);
     expect(r.seqNo).toBe(1);
     expect(r.fyYear).toBe(2026);
-    expect(r.quoteNo).toMatch(/^Q-Y-2026\d{10}-000001-v1$/);
+    // quoteType: 'estimate' → E- prefix
+    expect(r.quoteNo).toMatch(/^E-Y-2026\d{10}-000001-v1$/);
   });
 });

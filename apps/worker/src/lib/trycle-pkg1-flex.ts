@@ -22,14 +22,17 @@
 import type { Region, Symptom, Variant } from '../data/pkg1-regions.js';
 import {
   buildQuote,
+  formatItemPrice,
   formatQuoteText,
+  formatTotalPrice,
   formatYen,
   PARTS_NOTICE,
   ESTIMATE_DISCLAIMER,
-  TAX_RATE,
+  type BuildQuoteOptions,
   type QuoteLineItem,
 } from './quote.js';
-import type { ReservationSlot } from './trycle-visit-slots.js';
+import type { ReservationSlot, VisitDay } from './trycle-visit-slots.js';
+import type { StoreRow } from './trycle-repo.js';
 import {
   buildTapRow,
   buildSectionLabel,
@@ -226,8 +229,11 @@ export function cartDecisionPrompt(): LineMessage {
 
 // ── 確認 (REQ-PKG1-009 概算明示) → 3 択 (本物 confirmMessages) ─────────────────
 
-export function confirmMessages(cart: ReadonlyArray<QuoteLineItem>): LineMessage[] {
-  const quote = buildQuote(cart);
+export function confirmMessages(
+  cart: ReadonlyArray<QuoteLineItem>,
+  taxOptions?: BuildQuoteOptions,
+): LineMessage[] {
+  const quote = buildQuote(cart, taxOptions);
   const contents: object[] = [buildSectionLabel('📄 お見積もり（概算）')];
 
   // 明細を 1 行ずつ並べる。
@@ -237,9 +243,9 @@ export function confirmMessages(cart: ReadonlyArray<QuoteLineItem>): LineMessage
   contents.push(buildDivider());
 
   // 小計 / 税 / 合計 (range 表示)。
-  contents.push(amountRow('小計', rangeYen(quote.subtotal, quote.subtotalMax)));
-  contents.push(amountRow(`消費税（${Math.round(TAX_RATE * 100)}%）`, formatYen(quote.tax)));
-  contents.push(amountRow('合計', rangeYen(quote.total, quote.totalMax), { bold: true }));
+  contents.push(amountRow('小計', formatTotalPrice(quote, quote.subtotal, quote.subtotalMax)));
+  contents.push(amountRow(`消費税（${Math.round(quote.taxRate * 100)}%）`, formatYen(quote.tax)));
+  contents.push(amountRow('合計', formatTotalPrice(quote, quote.total, quote.totalMax), { bold: true }));
   contents.push(buildDivider());
 
   // 注記 (パーツ代別途・概算)。
@@ -268,11 +274,7 @@ export function confirmMessages(cart: ReadonlyArray<QuoteLineItem>): LineMessage
 /** 見積明細 1 行 (名称 ×数量 と金額を左右に)。 */
 function quoteLineRow(item: QuoteLineItem): object {
   const qtyStr = item.qty > 1 ? ` ×${item.qty}` : '';
-  const priceStr =
-    item.amountMax !== null && item.amountMax !== item.amount
-      ? rangeYen(item.amount, item.amountMax)
-      : formatYen(item.amount);
-  return amountRow(`${item.name}${qtyStr}`, priceStr);
+  return amountRow(`${item.name}${qtyStr}`, formatItemPrice(item));
 }
 
 /** ラベルと金額を左右に並べた行。 */
@@ -366,18 +368,128 @@ export function consentPrompt(liffUrl: string | undefined): LineMessage {
 
 // ── カートサマリ (text) ───────────────────────────────────────────────────────
 
-export function cartSummaryText(cart: ReadonlyArray<QuoteLineItem>): string {
-  const quote = buildQuote(cart);
+export function cartSummaryText(
+  cart: ReadonlyArray<QuoteLineItem>,
+  taxOptions?: BuildQuoteOptions,
+): string {
+  const quote = buildQuote(cart, taxOptions);
   return `カートに追加しました（${cart.length}件）\n\n${formatQuoteText(quote)}`;
 }
 
-// ── 来店予定: 日時候補 縦リスト (Option A・店舗内包・1 タップ選択) ────────────────
+// ── 来店予定: 3 段階フロー (店舗 → 日付 → 時間 → 確認) ─────────────────────────
 //
-// 旧 UI (店舗 carousel + datetimepicker 自由カレンダー) は「分かりにくい」評価を受けた
-// ため、14 日分の「日付 × 店舗 × 時刻」候補を Pkg8 LH 準拠の縦リスト (section label +
-// tap row + divider) で提示する。候補が店舗を内包するので店舗選択ステップは不要。
-// 候補は数百件になりうるため buildPaginatedListMessages の byte 予算 carousel 分割に乗せ、
-// section label / tap row / divider を自前で組んで dividers=false で渡す。
+// 旧 Option A (店舗内包の「日付×店舗×時刻」全候補を 1 carousel に詰める縦リスト) は、
+// 2 店舗 × 14 日 × 30 分刻みで 287 候補 / 168KB に膨らみ、LINE Flex の 50KB 上限を超えて
+// Push API が 400 reject していた (届かない・bot_sessions だけ進む)。これを「店舗 → 日付 →
+// 時間」の 3 段階に分解し、各画面を 1 Bubble (件数が少なく軽量) に収める。
+//
+// - 店舗: template carousel (軽量・複雑な Flex 不要)。postback=pkg1_reserve_store&value={storeId}
+// - 日付: 選んだ店舗の営業日 (定休日除外済み) を縦リスト。postback=pkg1_reserve_date&value={YYYY-MM-DD}
+// - 時間: 選んだ日の slots を縦リスト。postback=pkg1_reserve_time&value={YYYY-MM-DDtHH:mm}
+
+/**
+ * ① 店舗選択 (Flex bubble 縦リスト)。日付・時間選択と同じスタイル (buildTapRow) で
+ * 統一感を出す。template carousel は古臭く見えるため Flex 縦リストに揃えた。
+ */
+export function reservationStoreCarousel(stores: ReadonlyArray<StoreRow>): LineMessage {
+  if (stores.length === 0) {
+    return buildListBubble({
+      altText: 'ご来店店舗の候補が見つかりません',
+      headerTitle: 'ご来店店舗',
+      headerSubtitle: '候補が見つかりませんでした',
+      contents: [
+        bodyText(
+          'ただいまご案内できる店舗が見つかりませんでした。スタッフよりご連絡いたします。',
+          { muted: true },
+        ),
+      ],
+    });
+  }
+  const tapRows = stores.map((store) =>
+    buildTapRow({
+      icon: '🏪',
+      label: store.name,
+      data: `action=pkg1_reserve_store&value=${store.id}`,
+    }),
+  );
+  return buildPaginatedListMessages({
+    altText: 'ご来店店舗をお選びください',
+    headerTitle: 'ご来店店舗',
+    headerSubtitle: 'ご来店店舗をお選びください',
+    leadingContents: [buildSectionLabel('🏪 店舗を選んでください')],
+    tapRows,
+  })[0]!;
+}
+
+/**
+ * ② 日付選択 (Flex bubble・縦リスト)。選んだ店舗の営業日 (定休日・過去除外済みの
+ * VisitDay) を 1 タップで選ばせる。候補ゼロは fail-loud (「準備中」1 Bubble)。
+ */
+export function reservationDateList(
+  store: StoreRow,
+  days: ReadonlyArray<VisitDay>,
+): LineMessage {
+  if (days.length === 0) {
+    return buildListBubble({
+      altText: 'ご来店日の候補が見つかりません',
+      headerTitle: `${store.name} - ご来店日`,
+      headerSubtitle: '候補が見つかりませんでした',
+      contents: [
+        bodyText(
+          'ただいまご案内できる来店日が見つかりませんでした。スタッフよりご連絡いたします。',
+          { muted: true },
+        ),
+      ],
+    });
+  }
+  const tapRows = days.map((day) =>
+    buildTapRow({ icon: '📅', label: day.label, data: `action=pkg1_reserve_date&value=${day.date}` }),
+  );
+  return buildPaginatedListMessages({
+    altText: 'ご来店日をお選びください',
+    headerTitle: `${store.name} - ご来店日`,
+    headerSubtitle: '来店予定日をお選びください',
+    leadingContents: [buildSectionLabel('📅 ご来店日を選んでください')],
+    tapRows,
+  })[0]!;
+}
+
+/**
+ * ③ 時間選択 (Flex bubble・縦リスト)。選んだ日の営業時間内 slots を 1 タップで選ばせる。
+ * slots ゼロ (枠切れ) は fail-loud (「別日選択を促す」1 Bubble)。
+ */
+export function reservationTimeList(store: StoreRow, day: VisitDay): LineMessage {
+  if (day.slots.length === 0) {
+    return buildListBubble({
+      altText: 'ご来店時間の候補が見つかりません',
+      headerTitle: `${store.name} - ${day.label}`,
+      headerSubtitle: '空き時間が見つかりませんでした',
+      contents: [
+        bodyText(
+          'この日のご案内できる時間が見つかりませんでした。別の日をお選びください。',
+          { muted: true },
+        ),
+      ],
+    });
+  }
+  const tapRows = day.slots.map((slot) =>
+    buildTapRow({ icon: '🕒', label: slot.label, data: `action=pkg1_reserve_time&value=${slot.value}` }),
+  );
+  return buildPaginatedListMessages({
+    altText: 'ご来店時間をお選びください',
+    headerTitle: `${store.name} - ${day.label}`,
+    headerSubtitle: 'ご来店時間をお選びください',
+    leadingContents: [buildSectionLabel(`🕒 ${day.label} の時間を選んでください`)],
+    tapRows,
+  })[0]!;
+}
+
+// ── [DEPRECATED] 来店予定: 日時候補 縦リスト (Option A・店舗内包・1 タップ選択) ─────
+//
+// @deprecated 287 候補を 1 carousel に詰めて 168KB → LINE Flex 50KB 上限超過で Push が
+// 400 reject される事故の原因。上の 3 段階フロー (reservationStoreCarousel /
+// reservationDateList / reservationTimeList) に置き換え済み。型互換と既存 import の都合で
+// 関数は残すが、dispatcher からは呼ばれない。/__debug/build-slot endpoint からのみ参照。
 
 const RESERVATION_HORIZON_DAYS = 14;
 
