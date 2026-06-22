@@ -11,8 +11,8 @@
  *   symptomMessages (region 配下の作業) / variantMessages (排他別単価の種類) /
  *   qtyPrompt (pair/count・v1.2.1 で任意数量は text 受付) / cartDecisionPrompt /
  *   confirmMessages (概算見積 + PDF だけ / 来店予定 / やり直す) / cartSummaryText /
- *   consentPrompt (LIFF URI) / reservationSlotMessages (来店日時候補 縦リスト・
- *   Option A: 店舗内包の 1 タップ選択) / reservationConfirmPrompt。
+ *   consentPrompt (LIFF URI) / 来店予定 3 段階フロー (reservationStoreCarousel /
+ *   reservationDateList / reservationTimeList) / reservationConfirmPrompt。
  *
  * postback 命名は本物 `action=pkg1_X&value=Y` 形式 (設計 v1.2.1 §3) を維持。
  * ロジック (state machine / dispatcher / postback format) は dfba733 のまま不変。
@@ -482,71 +482,6 @@ export function reservationTimeList(store: StoreRow, day: VisitDay): LineMessage
     leadingContents: [buildSectionLabel(`🕒 ${day.label} の時間を選んでください`)],
     tapRows,
   })[0]!;
-}
-
-// ── [DEPRECATED] 来店予定: 日時候補 縦リスト (Option A・店舗内包・1 タップ選択) ─────
-//
-// @deprecated 287 候補を 1 carousel に詰めて 168KB → LINE Flex 50KB 上限超過で Push が
-// 400 reject される事故の原因。上の 3 段階フロー (reservationStoreCarousel /
-// reservationDateList / reservationTimeList) に置き換え済み。型互換と既存 import の都合で
-// 関数は残すが、dispatcher からは呼ばれない。/__debug/build-slot endpoint からのみ参照。
-
-const RESERVATION_HORIZON_DAYS = 14;
-
-/** 1 候補の tap row。「{HH:MM} {店舗略称}」を 1 行で。postback に店舗 + 日時を内包。 */
-function reservationSlotRow(slot: ReservationSlot): object {
-  return buildTapRow({
-    icon: '▸',
-    label: `${slot.timeLabel} ${slot.storeAbbr}`,
-    data: `action=pkg1_reserve_slot&value=${slot.storeId}|${slot.datetime}`,
-  });
-}
-
-/**
- * 来店日時候補の縦リスト。日付ごとに section label を挟み、その配下に候補 tap row を
- * 並べる。10KB を超えるなら carousel に自動分割する (件数が増えても silent reject させない)。
- * 候補ゼロ (全店休業/枠切れ) は空配列でなく「準備中」1 Bubble を返し fail-loud にする。
- */
-export function reservationSlotMessages(slots: ReadonlyArray<ReservationSlot>): LineMessage[] {
-  if (slots.length === 0) {
-    return [
-      buildListBubble({
-        altText: 'ご来店予定の候補が見つかりません',
-        headerTitle: 'ご来店予定',
-        headerSubtitle: '候補が見つかりませんでした',
-        contents: [
-          bodyText(
-            'ただいまご案内できる来店枠が見つかりませんでした。スタッフよりご連絡いたします。',
-            { muted: true },
-          ),
-        ],
-      }),
-    ];
-  }
-
-  // 日付が変わるたびに section label を差し込みつつ row を 1 本の配列に積む。
-  // buildPaginatedListMessages の自動 divider は使わず (section label を跨ぐと不自然)、
-  // 候補 row の間にだけ自前で divider を入れる。
-  const rows: object[] = [];
-  let prevDate: string | null = null;
-  slots.forEach((slot) => {
-    if (slot.date !== prevDate) {
-      rows.push(buildSectionLabel(`📅 ${slot.dateLabel}`));
-      prevDate = slot.date;
-    } else {
-      rows.push(buildDivider());
-    }
-    rows.push(reservationSlotRow(slot));
-  });
-
-  return buildPaginatedListMessages({
-    altText: 'ご来店予定の日時をお選びください',
-    headerTitle: '📅 ご来店予定',
-    headerSubtitle: `${RESERVATION_HORIZON_DAYS}日先までの候補からお選びください`,
-    leadingContents: [buildSectionLabel('🗓 ご希望の日時を選んでください')],
-    tapRows: rows,
-    dividers: false,
-  });
 }
 
 // ── 来店予定: 確認 (はい / 別の日時にする) ──────────────────────────────────────

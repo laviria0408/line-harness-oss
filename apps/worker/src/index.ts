@@ -260,34 +260,6 @@ app.get('/__debug/force-resume', async (c) => {
   }
 });
 
-app.get('/__debug/build-slot', async (c) => {
-  const env = c.env as unknown as { [key: string]: unknown };
-  try {
-    const { listActiveStores } = await import('./lib/trycle-repo.js');
-    const { buildReservationSlots, nowJst } = await import('./lib/trycle-visit-slots.js');
-    const { reservationSlotMessages } = await import('./lib/trycle-pkg1-flex.js');
-    const stores = await listActiveStores(env as never);
-    const slots = buildReservationSlots(stores, nowJst());
-    const messages = reservationSlotMessages(slots);
-    const perMessageBytes = messages.map((m) => JSON.stringify(m).length);
-    const totalBytes = perMessageBytes.reduce((a, b) => a + b, 0);
-    return c.json({
-      ok: true,
-      storesCount: stores.length,
-      slotsCount: slots.length,
-      messagesCount: messages.length,
-      pushArrayLengthWithText: messages.length + 1,
-      pushApiLimit: 5,
-      wouldExceedPushLimit: messages.length + 1 > 5,
-      totalBytes,
-      perMessageBytes,
-    });
-  } catch (err) {
-    const e = err as { message?: string; stack?: string };
-    return c.json({ ok: false, error: String(e?.message ?? err), stack: e?.stack });
-  }
-});
-
 app.get('/__debug/delete-test-customer', async (c) => {
   const env = c.env as unknown as { [key: string]: unknown };
   const lineUserId = c.req.query('u');

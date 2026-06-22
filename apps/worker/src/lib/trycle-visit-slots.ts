@@ -61,9 +61,10 @@ export interface VisitSlot {
 }
 
 /**
- * 来店候補 1 件 (店舗 × 日 × 時刻を平坦化した row)。Option A の縦リスト UI 用。
- * 店舗 carousel + datetimepicker (自由カレンダー) は「分かりにくい」評価を受けたため、
- * 候補を 1 タップで選べる縦リストに置き換える (reservationSlotMessages が消費する)。
+ * 来店候補 1 件 (店舗 × 日 × 時刻を平坦化した row)。
+ * 現行は 3 段階フロー (店舗 → 日付 → 時刻) で消費する (reservationStoreCarousel /
+ * reservationDateList / reservationTimeList)。Flex 50KB 上限事故を避けるため
+ * 1 carousel 詰め込みの旧 UI は廃止済。
  */
 export interface ReservationSlot {
   readonly storeId: string;
