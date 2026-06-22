@@ -212,9 +212,10 @@ async function onRegion(ctx: Pkg1Context, value: string | null): Promise<void> {
     await safeReply(ctx, regionMessages(REGIONS));
     return;
   }
-  // 「その他（自由記述）」はスタッフ送り (REQ-PKG1-018)。
+  // 「その他（自由記述）」はスタッフ送り (REQ-PKG1-018)。選択した部位ラベルを
+  // 種別タグ判定 (Add-D) の起点に渡す。
   if (region.symptoms === null) {
-    return finishWithEscalation(ctx);
+    return finishWithEscalation(ctx, region.label);
   }
   const session = await currentSession(ctx);
   await upsertPkg1Session(repoEnv(ctx), ctx.lineUserId, {
@@ -250,8 +251,9 @@ async function onSymptom(ctx: Pkg1Context, value: string | null): Promise<void> 
     return;
   }
   // sample=null (「その他」) は確定額を出さずスタッフ送り (REQ-PKG1-018)。
+  // 部位+作業ラベルを種別タグ判定 (Add-D) の起点に渡す。
   if (!symptom.sample) {
-    return finishWithEscalation(ctx);
+    return finishWithEscalation(ctx, `${region.label} ${symptom.label}`);
   }
   return resolveAfterSelection(ctx, session, symptom, pending);
 }
@@ -269,7 +271,9 @@ async function onVariant(ctx: Pkg1Context, value: string | null): Promise<void> 
     if (symptom) await safeReply(ctx, variantMessages(symptom));
     return;
   }
-  if (!variant.sample) return finishWithEscalation(ctx);
+  if (!variant.sample) {
+    return finishWithEscalation(ctx, `${region.label} ${symptom.label} ${variant.label}`);
+  }
   const pending: PendingSelection = { ...session.pending, variantIndex };
   return resolveAfterSelection(ctx, session, symptom, pending);
 }
@@ -339,7 +343,7 @@ async function addLineItemAndAskCart(
   qty: number,
 ): Promise<void> {
   const base = await buildLineItemFromPending(repoEnv(ctx), session.pending);
-  if (!base) return finishWithEscalation(ctx);
+  if (!base) return finishWithEscalation(ctx, pendingLabel(session.pending));
 
   const item = makeLineItem({
     name: base.name,
@@ -746,20 +750,35 @@ async function finalizeReservation(ctx: Pkg1Context, session: ReservationState):
 /**
  * 確定不能症状 (region その他・symptom/variant sample=null・labor 解決不能) の
  * スタッフ送り。専用文言 + notifyStaff (見積サマリ同梱) + 有人モード。
+ *
+ * inquiryText = お客様の選択ラベル (region/symptom)。classifyInquiry (Add-D) が
+ * これを起点に種別タグを判定する (省略すると定型 reason が誤分類されるため・
+ * REQ-ADD-D-001 メニュー起点判定 / REQ-ADD-F-002 カーボン補修=矢野口固定)。
  */
-async function finishWithEscalation(ctx: Pkg1Context): Promise<void> {
+async function finishWithEscalation(ctx: Pkg1Context, inquiryText?: string): Promise<void> {
   await escalate(
     ctx,
     '確定不能症状',
     '確定のお見積もりが難しいご相談のため、スタッフから折り返しご連絡いたします 🙇',
+    inquiryText,
   );
 }
 
 /**
  * スタッフ送り共通: session 破棄 + 有人モード + Gmail 通知 (tag/店舗振り分け・
  * 見積サマリ同梱) + 文言 reply。
+ *
+ * inquiryText を渡すと classifyInquiry (Add-D) がそれを起点に種別タグを判定する。
+ * 省略時は定型 reason を分類してしまい、カーボン補修等の選択が「other」へ誤分類
+ * される (REQ-ADD-D-001 受入基準・REQ-ADD-F-002 違反) ため、呼び出し側は可能な
+ * 限り選択ラベルを渡すこと。
  */
-async function escalate(ctx: Pkg1Context, reason: string, introText: string): Promise<void> {
+async function escalate(
+  ctx: Pkg1Context,
+  reason: string,
+  introText: string,
+  inquiryText?: string,
+): Promise<void> {
   const env = repoEnv(ctx);
   // 見積中なら同梱物 (cart サマリ) を集める (REQ-PKG1-017)。
   const session = await getPkg1Session(env, ctx.lineUserId).catch(() => null);
@@ -777,6 +796,9 @@ async function escalate(ctx: Pkg1Context, reason: string, introText: string): Pr
     estimateSummary,
     pdfUrl: null,
     note: null,
+    // 種別タグ (Add-D) は選択ラベル起点で判定。無ければ reason へフォールバック
+    // (空文字も含めて分類根拠が無いとみなす)。
+    inquiryText: inquiryText && inquiryText.trim() !== '' ? inquiryText : reason,
   }).catch((err) => console.error('[trycle-pkg1] notifyStaff failed', err));
 
   await safeReply(ctx, [
@@ -805,6 +827,17 @@ async function currentSession(ctx: Pkg1Context): Promise<Pkg1State> {
 
 function currentSymptom(pending: PendingSelection): Symptom | undefined {
   return findRegionByValue(pending.regionValue)?.symptoms?.[pending.symptomIndex];
+}
+
+/**
+ * pending 選択の部位+作業ラベルを連結 (種別タグ判定 Add-D の起点)。
+ * region/symptom が解決できなければ空文字 (escalate 側で reason へフォールバック)。
+ */
+function pendingLabel(pending: PendingSelection | undefined): string {
+  if (!pending) return '';
+  const region = findRegionByValue(pending.regionValue);
+  const symptom = region?.symptoms?.[pending.symptomIndex];
+  return [region?.label, symptom?.label].filter(Boolean).join(' ');
 }
 
 function parseDispatch(value: string | null): Dispatch | null {

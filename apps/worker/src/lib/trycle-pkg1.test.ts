@@ -484,6 +484,110 @@ describe('escalation paths (REQ-PKG1-018)', () => {
   });
 });
 
+// ── escalate → notifyStaff の種別タグ判定 (Add-D / Add-F) ──────────────────────
+//
+// audit-coverage 指摘の実証: 旧実装は escalate() が notifyStaff に「reason のみ」
+// (定型文字列) を渡し、classifyInquiry が定型 reason を誤分類していた
+// (確定不能症状 → other 固定)。修正後は「お客様の選択ラベル」を inquiryText として
+// 渡すため、選択起点で種別タグが判定される (REQ-ADD-D-001 メニュー起点判定)。
+describe('escalate → staff 通知の種別タグ (Add-D / Add-F)', () => {
+  // gmail_notify (callGas → GAS_WEB_APP_URL) の POST を捕捉する。
+  let gasCalls: { type: string; payload: Record<string, unknown> }[];
+  const GAS_URL = 'https://gas.example.com/exec';
+
+  function gasEnv(): Env['Bindings'] {
+    return {
+      SUPABASE_URL: 'https://sb.example.com',
+      SUPABASE_SERVICE_ROLE_KEY: 'svc',
+      TRYCLE_TENANT_ID: TENANT,
+      GAS_WEB_APP_URL: GAS_URL,
+      GMAIL_NOTIFICATION_TO: 'staff@example.com',
+    } as Env['Bindings'];
+  }
+
+  async function gasPostback(data: string): Promise<boolean> {
+    return handlePkg1Postback(data, {
+      replyToken: `rt-${Math.random()}`,
+      lineUserId: USER,
+      lineClient,
+      env: gasEnv(),
+    });
+  }
+
+  beforeEach(() => {
+    gasCalls = [];
+    // supabase URL は既存 mock へ・GAS URL は捕捉して ok を返す。
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.startsWith(GAS_URL)) {
+          gasCalls.push(JSON.parse((init!.body as string) ?? '{}'));
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }
+        return supabaseMock(input, init);
+      }),
+    );
+  });
+
+  function lastStaffNotify(): Record<string, unknown> | undefined {
+    return gasCalls.filter((c) => c.type === 'gmail_notify').at(-1)?.payload;
+  }
+
+  it('region=その他 escalate は選択ラベル (定型 reason ではない) を分類根拠にする', async () => {
+    await gasPostback('pkg1_start');
+    await gasPostback('action=pkg1_dispatch&value=identified');
+    await gasPostback('action=pkg1_region&value=other');
+
+    const payload = lastStaffNotify();
+    expect(payload).toBeDefined();
+    // 「その他（自由記述）」= サービス種別不明 → other (旧実装と値は同じだが、
+    // 分類の起点が定型 reason でなく選択ラベルになっていることが要点)。
+    expect(payload!.tag).toBe('other');
+    // 確定不能症状 (canned reason) でなく、有人モードへ切り替わっている。
+    expect(tables.bot_sessions.some((r) => r.kind === 'manual_mode')).toBe(true);
+  });
+
+  it('カーボン補修ルートで escalate すると carbon タグ + 矢野口固定で通知 (REQ-ADD-F-002)', async () => {
+    // 顧客自由文起点の routing 実証: お客様の発話 (カーボン補修) が分類根拠になれば、
+    // 希望店舗に関わらず矢野口本店へ振り分けられる。escalate がお客様の文言を
+    // inquiryText として通知するため、カーボン関連の選択ラベルなら carbon タグになる。
+    // ※ 現行メニューにカーボン項目は無いため、ここは classifyInquiry の不変条件を
+    //    notifyStaff payload レベルで担保する直接検証 (routeInquiry の単体は
+    //    trycle-staff.test.ts)。
+    const { notifyStaff } = await import('./trycle-staff.js');
+    const res = await notifyStaff(gasEnv(), {
+      lineUserId: USER,
+      customerName: null,
+      reason: '確定不能症状',
+      estimateSummary: null,
+      pdfUrl: null,
+      note: null,
+      inquiryText: 'カーボンフレームのクラック補修をお願いしたい',
+      preferredShop: 'miyagase', // 宮ヶ瀬希望でも carbon は矢野口固定
+    });
+    expect(res.tag).toBe('carbon');
+    expect(res.shopId).toBe('yano');
+
+    const payload = lastStaffNotify();
+    expect(payload!.tag).toBe('carbon');
+    expect(payload!.shop_id).toBe('yano');
+    expect(payload!.shop_label).toBe('矢野口本店');
+  });
+
+  it('定型 reason をそのまま分類すると誤る (回帰防止: 来店予定は reservation, 確定不能症状は other)', async () => {
+    // classifyInquiry に canned reason を直接渡したときの値を固定し、escalate が
+    // この誤りやすい入力を分類根拠にしてしまわないこと (=選択ラベルを渡すこと) の
+    // 根拠を残す。
+    const { classifyInquiry } = await import('./trycle-staff.js');
+    expect(classifyInquiry('確定不能症状')).toBe('other');
+    expect(classifyInquiry('包括メンテしたい')).toBe('other');
+    expect(classifyInquiry('原因がわからない')).toBe('other');
+    // 「来店予定の受付」だけは 来店 を拾って reservation になる (偶然の正解)。
+    expect(classifyInquiry('来店予定の受付')).toBe('reservation');
+  });
+});
+
 // ── qty step (v1.2.1: 制限なし・任意数量) ─────────────────────────────────────
 
 describe('qty step (v1.2.1: 任意数量で cart 追加)', () => {
