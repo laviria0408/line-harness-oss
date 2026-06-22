@@ -15,6 +15,69 @@ export function getTenantId(env: TrycleRepoEnv): string {
   return env.TRYCLE_TENANT_ID;
 }
 
+// ── Tenant quote settings (設定 > 経理) ──────────────────────────────────────
+//
+// dashboard 側 `src/db/tenant-settings.ts:getQuoteSettings` と同じ source of
+// truth (tenants.settings.quote.{taxRate,taxRounding})。bot 経由の見積も
+// dashboard 経由の見積も同じ経理テーブルを参照させる (key 名・型は完全一致)。
+
+export type TaxRounding = 'floor' | 'round' | 'ceil';
+
+export interface TenantQuoteSettings {
+  readonly taxRate: number; // 0.1 等
+  readonly taxRounding: TaxRounding;
+}
+
+/**
+ * 最終 fallback。dashboard DEFAULT_QUOTE_SETTINGS と同じ既定値 (10% / floor)。
+ * ※ dashboard の hardcoded fallback (0.1 / "floor") と一致させる。
+ */
+const DEFAULT_TENANT_QUOTE_SETTINGS: TenantQuoteSettings = {
+  taxRate: 0.1,
+  taxRounding: 'floor',
+};
+
+function isValidTaxRate(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 1;
+}
+
+function isValidTaxRounding(v: unknown): v is TaxRounding {
+  return v === 'floor' || v === 'round' || v === 'ceil';
+}
+
+interface TenantSettingsRow {
+  readonly settings: { quote?: { taxRate?: unknown; taxRounding?: unknown } } | null;
+}
+
+/**
+ * tenants.settings JSONB から税率・端数処理を取得。
+ * dashboard 側 `getQuoteSettings` と同じ source of truth。
+ * 取得失敗・欠落・不正値時は { 0.1, "floor" } を fallback。
+ */
+export async function getTenantQuoteSettings(
+  env: TrycleRepoEnv,
+): Promise<TenantQuoteSettings> {
+  try {
+    const rows = await supabaseSelect<TenantSettingsRow>(
+      env,
+      'tenants',
+      { id: `eq.${getTenantId(env)}` },
+      { select: 'settings', limit: 1 },
+    );
+    const quote = rows[0]?.settings?.quote;
+    const taxRate = isValidTaxRate(quote?.taxRate)
+      ? quote.taxRate
+      : DEFAULT_TENANT_QUOTE_SETTINGS.taxRate;
+    const taxRounding = isValidTaxRounding(quote?.taxRounding)
+      ? quote.taxRounding
+      : DEFAULT_TENANT_QUOTE_SETTINGS.taxRounding;
+    return { taxRate, taxRounding };
+  } catch (err) {
+    console.error('[trycle-repo] getTenantQuoteSettings failed, using fallback', err);
+    return DEFAULT_TENANT_QUOTE_SETTINGS;
+  }
+}
+
 // ── Customer ────────────────────────────────────────────────────────────────
 
 export interface CustomerRow {

@@ -14,6 +14,7 @@ import {
   listActiveStores,
   findStoreById,
   findLaborByCode,
+  getTenantQuoteSettings,
   upsertCustomer,
   upsertConsent,
   MAINTENANCE_CONSENT_SOURCE,
@@ -221,7 +222,7 @@ trycle.post('/api/trycle/quote', async (c) => {
         }),
       );
     }
-    const quote = buildQuote(lineItems);
+    const quote = buildQuote(lineItems, await getTenantQuoteSettings(c.env));
     if (parsed.lineUserId) {
       await tagFriendByLineUserId(c.env, parsed.lineUserId, TRYCLE_TAG_QUOTE);
     }

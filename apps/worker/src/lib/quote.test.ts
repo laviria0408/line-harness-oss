@@ -4,6 +4,7 @@ import {
   formatQuoteText,
   formatYen,
   makeLineItem,
+  roundBy,
   TAX_RATE,
   type QuoteLineItem,
 } from './quote.js';
@@ -50,6 +51,47 @@ describe('buildQuote', () => {
   it('disclaimer is the canonical 概算 message', () => {
     const quote = buildQuote([makeLineItem({ name: 'X', unitPrice: 100 })]);
     expect(quote.disclaimer).toMatch(/概算/);
+  });
+
+  it('defaults to 10% / floor when options omitted (back-compat)', () => {
+    const quote = buildQuote([makeLineItem({ name: 'X', unitPrice: 1990 })]);
+    // 1990 * 0.1 = 199 (floor)
+    expect(quote.taxRate).toBe(0.1);
+    expect(quote.taxRounding).toBe('floor');
+    expect(quote.tax).toBe(199);
+    expect(quote.total).toBe(2189);
+  });
+
+  it('applies tenant taxRate and taxRounding from options', () => {
+    const items: QuoteLineItem[] = [makeLineItem({ name: 'X', unitPrice: 1990 })];
+    const quote = buildQuote(items, { taxRate: 0.08, taxRounding: 'round' });
+    // 1990 * 0.08 = 159.2 → round = 159
+    expect(quote.taxRate).toBe(0.08);
+    expect(quote.taxRounding).toBe('round');
+    expect(quote.tax).toBe(159);
+    expect(quote.total).toBe(2149);
+  });
+
+  it('honors ceil rounding from options', () => {
+    const items: QuoteLineItem[] = [makeLineItem({ name: 'X', unitPrice: 1011 })];
+    const quote = buildQuote(items, { taxRate: 0.1, taxRounding: 'ceil' });
+    // 1011 * 0.1 = 101.1 → ceil = 102
+    expect(quote.tax).toBe(102);
+  });
+
+  it('formatQuoteText shows the tax rate that was applied (8%)', () => {
+    const items: QuoteLineItem[] = [makeLineItem({ name: 'X', unitPrice: 1000 })];
+    const text = formatQuoteText(buildQuote(items, { taxRate: 0.08, taxRounding: 'round' }));
+    expect(text).toContain('消費税(8%)');
+  });
+});
+
+describe('roundBy', () => {
+  it('floor truncates, ceil rounds up, round nearest', () => {
+    expect(roundBy(159.2, 'floor')).toBe(159);
+    expect(roundBy(159.2, 'ceil')).toBe(160);
+    expect(roundBy(159.5, 'round')).toBe(160);
+    expect(roundBy(159.4, 'round')).toBe(159);
   });
 });
 
