@@ -386,9 +386,11 @@ function cleanEmptyNodes(obj: unknown): void {
 export function messageToLogPayload(message: Message): { messageType: string; content: string } {
   if (message.type === 'text') return { messageType: 'text', content: message.text };
   if (message.type === 'flex') {
-    // 会話履歴 (dashboard) で raw JSON が dump されると UI が崩壊する。
-    // LINE 仕様で必須の altText を抽出して人間可読なラベルだけ保存する
-    // (raw JSON は捨てる)。altText 欠落時は contents から先頭 text を救出。
+    // 会話履歴 (dashboard / LH 管理画面) で raw JSON が dump されると UI が崩壊する。
+    // altText (見出し) に加えて Flex 内の本文テキスト・選択肢ラベルを抽出し、
+    // 「📋 {altText}\n選択肢:\n- {label1}\n- {label2}…」形式で人間可読に保存する
+    // (raw JSON は捨てる)。これで「bot が何を提示し、どの選択肢があったか」が
+    // 会話履歴だけで完全に読める (Phase 1)。
     return { messageType: 'flex', content: flexLogContent(message.altText, message.contents) };
   }
   if (message.type === 'template') {
@@ -407,14 +409,33 @@ export function messageToLogPayload(message: Message): { messageType: string; co
   return { messageType: message.type, content: JSON.stringify(message) };
 }
 
+/** 1 つの Flex content から抽出する深さ上限 (循環/巨大 JSON の保険)。 */
+const FLEX_EXTRACT_MAX_DEPTH = 12;
+/** 会話履歴に出す選択肢ラベルの上限件数 (carousel 全展開での暴発を防ぐ)。 */
+const FLEX_MAX_CHOICE_LABELS = 40;
+
 /**
- * Flex / template の messages_log content を `[flex] {altText}` 形式に整える。
- * altText が空なら contents から先頭 text を救出し、それも無ければ `[flex]` だけ。
+ * Flex / template の messages_log content を会話履歴向けに整える。
+ *
+ *   `[flex] {見出し}`                         … 見出しだけ (選択肢が無い場合)
+ *   `[flex] {見出し}\n選択肢:\n- {A}\n- {B}…`  … tap row / button の選択肢付き
+ *
+ * 見出しは altText を優先し、空なら本文の先頭テキストを救出する。選択肢は Flex 内の
+ * postback / message / uri action を持つ tap row・button のラベルから抽出する
+ * (見出しと重複するラベルは除外)。altText も本文も無ければ `[flex]` のみ。
  */
 export function flexLogContent(altText: unknown, contents: unknown): string {
+  const heading = resolveHeading(altText, contents);
+  const choices = contents === undefined ? [] : safeCollectChoiceLabels(contents, heading);
+  const head = heading ? `[flex] ${heading}` : '[flex]';
+  if (choices.length === 0) return head;
+  return `${head}\n選択肢:\n${choices.map((c) => `- ${c}`).join('\n')}`;
+}
+
+/** 見出し (altText 優先・空なら本文先頭 text 救出)。 */
+function resolveHeading(altText: unknown, contents: unknown): string {
   const fromAlt = typeof altText === 'string' ? altText.trim() : '';
-  const label = fromAlt || (contents === undefined ? '' : safeExtractAltText(contents));
-  return label ? `[flex] ${label}` : '[flex]';
+  return fromAlt || (contents === undefined ? '' : safeExtractAltText(contents));
 }
 
 function safeExtractAltText(contents: unknown): string {
@@ -425,6 +446,58 @@ function safeExtractAltText(contents: unknown): string {
   } catch {
     return '';
   }
+}
+
+function safeCollectChoiceLabels(contents: unknown, heading: string): string[] {
+  try {
+    return collectChoiceLabels(contents, heading);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Flex JSON 内の tap row / button のアクションラベルを抽出する。
+ *
+ * - tap row (TRYCLE buildTapRow) は box.action.label に選択肢ラベルを持つ
+ * - LINE 標準 button は button.action.label を持つ
+ * - URI / message / postback いずれの action でも label を拾う (datetimepicker は除く)
+ *
+ * 見出し (altText) と一致するラベルや重複ラベルは除外し、出現順を保つ。
+ */
+function collectChoiceLabels(contents: unknown, heading: string): string[] {
+  const labels: string[] = [];
+  const seen = new Set<string>();
+  if (heading) seen.add(heading.trim());
+
+  const visit = (node: unknown, depth: number): void => {
+    if (depth > FLEX_EXTRACT_MAX_DEPTH || !node || typeof node !== 'object') return;
+    if (labels.length >= FLEX_MAX_CHOICE_LABELS) return;
+    if (Array.isArray(node)) {
+      for (const child of node) visit(child, depth + 1);
+      return;
+    }
+    const obj = node as Record<string, unknown>;
+    addActionLabel(obj.action, labels, seen);
+    for (const key of ['header', 'hero', 'body', 'footer', 'contents']) {
+      if (obj[key]) visit(obj[key], depth + 1);
+    }
+  };
+
+  visit(contents, 0);
+  return labels;
+}
+
+/** action オブジェクトの label を (重複でなければ) labels に積む。 */
+function addActionLabel(action: unknown, labels: string[], seen: Set<string>): void {
+  if (labels.length >= FLEX_MAX_CHOICE_LABELS) return;
+  if (!action || typeof action !== 'object') return;
+  const label = (action as Record<string, unknown>).label;
+  if (typeof label !== 'string') return;
+  const trimmed = label.trim();
+  if (!trimmed || seen.has(trimmed)) return;
+  seen.add(trimmed);
+  labels.push(trimmed);
 }
 
 export function buildMessage(messageType: string, messageContent: string, altText?: string): Message {

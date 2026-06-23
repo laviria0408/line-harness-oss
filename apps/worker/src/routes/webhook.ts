@@ -24,7 +24,8 @@ import type { EntryRoute, Friend } from '@line-crm/db';
 import { fireEvent } from '../services/event-bus.js';
 import { buildMessage, expandVariables } from '../services/step-delivery.js';
 import { tryHandleTryclePostback } from '../lib/trycle-postback.js';
-import { isManualMode, clearManualMode } from '../lib/trycle-session.js';
+import { isManualMode, clearManualMode, getPkg1Session } from '../lib/trycle-session.js';
+import { resolvePostbackLabel } from '../lib/trycle-postback-label.js';
 import type { TrycleRepoEnv } from '../lib/trycle-repo.js';
 import type { Env } from '../index.js';
 
@@ -409,6 +410,21 @@ async function handleEvent(
       // datetimepicker の選択値は postback.params.datetime で来る (Pkg1 来店予定)。
       const postbackParams = (event as unknown as { postback?: { params?: { datetime?: string } } })
         .postback?.params;
+
+      // Phase 2: 会話履歴の完全文脈化。symptom/variant の index は処理「後」だと
+      // session が次ステップへ進み region 文脈が失われるため、dispatch 前に実ラベルへ
+      // 翻訳して messages_log に保存する (Method A・DRY)。datetimepicker の値は
+      // postback.params.datetime で来るので value 欠落時はそちらを使う。
+      const dataForLabel = resolvePostbackDataForLabel(postbackData, postbackParams?.datetime);
+      const resolvedLabel = await resolveTryclePostbackLabel(
+        dataForLabel,
+        workerEnv,
+        userId,
+      ).catch((err) => {
+        console.error('Failed to resolve postback label', err);
+        return null;
+      });
+
       const handled = await tryHandleTryclePostback(postbackData, {
         replyToken: replyTokenForTrycle,
         lineUserId: userId,
@@ -418,13 +434,15 @@ async function handleEvent(
       });
       if (handled) {
         // Log the incoming postback so dashboard analytics still see it.
+        // 翻訳できたものは実ラベル (例「シーラント注入（1本）を選択」) を、できなければ
+        // raw を保存する (表示側は raw も翻訳できるフォールバックを持つ)。
         try {
           await db
             .prepare(
               `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, line_account_id, created_at)
                VALUES (?, ?, 'incoming', 'text', ?, NULL, NULL, 'postback', ?, ?)`,
             )
-            .bind(crypto.randomUUID(), friend.id, postbackData, lineAccountId ?? null, jstNow())
+            .bind(crypto.randomUUID(), friend.id, resolvedLabel ?? postbackData, lineAccountId ?? null, jstNow())
             .run();
         } catch (err) {
           console.error('Failed to log TRYCLE postback', err);
@@ -772,6 +790,50 @@ async function handleEvent(
 
     return;
   }
+}
+
+/**
+ * datetimepicker 系 postback は選択値が data でなく postback.params.datetime に来る。
+ * ラベル翻訳のため、value が無い来店時間 postback には datetime を value として補う。
+ */
+function resolvePostbackDataForLabel(data: string, datetime?: string): string {
+  if (!datetime) return data;
+  if (!data.startsWith('action=pkg1_reserve_time')) return data;
+  if (new URLSearchParams(data).get('value')) return data; // 既に value 同梱。
+  return `${data}&value=${datetime}`;
+}
+
+/**
+ * TRYCLE postback を実ラベルへ翻訳する (Phase 2)。symptom/variant の index 解決に
+ * 要る region 文脈は、dispatch で session が進む前のスナップショットから取る。
+ * 店舗 id は trycle-repo の findStoreById で名称解決する (関数注入)。
+ * Supabase 未設定・session 不在・例外時は null (= raw 保存にフォールバック)。
+ */
+async function resolveTryclePostbackLabel(
+  data: string,
+  workerEnv: Env['Bindings'] | undefined,
+  lineUserId: string,
+): Promise<string | null> {
+  if (!workerEnv) return null;
+  const repoEnv = workerEnv as TrycleRepoEnv;
+  const session =
+    repoEnv.SUPABASE_URL && repoEnv.SUPABASE_SERVICE_ROLE_KEY && workerEnv.TRYCLE_TENANT_ID
+      ? await getPkg1Session(repoEnv, lineUserId).catch(() => null)
+      : null;
+  const storeNameById = async (storeId: string): Promise<string | null> => {
+    try {
+      const { findStoreById } = await import('../lib/trycle-repo.js');
+      const store = await findStoreById(repoEnv, storeId);
+      return store?.name ?? null;
+    } catch {
+      return null;
+    }
+  };
+  return resolvePostbackLabel(data, {
+    regionValue: session?.pending?.regionValue,
+    symptomIndex: session?.pending?.symptomIndex,
+    storeNameById,
+  });
 }
 
 /**
