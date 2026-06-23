@@ -55,6 +55,9 @@ LIFF_CONSENT_URL = "https://liff.line.me/2010454164-PQzCGMhy"
 # need no new vars: they reuse SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY /
 # TRYCLE_TENANT_ID (secrets) and verify the LIFF access_token against LINE's
 # public Profile API (https://api.line.me/v2/profile).
+# 会話履歴タブ (/api/cases/:caseId/messages) は dashboard server と共有する内部
+# token を secret で持つ。dashboard 側 BOT_INTERNAL_TOKEN と同値にすること:
+#   wrangler secret put DASHBOARD_INTERNAL_TOKEN
 
 # ═══════════════════════════════════════════════════════════════
 # 本番環境

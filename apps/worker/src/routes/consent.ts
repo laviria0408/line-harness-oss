@@ -34,6 +34,7 @@ import {
   linkCaseCustomer,
 } from '../lib/trycle-pkg1-repo.js';
 import { resumeReservationAfterConsent } from '../lib/trycle-pkg1.js';
+import { appendChatSummary } from '../lib/trycle-chat-summary.js';
 import { LineClient } from '@line-crm/line-sdk';
 
 export const consent = new Hono<Env>();
@@ -117,6 +118,13 @@ consent.post('/api/consent-callback', async (c) => {
       },
     });
     await tagFriendByLineUserId(c.env, parsed.lineUserId, TRYCLE_TAG_CONSENT);
+
+    // 同意書取得 (直近 case があれば append・無ければバッファ)。flow は pkg1 扱い。
+    await appendChatSummary(c.env, parsed.lineUserId, {
+      flowType: 'pkg1',
+      speaker: '顧客',
+      text: '同意書を提出',
+    });
 
     // 経路 E (来店時補完・v1.2.1): 直近の pdf_only ルート cases (customer_id 未紐付け)
     // を line_user_id で検索し、今登録した customer を後付け紐付けする。失敗しても

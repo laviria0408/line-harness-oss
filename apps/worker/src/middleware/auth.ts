@@ -183,7 +183,10 @@ export async function authMiddleware(c: Context<Env>, next: Next): Promise<Respo
     // Consent LIFF (Pkg1 案 B): LINE access_token を route 内で verify するため
     // staff 認証は bypass する。
     path === '/api/consent-document' ||
-    path === '/api/consent-callback'
+    path === '/api/consent-callback' ||
+    // TRYCLE 会話履歴タブ: dashboard server が内部 token (DASHBOARD_INTERNAL_TOKEN)
+    // で叩くため staff 認証は bypass し、route 内で token を verify する。
+    path.match(/^\/api\/cases\/[^/]+\/messages$/)
   ) {
     return next();
   }

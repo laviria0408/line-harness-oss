@@ -27,6 +27,7 @@ import {
   type FaqLinkRow,
 } from './trycle-faq-repo.js';
 import type { TrycleRepoEnv } from './trycle-repo.js';
+import { appendChatSummary } from './trycle-chat-summary.js';
 import {
   buildTapRow,
   buildSectionLabel,
@@ -123,6 +124,9 @@ export async function handlePkg8Text(text: string, ctx: Pkg8Context): Promise<bo
       await incrementFaqCounter(ctx.env, hits[0]!.id, 'view_count').catch((err) => {
         console.error('[trycle-pkg8] view_count increment failed', err);
       });
+      // なんでも質問 (自由入力) + bot 応答 (2 行)。flow は inquiry 扱い。
+      await appendChatSummary(ctx.env, ctx.lineUserId, { flowType: 'inquiry', speaker: '顧客', text: query });
+      await appendChatSummary(ctx.env, ctx.lineUserId, { flowType: 'inquiry', speaker: 'bot', text: hits[0]!.answer });
       const flex = buildAnswerBubble(hits[0]!);
       await ctx.lineClient.replyMessage(ctx.replyToken, [flex]);
       return true;
@@ -183,6 +187,9 @@ async function replyAnswer(ctx: Pkg8Context, faqId: string): Promise<void> {
   await incrementFaqCounter(ctx.env, faqId, 'view_count').catch((err) => {
     console.error('[trycle-pkg8] view_count increment failed', err);
   });
+  // FAQ 選択 + 応答 (2 行)。直近 case があれば append・無ければバッファ。
+  await appendChatSummary(ctx.env, ctx.lineUserId, { flowType: 'pkg8', speaker: '顧客', text: faq.question });
+  await appendChatSummary(ctx.env, ctx.lineUserId, { flowType: 'pkg8', speaker: 'bot', text: faq.answer });
   const flex = buildAnswerBubble(faq);
   await ctx.lineClient.replyMessage(ctx.replyToken, [flex]);
 }

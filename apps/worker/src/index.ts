@@ -79,6 +79,7 @@ import adminUpdate from './routes/admin-update.js';
 // stock routes; tenant-scoped Supabase access is opt-in via env vars.
 import { trycle } from './routes/trycle.js';
 import { consent } from './routes/consent.js';
+import { casesMessages } from './routes/cases-messages.js';
 
 export type Env = {
   Bindings: {
@@ -128,6 +129,9 @@ export type Env = {
     // Pkg1 整備見積 (Step 4-7)。LIFF 同意書 URL・スタッフ通知先 Gmail。
     LIFF_CONSENT_URL?: string;
     GMAIL_NOTIFICATION_TO?: string;
+    // dashboard (Vercel) の会話履歴タブ → /api/cases/:caseId/messages 用の内部
+    // 共有 token。dashboard 側 BOT_INTERNAL_TOKEN と同値。staff API key とは別。
+    DASHBOARD_INTERNAL_TOKEN?: string;
   };
   Variables: {
     staff: { id: string; name: string; role: 'owner' | 'admin' | 'staff' };
@@ -173,6 +177,7 @@ app.route('/', liffRoutes);
 // TRYCLE business endpoints (Phase B)
 app.route('/', trycle);
 app.route('/', consent);
+app.route('/', casesMessages);
 
 // Mount route groups — Round 3
 app.route('/', webhooks);

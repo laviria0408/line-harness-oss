@@ -62,6 +62,7 @@ import {
 import { jstWallToIsoZ, parseJstDatetime, validateVisitAt } from './trycle-store-hours.js';
 import { generateVisitDays, nowJst, type VisitDay } from './trycle-visit-slots.js';
 import { notifyStaff } from './trycle-staff.js';
+import { appendChatSummary, flushChatSummaryBuffer } from './trycle-chat-summary.js';
 import { issueEstimatePdf, type EstimatePdfResult } from './trycle-pkg1-pdf.js';
 import {
   dispatchPrompt,
@@ -178,6 +179,12 @@ async function startFlow(ctx: Pkg1Context): Promise<void> {
   await upsertPkg1Session(repoEnv(ctx), ctx.lineUserId, emptyPkg1State()).catch((err) =>
     console.error('[trycle-pkg1] startFlow upsertPkg1Session failed', err),
   );
+  // 案件起票 (フロー開始)。flow_id はここで採番され後続イベントで共有される。
+  await appendChatSummary(repoEnv(ctx), ctx.lineUserId, {
+    flowType: 'pkg1',
+    speaker: '顧客',
+    text: '整備見積を依頼',
+  });
   await safeReply(ctx, [dispatchPrompt()]);
 }
 
@@ -354,6 +361,14 @@ async function addLineItemAndAskCart(
   });
   const cart = [...session.cart, item];
 
+  // メニュー選択確定 (region/symptom/variant 合算で 1 行)。item.name に部位+作業+種類が
+  // 含まれる (例「ブレーキパッド交換（前後）」)。qty>1 のときは本数も付す。
+  await appendChatSummary(repoEnv(ctx), ctx.lineUserId, {
+    flowType: 'pkg1',
+    speaker: '顧客',
+    text: qty > 1 ? `${item.name} ×${qty}` : item.name,
+  });
+
   await upsertPkg1Session(repoEnv(ctx), ctx.lineUserId, {
     ...session,
     cart,
@@ -413,7 +428,16 @@ async function finishPdfOnly(ctx: Pkg1Context, session: Pkg1State): Promise<void
   const env = repoEnv(ctx);
   const quote = buildQuote(session.cart, await getTenantQuoteSettings(env));
 
+  // 見積成立 (概算)。case 生成前に append → 同一 flow_id でバッファに積み、
+  // saveQuote 直後の flush で起票/選択行と一緒に case へ移す (グルーピング維持)。
+  await appendChatSummary(env, ctx.lineUserId, {
+    flowType: 'pkg1',
+    speaker: 'bot',
+    text: `概算見積 ¥${quote.total.toLocaleString('ja-JP')}`,
+  });
+
   // 見積保存 (v1.2.1 §7 #3): cases(status pdf_only・customer_id=null) + quote_versions。
+  // saveQuoteSafely 内で flushChatSummaryBuffer がバッファを case へ移す。
   const saved = await saveQuoteSafely(ctx, {
     quote,
     customerId: null,
@@ -700,7 +724,23 @@ async function finalizeReservation(ctx: Pkg1Context, session: ReservationState):
   // dashboard 側 JST 表示で +9h ズレるため "+09:00" 付き ISO に揃える (2026-06-22 事故)
   const visitAtIsoForDb = visitAtIso ? jstWallToIsoZ(visitAtIso) : null;
 
+  // 見積成立 + 来店予約成立。case 生成前に append → 同一 flow_id でバッファに積み、
+  // saveQuote 直後の flush で起票/選択行と一緒に case へ移す (グルーピング維持)。
+  await appendChatSummary(env, ctx.lineUserId, {
+    flowType: 'pkg1',
+    speaker: 'bot',
+    text: `概算見積 ¥${quote.total.toLocaleString('ja-JP')}`,
+  });
+  await appendChatSummary(env, ctx.lineUserId, {
+    flowType: 'pkg1',
+    speaker: '顧客',
+    text: visitAtIso
+      ? `来店予定: ${session.storeName ?? '店舗'} ${formatVisitAt(visitAtIso)}`
+      : `来店予定: ${session.storeName ?? '店舗'}`,
+  });
+
   const customerId = await findCustomerIdByLineUserId(env, ctx.lineUserId).catch(() => null);
+  // saveQuoteSafely 内で flushChatSummaryBuffer がバッファを case へ移す。
   const saved = await saveQuoteSafely(ctx, {
     quote,
     customerId,
@@ -732,6 +772,12 @@ async function finalizeReservation(ctx: Pkg1Context, session: ReservationState):
     pdfUrl,
     note: visitAtIso ? `来店予定: ${formatVisitAt(visitAtIso)}` : null,
   }).catch((err) => console.error('[trycle-pkg1] notifyStaff (reservation) failed', err));
+
+  await appendChatSummary(env, ctx.lineUserId, {
+    flowType: 'pkg1',
+    speaker: 'bot',
+    text: 'スタッフ引継: 来店予定の受付',
+  });
 
   await clearReservationSession(env, ctx.lineUserId).catch((err) => console.error('[trycle-pkg1] clearReservationSession failed', err));
   await clearPkg1Session(env, ctx.lineUserId).catch((err) => console.error('[trycle-pkg1] clearPkg1Session failed', err));
@@ -800,6 +846,13 @@ async function escalate(
     // (空文字も含めて分類根拠が無いとみなす)。
     inquiryText: inquiryText && inquiryText.trim() !== '' ? inquiryText : reason,
   }).catch((err) => console.error('[trycle-pkg1] notifyStaff failed', err));
+
+  // スタッフ送り。直近 case があれば append・無ければバッファ (後続 case 生成時に flush)。
+  await appendChatSummary(env, ctx.lineUserId, {
+    flowType: 'pkg1',
+    speaker: 'bot',
+    text: `スタッフ引継: ${inquiryText && inquiryText.trim() !== '' ? inquiryText : reason}`,
+  });
 
   await safeReply(ctx, [
     textMessage(introText),
@@ -908,7 +961,7 @@ async function saveQuoteSafely(ctx: Pkg1Context, args: SaveQuoteArgs): Promise<S
       storeId = def.id;
       storeCode = def.code;
     }
-    return await saveQuote(env, {
+    const saved = await saveQuote(env, {
       lineUserId: ctx.lineUserId,
       customerId: args.customerId,
       storeId,
@@ -917,8 +970,13 @@ async function saveQuoteSafely(ctx: Pkg1Context, args: SaveQuoteArgs): Promise<S
       quote: args.quote,
       caseLabel: args.caseLabel,
       visitScheduledAt: args.visitScheduledAt,
+      // chat_summary はフロー単位イベント行で構成する (v1.4)。case 生成直後に
+      // バッファ (起票〜メニュー選択) を flush し、空なら既定文言を入れておく。
       chatSummary: `整備見積 (概算 ${args.quote.total}円・LINE bot)`,
     });
+    // 案件起票より前のイベント (起票/メニュー選択) を新 case 行へ移す。
+    await flushChatSummaryBuffer(env, ctx.lineUserId, saved.caseId);
+    return saved;
   } catch (err) {
     console.error('[trycle-pkg1] saveQuote failed', err);
     return null;
