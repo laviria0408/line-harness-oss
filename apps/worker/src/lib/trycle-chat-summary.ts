@@ -46,6 +46,12 @@ export interface ChatSummaryEvent {
   readonly text: string;
   /** 表示時刻 (省略時は now)。テスト用に注入可能。 */
   readonly at?: Date;
+  /**
+   * フロー開始イベント (起票) に true を渡すと、必ず新しい flow_id を採番する。
+   * これにより、同一ユーザーが既存案件を持ったまま新しいフローを始めても、
+   * 直前フローの flow_id を引き継いで同じカードに混ざるのを防ぐ。
+   */
+  readonly startNewFlow?: boolean;
 }
 
 interface ChatSummaryBufferState {
@@ -213,13 +219,15 @@ export async function appendChatSummary(
 ): Promise<void> {
   try {
     const at = event.at ?? new Date();
+    const buffer = await getBuffer(env, lineUserId);
+    // 同フロー継続なら buffer の flow_id を再利用。新フロー開始 or 別フロー種別なら採番。
+    const reuse = !event.startNewFlow && buffer?.flowType === event.flowType;
+    const flowId = reuse ? buffer!.flowId : makeFlowId(at);
+    const line = formatChatSummaryLine(event, flowId);
     const recentCase = await findRecentCase(env, lineUserId);
 
     if (recentCase) {
-      // case 行がある → 直接 append。flow_id はバッファがあればそれ、無ければ採番。
-      const buffer = await getBuffer(env, lineUserId);
-      const flowId = buffer?.flowType === event.flowType ? buffer.flowId : makeFlowId(at);
-      const line = formatChatSummaryLine(event, flowId);
+      // case 行がある → 直接 append。flow_id は buffer 経由で同一フロー内共有する。
       const next = appendLineWithCap(recentCase.chat_summary, line);
       await supabaseUpdate(
         env,
@@ -227,14 +235,14 @@ export async function appendChatSummary(
         { id: `eq.${recentCase.id}`, tenant_id: `eq.${getTenantId(env)}` },
         { chat_summary: next, updated_at: new Date().toISOString() },
       );
+      // active flow の flow_id を保持 (lines は case へ出したので空)。後続の同フロー
+      // append が同じ flow_id を引けるようにする。
+      await setBuffer(env, lineUserId, { flowId, flowType: event.flowType, lines: [] });
       return;
     }
 
-    // case 行が無い → バッファに溜める。flow_id は同フローなら維持・別フローなら採番。
-    const buffer = await getBuffer(env, lineUserId);
-    const flowId = buffer?.flowType === event.flowType ? buffer.flowId : makeFlowId(at);
-    const line = formatChatSummaryLine(event, flowId);
-    const prevLines = buffer?.flowType === event.flowType ? buffer.lines : [];
+    // case 行が無い → バッファに溜める (case 生成時に flush)。
+    const prevLines = reuse ? buffer!.lines : [];
     const joined = appendLineWithCap(prevLines.join('\n') || null, line);
     await setBuffer(env, lineUserId, {
       flowId,
@@ -270,7 +278,14 @@ export async function flushChatSummaryBuffer(
       { id: `eq.${caseId}`, tenant_id: `eq.${getTenantId(env)}` },
       { chat_summary: joined, updated_at: new Date().toISOString() },
     );
-    await clearBuffer(env, lineUserId);
+    // バッファ行は case へ移したのでクリアするが、**flowId は保持**する。
+    // flush 直後に来る同フローの append (見積成立など・case 存在経路) が同じ
+    // flow_id を再利用でき、別カードへ分離するのを防ぐ (lines は空・flowType 維持)。
+    await setBuffer(env, lineUserId, {
+      flowId: buffer.flowId,
+      flowType: buffer.flowType,
+      lines: [],
+    });
   } catch (err) {
     console.error('[trycle-chat-summary] flushChatSummaryBuffer failed', err);
   }

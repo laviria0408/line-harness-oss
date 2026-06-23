@@ -179,11 +179,12 @@ async function startFlow(ctx: Pkg1Context): Promise<void> {
   await upsertPkg1Session(repoEnv(ctx), ctx.lineUserId, emptyPkg1State()).catch((err) =>
     console.error('[trycle-pkg1] startFlow upsertPkg1Session failed', err),
   );
-  // 案件起票 (フロー開始)。flow_id はここで採番され後続イベントで共有される。
+  // 案件起票 (フロー開始)。新 flow_id を採番し後続イベントで共有される。
   await appendChatSummary(repoEnv(ctx), ctx.lineUserId, {
     flowType: 'pkg1',
     speaker: '顧客',
     text: '整備見積を依頼',
+    startNewFlow: true,
   });
   await safeReply(ctx, [dispatchPrompt()]);
 }
