@@ -13,20 +13,27 @@
  *
  * ## 案件 (cases) 行が無い間の扱い (重要)
  * Pkg1 のメニュー選択・Pkg8 FAQ・スタッフ送り等は **cases 行ができる前** に
- * 発生する (cases は saveQuote でのみ生成される)。そこで append は:
- *   1. line_user_id の直近 cases 行があればそこへ直接 append。
- *   2. 無ければ bot_sessions(kind='chat_summary') に **バッファ** する
- *      (同時に flow_id を 1 度だけ採番し、後続イベントで共有する)。
- *   3. cases 行が生成された瞬間 (saveQuote) に flushChatSummaryBuffer で
- *      バッファ行を cases.chat_summary へ移し、バッファを消す。
+ * 発生する (cases は saveQuote でのみ生成される)。そこで append は
+ * **必ずアクティブフロー単位のバッファ** を介す:
+ *   1. bot_sessions(kind='chat_summary') にフロー単位のバッファ state を持つ
+ *      (flow_id を 1 度だけ採番し後続イベントで共有・flowType・lines・caseId)。
+ *   2. cases 行が無い間 (buffer.caseId 未設定) は lines に溜める。
+ *   3. このフローの saveQuote が cases 行を作った瞬間に flushChatSummaryBuffer で
+ *      lines を **その新 case** へ移し、buffer.caseId にその case を記録する。
+ *   4. flush 後の同フロー append (見積成立・来店予定など) は buffer.caseId が
+ *      指す **このフローの case** へ直接 append する。
  *
- * これにより「案件起票より前のメニュー選択」も最終的に案件のサマリーに残る。
+ * ## 「古い case を選ぶ」罠の回避 (2026-06-23 真因 1/2)
+ * 旧実装は「line_user_id の直近 case (created_at desc)」へ直接 append していた。
+ * 同一ユーザーが連続して 2 回フローを回すと、2 回目のイベントが 1 回目の古い case
+ * に流れ込み、2 回目の saveQuote が作る新 case にはフロー本文が残らない
+ * (= 同 flow_id が 2 case に分散)。本実装は **アクティブフローの buffer.caseId のみ**
+ * を append 先にし、findRecentCase フォールバックを廃止することでこれを防ぐ。
  */
 import {
   supabaseSelect,
   supabaseUpdate,
   supabaseUpsert,
-  supabaseDelete,
 } from './supabase.js';
 import { getTenantId, type TrycleRepoEnv } from './trycle-repo.js';
 
@@ -58,8 +65,14 @@ interface ChatSummaryBufferState {
   /** {MMDD-HHMM} 形式。フロー開始時に 1 度だけ採番。 */
   readonly flowId: string;
   readonly flowType: FlowType;
-  /** 既に整形済みの 1 行イベント (改行なし)。 */
+  /** 既に整形済みの 1 行イベント (改行なし)。case へ flush 済なら空。 */
   readonly lines: string[];
+  /**
+   * このフローの saveQuote が作った case の id。flush 後に設定する。
+   * 設定済 = 「このフロー専用の case」が確定したので、以降の同フロー append は
+   * findRecentCase でなく **この caseId** へ直接 append する (古い case 混入を防ぐ)。
+   */
+  readonly caseId?: string;
 }
 
 // ── format helpers ────────────────────────────────────────────────────────────
@@ -169,6 +182,7 @@ async function getBuffer(
     flowId: state.flowId,
     flowType: (state.flowType as FlowType) ?? 'pkg1',
     lines: state.lines,
+    ...(typeof state.caseId === 'string' ? { caseId: state.caseId } : {}),
   };
 }
 
@@ -193,24 +207,26 @@ async function setBuffer(
   );
 }
 
-async function clearBuffer(env: TrycleRepoEnv, lineUserId: string): Promise<void> {
-  await supabaseDelete(env, 'bot_sessions', {
-    tenant_id: `eq.${getTenantId(env)}`,
-    line_user_id: `eq.${lineUserId}`,
-    kind: `eq.${CHAT_SUMMARY_KIND}`,
-  });
-}
+// buffer は flow 切替時に setBuffer (upsert) で丸ごと置換されるため delete は不要
+// (新フローは startNewFlow で caseId 無しの fresh buffer に上書きされる)。
 
 // ── public API ────────────────────────────────────────────────────────────────
 
 /**
  * 1 イベントを「最近のやりとり」へ append する。
  *
- * - 直近 cases 行があれば直接 cases.chat_summary に append。
- * - 無ければ bot_sessions バッファに溜める (case 生成時に flush)。
+ * 紐付け先の決定 (上から優先):
+ *   1. **アクティブフローの buffer.caseId** が確定済 (= このフローの saveQuote が
+ *      既に case を作った) → その case へ直接 append。
+ *   2. アクティブフローの buffer がある (まだ case 未確定) → buffer.lines へ溜める。
+ *   3. buffer が無い & このイベントが新フローでない → 直近 case があればそこへ
+ *      append (consent callback の「同意書を提出」など・フロー外の後追いイベント)。
+ *   4. それも無ければ新規 buffer を作る。
  *
  * flow_id は同一フロー内で共有する: バッファの flowId を再利用し、無ければ採番する。
- * 失敗はフローを止めない (best-effort・呼び出し側は await して catch 不要)。
+ * **重要**: アクティブフロー (buffer あり) のときは findRecentCase を一切見ない。
+ * 直近 case が前フローの古い case のことがあり、混ぜると同 flow_id が複数 case に
+ * 分散する (2026-06-23 真因 1/2)。失敗はフローを止めない (best-effort)。
  */
 export async function appendChatSummary(
   env: TrycleRepoEnv,
@@ -224,44 +240,94 @@ export async function appendChatSummary(
     const reuse = !event.startNewFlow && buffer?.flowType === event.flowType;
     const flowId = reuse ? buffer!.flowId : makeFlowId(at);
     const line = formatChatSummaryLine(event, flowId);
-    const recentCase = await findRecentCase(env, lineUserId);
 
-    if (recentCase) {
-      // case 行がある → 直接 append。flow_id は buffer 経由で同一フロー内共有する。
-      const next = appendLineWithCap(recentCase.chat_summary, line);
-      await supabaseUpdate(
-        env,
-        'cases',
-        { id: `eq.${recentCase.id}`, tenant_id: `eq.${getTenantId(env)}` },
-        { chat_summary: next, updated_at: new Date().toISOString() },
-      );
-      // active flow の flow_id を保持 (lines は case へ出したので空)。後続の同フロー
-      // append が同じ flow_id を引けるようにする。
-      await setBuffer(env, lineUserId, { flowId, flowType: event.flowType, lines: [] });
+    // (1) アクティブフローの case が確定済 → その case へ直接 append (古い case 混入なし)。
+    if (reuse && buffer!.caseId) {
+      await appendToCase(env, buffer!.caseId, line);
+      // buffer は維持 (caseId/flowId/flowType をそのまま・lines は引き続き空)。
+      await setBuffer(env, lineUserId, {
+        flowId,
+        flowType: event.flowType,
+        lines: [],
+        caseId: buffer!.caseId,
+      });
       return;
     }
 
-    // case 行が無い → バッファに溜める (case 生成時に flush)。
-    const prevLines = reuse ? buffer!.lines : [];
-    const joined = appendLineWithCap(prevLines.join('\n') || null, line);
+    // (2) アクティブフロー継続中だがまだ case 未確定 → buffer.lines に溜める。
+    if (reuse) {
+      const joined = appendLineWithCap(buffer!.lines.join('\n') || null, line);
+      await setBuffer(env, lineUserId, {
+        flowId,
+        flowType: event.flowType,
+        lines: joined.split('\n'),
+      });
+      return;
+    }
+
+    // ここから先は「アクティブフロー外」(buffer 無し or 別フロー種別 or 新フロー開始)。
+    // (3) 新フロー開始でなく、直近 case があるならフロー外の後追いイベントとして
+    //     その case へ append する (consent callback 等)。新フロー開始 (startNewFlow)
+    //     のイベントは必ず buffer へ → 自フローの case へ flush させる。
+    if (!event.startNewFlow) {
+      const recentCase = await findRecentCase(env, lineUserId);
+      if (recentCase) {
+        const next = appendLineWithCap(recentCase.chat_summary, line);
+        await supabaseUpdate(
+          env,
+          'cases',
+          { id: `eq.${recentCase.id}`, tenant_id: `eq.${getTenantId(env)}` },
+          { chat_summary: next, updated_at: new Date().toISOString() },
+        );
+        return;
+      }
+    }
+
+    // (4) 新規 buffer を作る (case 生成時に flush)。
     await setBuffer(env, lineUserId, {
       flowId,
       flowType: event.flowType,
-      lines: joined.split('\n'),
+      lines: [line],
     });
   } catch (err) {
     console.error('[trycle-chat-summary] appendChatSummary failed', err);
   }
 }
 
+/** case.chat_summary に 1 行 append する (read-modify-write・上限 cap)。 */
+async function appendToCase(
+  env: TrycleRepoEnv,
+  caseId: string,
+  line: string,
+): Promise<void> {
+  const rows = await supabaseSelect<{ chat_summary: string | null }>(
+    env,
+    'cases',
+    { id: `eq.${caseId}`, tenant_id: `eq.${getTenantId(env)}` },
+    { select: 'chat_summary', limit: 1 },
+  );
+  const next = appendLineWithCap(rows[0]?.chat_summary ?? null, line);
+  await supabaseUpdate(
+    env,
+    'cases',
+    { id: `eq.${caseId}`, tenant_id: `eq.${getTenantId(env)}` },
+    { chat_summary: next, updated_at: new Date().toISOString() },
+  );
+}
+
 /**
- * cases 行が新規作成された直後に呼ぶ。バッファに溜まっていた行を
- * cases.chat_summary の先頭に移し、バッファを消す。
+ * このフローの cases 行が新規作成された直後に呼ぶ。バッファに溜まっていた
+ * イベント行を **その新 case** の chat_summary へ移す。
  *
- * caseInitialSummary には saveQuote が入れた既定文言が来る場合があるが、本仕様では
- * フロー単位イベント行で置き換える方が一貫するため、バッファ行 (= イベント履歴) を
- * 正としてマージする。バッファが空なら何もしない (既定文言を残す)。
- * 失敗はフローを止めない。
+ * - saveQuote は chat_summary を入れずに case を作る (legacy 固定文言は廃止・真因 3)
+ *   ため、case の既存 chat_summary (通常 null) にバッファ行を append する。
+ * - **buffer.caseId にこの caseId を記録**し、flush 後に来る同フローの append
+ *   (見積成立・来店予定・スタッフ引継など) が findRecentCase でなく
+ *   **この case** へ直接 append できるようにする (古い case 混入の防止・真因 1/2)。
+ *
+ * バッファが無い場合でも、後続の同フロー append が caseId を引けるよう buffer を
+ * 作って caseId を記録する (flowType/flowId は不明なら既定値・後続 append が
+ * startNewFlow せず continue する想定)。失敗はフローを止めない。
  */
 export async function flushChatSummaryBuffer(
   env: TrycleRepoEnv,
@@ -270,21 +336,16 @@ export async function flushChatSummaryBuffer(
 ): Promise<void> {
   try {
     const buffer = await getBuffer(env, lineUserId);
-    if (!buffer || buffer.lines.length === 0) return;
-    const joined = appendLineWithCap(null, buffer.lines.join('\n'));
-    await supabaseUpdate(
-      env,
-      'cases',
-      { id: `eq.${caseId}`, tenant_id: `eq.${getTenantId(env)}` },
-      { chat_summary: joined, updated_at: new Date().toISOString() },
-    );
-    // バッファ行は case へ移したのでクリアするが、**flowId は保持**する。
-    // flush 直後に来る同フローの append (見積成立など・case 存在経路) が同じ
-    // flow_id を再利用でき、別カードへ分離するのを防ぐ (lines は空・flowType 維持)。
+    if (buffer && buffer.lines.length > 0) {
+      await appendToCase(env, caseId, buffer.lines.join('\n'));
+    }
+    // バッファ行は case へ移した。**flowId/flowType を保持しつつ caseId を記録**して
+    // 同フローの後続 append が新 case へ直接届くようにする (lines は空)。
     await setBuffer(env, lineUserId, {
-      flowId: buffer.flowId,
-      flowType: buffer.flowType,
+      flowId: buffer?.flowId ?? makeFlowId(),
+      flowType: buffer?.flowType ?? 'pkg1',
       lines: [],
+      caseId,
     });
   } catch (err) {
     console.error('[trycle-chat-summary] flushChatSummaryBuffer failed', err);

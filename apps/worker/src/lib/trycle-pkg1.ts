@@ -63,6 +63,7 @@ import { jstWallToIsoZ, parseJstDatetime, validateVisitAt } from './trycle-store
 import { generateVisitDays, nowJst, type VisitDay } from './trycle-visit-slots.js';
 import { notifyStaff } from './trycle-staff.js';
 import { appendChatSummary, flushChatSummaryBuffer } from './trycle-chat-summary.js';
+import { recordOutgoingMessages } from './trycle-outgoing-log.js';
 import { issueEstimatePdf, type EstimatePdfResult } from './trycle-pkg1-pdf.js';
 import {
   dispatchPrompt,
@@ -532,15 +533,18 @@ export async function resumeReservationAfterConsent(
   await setReservationSession(repo, lineUserId, { step: 'awaiting_store', cart }).catch((err) => console.error('[trycle-pkg1] setReservationSession failed', err));
   await clearPkg1Cart(repo, lineUserId).catch((err) => console.error('[trycle-pkg1] clearPkg1Cart failed', err));
   await clearPkg1Session(repo, lineUserId).catch((err) => console.error('[trycle-pkg1] clearPkg1Session failed', err));
+  const pushed = [
+    textMessage('ご登録ありがとうございました。\nご来店店舗をお選びください。'),
+    reservationStoreCarousel(stores),
+  ];
   try {
-    await lineClient.pushMessage(lineUserId, [
-      textMessage('ご登録ありがとうございました。\nご来店店舗をお選びください。'),
-      reservationStoreCarousel(stores),
-    ] as never);
+    await lineClient.pushMessage(lineUserId, pushed as never);
   } catch (err) {
     console.error('[trycle-pkg1] resume reservation push failed', err);
     return false;
   }
+  // bot 応答を messages_log へ outgoing 記録 (真因 4)。env は Env['Bindings'] 実体。
+  await recordOutgoingMessages(env, lineUserId, pushed, 'push', 'pkg1');
   return true;
 }
 
@@ -971,11 +975,14 @@ async function saveQuoteSafely(ctx: Pkg1Context, args: SaveQuoteArgs): Promise<S
       quote: args.quote,
       caseLabel: args.caseLabel,
       visitScheduledAt: args.visitScheduledAt,
-      // chat_summary はフロー単位イベント行で構成する (v1.4)。case 生成直後に
-      // バッファ (起票〜メニュー選択) を flush し、空なら既定文言を入れておく。
-      chatSummary: `整備見積 (概算 ${args.quote.total}円・LINE bot)`,
+      // chat_summary はフロー単位イベント行 (v1.4) だけで構成する。flush helper が
+      // 唯一の writer。legacy 固定文言 (「整備見積 (概算 N円・LINE bot)」) は
+      // flush 行との二重書きになるため廃止 (2026-06-23 真因 3)。dashboard parser は
+      // 旧データの legacy 形式も読めるので過去 case には影響なし。
+      chatSummary: null,
     });
-    // 案件起票より前のイベント (起票/メニュー選択) を新 case 行へ移す。
+    // 案件起票より前のイベント (起票/メニュー選択) を **この新 case** 行へ移し、
+    // buffer.caseId に記録 (以降の同フロー append が古い case でなくここへ届く)。
     await flushChatSummaryBuffer(env, ctx.lineUserId, saved.caseId);
     return saved;
   } catch (err) {
@@ -1022,9 +1029,13 @@ function formatQuoteWithPdf(quote: Quote, pdfUrl: string | null): string {
 }
 
 async function safeReply(ctx: Pkg1Context, messages: LineMessage[]): Promise<void> {
+  const sent = messages.slice(0, MAX_REPLY_MESSAGES);
   try {
-    await ctx.lineClient.replyMessage(ctx.replyToken, messages.slice(0, MAX_REPLY_MESSAGES) as never);
+    await ctx.lineClient.replyMessage(ctx.replyToken, sent as never);
   } catch (err) {
     console.error('[trycle-pkg1] reply failed', err);
+    return; // 送信失敗時は履歴も書かない (実態と乖離させない)。
   }
+  // bot 応答を messages_log へ outgoing 記録 (真因 4: 会話履歴で bot を右側表示する)。
+  await recordOutgoingMessages(ctx.env, ctx.lineUserId, sent, 'reply', 'pkg1');
 }

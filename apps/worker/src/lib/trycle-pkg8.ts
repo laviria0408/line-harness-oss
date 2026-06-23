@@ -28,6 +28,7 @@ import {
 } from './trycle-faq-repo.js';
 import type { TrycleRepoEnv } from './trycle-repo.js';
 import { appendChatSummary } from './trycle-chat-summary.js';
+import { recordOutgoingMessages, type OutgoingLogEnv } from './trycle-outgoing-log.js';
 import {
   buildTapRow,
   buildSectionLabel,
@@ -52,6 +53,25 @@ export interface Pkg8Context {
   readonly lineUserId: string;
   readonly lineClient: LineClient;
   readonly env: TrycleRepoEnv;
+}
+
+/**
+ * reply を送り、成功したら messages_log へ outgoing 記録する (真因 4: FAQ の bot
+ * 応答を会話履歴で右側 (bot) 表示させる)。env は実体が Env['Bindings'] なので DB を
+ * 持つ (TrycleRepoEnv は narrow なので OutgoingLogEnv へ cast)。
+ */
+async function replyAndLog(
+  ctx: Pkg8Context,
+  messages: ReadonlyArray<{ type: string; [key: string]: unknown }>,
+): Promise<void> {
+  await ctx.lineClient.replyMessage(ctx.replyToken, messages as never);
+  await recordOutgoingMessages(
+    ctx.env as unknown as OutgoingLogEnv,
+    ctx.lineUserId,
+    messages,
+    'reply',
+    'pkg8',
+  );
 }
 
 export async function handlePkg8Postback(data: string, ctx: Pkg8Context): Promise<boolean> {
@@ -98,7 +118,7 @@ export async function handlePkg8Postback(data: string, ctx: Pkg8Context): Promis
     return true;
   }
 
-  await ctx.lineClient.replyMessage(ctx.replyToken, [{ type: 'text', text: '承りました。' }]);
+  await replyAndLog(ctx, [{ type: 'text', text: '承りました。' }]);
   return true;
 }
 
@@ -128,12 +148,12 @@ export async function handlePkg8Text(text: string, ctx: Pkg8Context): Promise<bo
       await appendChatSummary(ctx.env, ctx.lineUserId, { flowType: 'inquiry', speaker: '顧客', text: query, startNewFlow: true });
       await appendChatSummary(ctx.env, ctx.lineUserId, { flowType: 'inquiry', speaker: 'bot', text: hits[0]!.answer });
       const flex = buildAnswerBubble(hits[0]!);
-      await ctx.lineClient.replyMessage(ctx.replyToken, [flex]);
+      await replyAndLog(ctx, [flex]);
       return true;
     }
     // 2-5 件 → 候補リスト
     const flex = buildSearchResultsBubble(query, hits);
-    await ctx.lineClient.replyMessage(ctx.replyToken, [flex]);
+    await replyAndLog(ctx, [flex]);
     return true;
   } catch (err) {
     console.error('[trycle-pkg8] handlePkg8Text failed', err);
@@ -151,7 +171,7 @@ async function replyEntry(ctx: Pkg8Context): Promise<void> {
     listActiveFaqs(ctx.env).then((f) => f.length),
   ]);
   if (categories.length === 0 && faqsCount === 0) {
-    await ctx.lineClient.replyMessage(ctx.replyToken, [
+    await replyAndLog(ctx, [
       { type: 'text', text: '現在ご案内できる FAQ がありません。スタッフへ直接ご連絡ください。' },
     ]);
     return;
@@ -160,26 +180,26 @@ async function replyEntry(ctx: Pkg8Context): Promise<void> {
   // 閲覧数が 0 の FAQ は人気として出さない (新規 deploy 直後は空)
   const topFaqsFiltered = topFaqs.filter((f) => f.view_count > 0);
   const flex = buildEntryBubble(topFaqsFiltered, categories);
-  await ctx.lineClient.replyMessage(ctx.replyToken, [flex]);
+  await replyAndLog(ctx, [flex]);
 }
 
 async function replyQuestionList(ctx: Pkg8Context, category: string): Promise<void> {
   const faqs = await listActiveFaqs(ctx.env);
   const matched = faqs.filter((f) => f.category === category);
   if (matched.length === 0) {
-    await ctx.lineClient.replyMessage(ctx.replyToken, [
+    await replyAndLog(ctx, [
       { type: 'text', text: `「${category}」カテゴリに該当する質問が見つかりませんでした。` },
     ]);
     return;
   }
   const flex = buildQuestionListBubble(category, matched);
-  await ctx.lineClient.replyMessage(ctx.replyToken, [flex]);
+  await replyAndLog(ctx, [flex]);
 }
 
 async function replyAnswer(ctx: Pkg8Context, faqId: string): Promise<void> {
   const faq = await getFaqById(ctx.env, faqId);
   if (!faq) {
-    await ctx.lineClient.replyMessage(ctx.replyToken, [
+    await replyAndLog(ctx, [
       { type: 'text', text: '該当する質問が見つかりませんでした。' },
     ]);
     return;
@@ -191,7 +211,7 @@ async function replyAnswer(ctx: Pkg8Context, faqId: string): Promise<void> {
   await appendChatSummary(ctx.env, ctx.lineUserId, { flowType: 'pkg8', speaker: '顧客', text: faq.question, startNewFlow: true });
   await appendChatSummary(ctx.env, ctx.lineUserId, { flowType: 'pkg8', speaker: 'bot', text: faq.answer });
   const flex = buildAnswerBubble(faq);
-  await ctx.lineClient.replyMessage(ctx.replyToken, [flex]);
+  await replyAndLog(ctx, [flex]);
 }
 
 async function replyHelpfulAck(ctx: Pkg8Context, faqId: string): Promise<void> {
@@ -203,7 +223,7 @@ async function replyHelpfulAck(ctx: Pkg8Context, faqId: string): Promise<void> {
     '他にもご質問があれば下のボタンからお戻りください。',
     [{ label: '← FAQ に戻る', data: 'faq_start', style: 'primary' }],
   );
-  await ctx.lineClient.replyMessage(ctx.replyToken, [flex]);
+  await replyAndLog(ctx, [flex]);
 }
 
 async function replyUnhelpfulAck(ctx: Pkg8Context, faqId: string): Promise<void> {
@@ -218,7 +238,7 @@ async function replyUnhelpfulAck(ctx: Pkg8Context, faqId: string): Promise<void>
       { label: '← FAQ に戻る', data: 'faq_start', style: 'secondary' },
     ],
   );
-  await ctx.lineClient.replyMessage(ctx.replyToken, [flex]);
+  await replyAndLog(ctx, [flex]);
 }
 
 async function replyNoHit(ctx: Pkg8Context, query: string): Promise<void> {
@@ -229,11 +249,11 @@ async function replyNoHit(ctx: Pkg8Context, query: string): Promise<void> {
       { label: '← FAQ メニューを開く', data: 'faq_start', style: 'secondary' },
     ],
   );
-  await ctx.lineClient.replyMessage(ctx.replyToken, [flex]);
+  await replyAndLog(ctx, [flex]);
 }
 
 async function replyStaffEscalation(ctx: Pkg8Context): Promise<void> {
-  await ctx.lineClient.replyMessage(ctx.replyToken, [
+  await replyAndLog(ctx, [
     {
       type: 'text',
       text:
