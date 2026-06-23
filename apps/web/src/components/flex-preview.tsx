@@ -251,6 +251,14 @@ export default function FlexPreview({ content, maxWidth }: { content: string; ma
     // Unknown type — fallback to text extraction
     return <pre className="text-xs bg-gray-50 rounded p-2 max-h-40 overflow-auto">{JSON.stringify(parsed, null, 2)}</pre>
   } catch {
-    return <p className="text-xs text-red-500">Flex JSON パースエラー</p>
+    // 新仕様 (TRYCLE / messages_log INSERT 経路): bot 側で Flex の altText を抽出して
+    // "[flex] {altText}" 形式で保存している場合は JSON でないので JSON.parse は失敗するが
+    // それは fail-loud でなく altText を要約表示する fallback が正しい挙動。
+    const trimmed = typeof content === 'string' ? content.trim() : '';
+    if (trimmed.startsWith('[flex]')) {
+      const alt = trimmed.slice('[flex]'.length).trim();
+      return <p className="text-xs text-gray-700">📋 {alt || '(Flex)'}</p>;
+    }
+    return <p className="text-xs text-red-500">Flex JSON パースエラー</p>;
   }
 }
