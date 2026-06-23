@@ -4,6 +4,7 @@ import {
   buildLineItemFromPending,
   resetLaborCache,
   saveQuote,
+  attachCustomerIdToAllNullCases,
 } from './trycle-pkg1-repo.js';
 import { findRegionByValue } from '../data/pkg1-regions.js';
 import { buildQuote, makeLineItem } from './quote.js';
@@ -188,5 +189,57 @@ describe('saveQuote (cases + quotes + quote_versions・v1.2.1)', () => {
     const qvBody = JSON.parse(qvCall!.body as string)[0];
     expect(qvBody.tax).toBe(quote.tax);
     expect(qvBody.total).toBe(quote.total);
+  });
+});
+
+describe('attachCustomerIdToAllNullCases (経路 E 拡張・全件後付け紐付け)', () => {
+  beforeEach(() => vi.restoreAllMocks());
+  afterEach(() => vi.unstubAllGlobals());
+
+  function installFetch(nullCaseIds: string[]) {
+    const calls: Array<{ url: string; method: string; body?: string }> = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init?.method as string) ?? 'GET';
+      calls.push({ url, method, body: init?.body as string | undefined });
+      // SELECT (GET): customer_id IS NULL の case 一覧
+      if (url.includes('/cases') && method === 'GET') {
+        return new Response(JSON.stringify(nullCaseIds.map((id) => ({ id }))), { status: 200 });
+      }
+      // PATCH (UPDATE): 一括紐付け
+      return new Response(null, { status: 204 });
+    });
+    return calls;
+  }
+
+  it('updates all null-customer cases for the line_user_id (複数件)', async () => {
+    const calls = installFetch(['case-1', 'case-2', 'case-3']);
+    const n = await attachCustomerIdToAllNullCases(env(), 'cust-9', 'U1');
+    expect(n).toBe(3);
+    // SELECT は customer_id IS NULL + line_user_id でフィルタ
+    const selectCall = calls.find((c) => c.url.includes('/cases') && c.method === 'GET');
+    expect(selectCall!.url).toContain('customer_id=is.null');
+    expect(selectCall!.url).toContain('line_user_id=eq.U1');
+    // 1 回の PATCH で全件 update する
+    const patchCall = calls.find((c) => c.url.includes('/cases') && c.method === 'PATCH');
+    expect(patchCall).toBeDefined();
+    expect(patchCall!.url).toContain('customer_id=is.null');
+    expect(patchCall!.url).toContain('line_user_id=eq.U1');
+    expect(JSON.parse(patchCall!.body as string).customer_id).toBe('cust-9');
+  });
+
+  it('updates a single null-customer case (1 件)', async () => {
+    const calls = installFetch(['case-1']);
+    const n = await attachCustomerIdToAllNullCases(env(), 'cust-9', 'U1');
+    expect(n).toBe(1);
+    expect(calls.some((c) => c.url.includes('/cases') && c.method === 'PATCH')).toBe(true);
+  });
+
+  it('does not PATCH when there are no null-customer cases (0 件・idempotent)', async () => {
+    const calls = installFetch([]);
+    const n = await attachCustomerIdToAllNullCases(env(), 'cust-9', 'U1');
+    expect(n).toBe(0);
+    // 紐付け対象が無ければ PATCH を呼ばない (= 既に紐付け済 case を touch しない)
+    expect(calls.some((c) => c.url.includes('/cases') && c.method === 'PATCH')).toBe(false);
   });
 });

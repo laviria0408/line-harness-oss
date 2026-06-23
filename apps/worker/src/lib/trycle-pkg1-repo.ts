@@ -356,27 +356,10 @@ export async function updateQuotePdfUrl(
 }
 
 /**
- * 経路 E (来店時補完): 直近の pdf_only ルート cases を line_user_id で検索し、
- * customer_id 未紐付け (null) のものを返す。なければ null。
+ * cases.customer_id を後付け紐付けする (経路 E・単件)。
+ * 経路 E 拡張で通常は attachCustomerIdToAllNullCases (全件) を使うが、
+ * 単件紐付けが必要な呼び出し向けに残す。
  */
-export async function findRecentPdfOnlyCase(
-  env: TrycleRepoEnv,
-  lineUserId: string,
-): Promise<{ id: string } | null> {
-  const rows = await supabaseSelect<{ id: string }>(
-    env,
-    'cases',
-    {
-      tenant_id: `eq.${getTenantId(env)}`,
-      line_user_id: `eq.${lineUserId}`,
-      customer_id: 'is.null',
-    },
-    { select: 'id', order: 'created_at.desc', limit: 1 },
-  );
-  return rows[0] ?? null;
-}
-
-/** cases.customer_id を後付け紐付けする (経路 E)。 */
 export async function linkCaseCustomer(
   env: TrycleRepoEnv,
   caseId: string,
@@ -395,6 +378,53 @@ export async function linkCaseCustomer(
     ],
     { onConflict: 'id' },
   );
+}
+
+// 1 顧客あたりの未紐付け case 後付けは現実的にはごく少数。事故的な大量 UPDATE を
+// 避けるための安全キャップ。これを超える場合は別途調査すべき異常。
+const ATTACH_ALL_NULL_CASES_LIMIT = 20;
+
+/**
+ * 経路 E 拡張 (ユーザ確定仕様): 同 tenant + 同 line_user_id で customer_id 未紐付け
+ * (null) の cases を全件取得し、今登録した customer を後付け紐付けする。
+ *
+ * ケース ① (PDF → 来店予約) / ③ (PDF 複数 → LIFF) で、過去の pdf_only case が
+ * 複数 customer_id=null のまま残るのを解消する。既に customer_id が入っている case は
+ * フィルタ (is.null) で対象外になるため idempotent (二重 update しない)。
+ *
+ * @returns 後付け紐付けした件数
+ */
+export async function attachCustomerIdToAllNullCases(
+  env: TrycleRepoEnv,
+  customerId: string,
+  lineUserId: string,
+): Promise<number> {
+  const tenantId = getTenantId(env);
+  const rows = await supabaseSelect<{ id: string }>(
+    env,
+    'cases',
+    {
+      tenant_id: `eq.${tenantId}`,
+      line_user_id: `eq.${lineUserId}`,
+      customer_id: 'is.null',
+    },
+    { select: 'id', order: 'created_at.desc', limit: ATTACH_ALL_NULL_CASES_LIMIT },
+  );
+  if (rows.length === 0) return 0;
+
+  // line_user_id + customer_id IS NULL を条件に 1 回の PATCH で全件 update する
+  // (PostgREST は filter 全行を更新)。既に紐付け済の case は is.null フィルタで除外。
+  await supabaseUpdate(
+    env,
+    'cases',
+    {
+      tenant_id: `eq.${tenantId}`,
+      line_user_id: `eq.${lineUserId}`,
+      customer_id: 'is.null',
+    },
+    { customer_id: customerId, updated_at: new Date().toISOString() },
+  );
+  return rows.length;
 }
 
 /**

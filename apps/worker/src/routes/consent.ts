@@ -30,8 +30,7 @@ import {
   TRYCLE_TAG_CONSENT,
 } from '../lib/trycle-tagging.js';
 import {
-  findRecentPdfOnlyCase,
-  linkCaseCustomer,
+  attachCustomerIdToAllNullCases,
 } from '../lib/trycle-pkg1-repo.js';
 import { resumeReservationAfterConsent } from '../lib/trycle-pkg1.js';
 import { appendChatSummary } from '../lib/trycle-chat-summary.js';
@@ -126,17 +125,15 @@ consent.post('/api/consent-callback', async (c) => {
       text: '同意書を提出',
     });
 
-    // 経路 E (来店時補完・v1.2.1): 直近の pdf_only ルート cases (customer_id 未紐付け)
-    // を line_user_id で検索し、今登録した customer を後付け紐付けする。失敗しても
-    // 同意取得は成立しているのでフローは止めない (best-effort)。
+    // 経路 E 拡張 (ユーザ確定仕様): 同 line_user_id で customer_id 未紐付け (null) の
+    // 全 case を、今登録した customer に一括後付け紐付けする。ケース ① (PDF → 来店予約)
+    // / ③ (PDF 複数 → LIFF) で過去の pdf_only case が複数 null のまま残るのを解消する。
+    // 失敗しても同意取得は成立しているのでフローは止めない (best-effort)。
     if (customerId) {
       try {
-        const recentCase = await findRecentPdfOnlyCase(c.env, parsed.lineUserId);
-        if (recentCase) {
-          await linkCaseCustomer(c.env, recentCase.id, customerId);
-        }
+        await attachCustomerIdToAllNullCases(c.env, customerId, parsed.lineUserId);
       } catch (err) {
-        console.error('[consent-callback] pdf_only case link failed', err);
+        console.error('[consent-callback] attach customer_id to null cases failed', err);
       }
     }
 

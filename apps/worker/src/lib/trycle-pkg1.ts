@@ -438,11 +438,15 @@ async function finishPdfOnly(ctx: Pkg1Context, session: Pkg1State): Promise<void
     text: `概算見積 ¥${quote.total.toLocaleString('ja-JP')}`,
   });
 
-  // 見積保存 (v1.2.1 §7 #3): cases(status pdf_only・customer_id=null) + quote_versions。
+  // 見積保存 (v1.2.1 §7 #3): cases(status pdf_only) + quote_versions。
+  // ケース ② (来店予約 → PDF) で既に customer がいれば新 PDF case に継承する。
+  // 来店予定経路と同じ findCustomerIdByLineUserId パターンに統一 (DRY)。
+  // 未取得なら null のまま (経路 E が同意書提出時に後付け紐付けする)。
+  const customerId = await findCustomerIdByLineUserId(env, ctx.lineUserId).catch(() => null);
   // saveQuoteSafely 内で flushChatSummaryBuffer がバッファを case へ移す。
   const saved = await saveQuoteSafely(ctx, {
     quote,
-    customerId: null,
+    customerId,
     visitScheduledAt: null,
     caseLabel: 'pdf_only',
     statusKey: 'quote',

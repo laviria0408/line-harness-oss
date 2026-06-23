@@ -329,6 +329,15 @@ describe('pdf_only route (経路 D-1・v1.2.1 見積保存)', () => {
     expect(lastReplyText()).toContain('またのお問い合わせ');
     expect(sessionStep()).toBeUndefined();
   });
+
+  // ケース ② (来店予約 → PDF): 既に customer がいれば新 PDF case に継承する。
+  it('inherits the existing customer_id when a customer already exists', async () => {
+    tables.customers.push({ id: 'cust-7', tenant_id: TENANT, line_user_id: USER, name: '田中', phone: null, email: null });
+    await walkToConfirm();
+    await postback('action=pkg1_confirm&value=pdf_only');
+    expect(tables.cases).toHaveLength(1);
+    expect(tables.cases[0].customer_id).toBe('cust-7');
+  });
 });
 
 // ── 経路 D-2: 来店予定 → 同意書ゲート (来店予定押下直後) ───────────────────────

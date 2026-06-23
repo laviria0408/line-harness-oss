@@ -251,4 +251,71 @@ describe('POST /api/consent-callback', () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ ok: true });
   });
+
+  // 経路 E 拡張: 同意書提出時に同 line_user_id の customer_id=null 全 case を一括紐付け。
+  test('attaches customer_id to all null-customer cases on consent submit', async () => {
+    const patchedCases: Array<{ url: string; body?: string }> = [];
+    const stub = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = (init?.method as string) ?? 'GET';
+      if (url.startsWith('https://api.line.me/v2/profile')) {
+        return new Response(JSON.stringify({ userId: LINE_USER_ID }), { status: 200 });
+      }
+      // customers SELECT (findCustomerIdByLineUserId) → 既存 customer を返す
+      if (url.includes('/rest/v1/customers') && method === 'GET') {
+        return new Response(JSON.stringify([{ id: 'cust-1' }]), { status: 200 });
+      }
+      // cases SELECT (attachCustomerIdToAllNullCases) → null customer の case 2 件
+      if (url.includes('/rest/v1/cases') && method === 'GET') {
+        return new Response(JSON.stringify([{ id: 'case-1' }, { id: 'case-2' }]), { status: 200 });
+      }
+      // cases PATCH を記録 (chat_summary 紐付けと customer_id 紐付けの 2 系統がある)
+      if (url.includes('/rest/v1/cases') && method === 'PATCH') {
+        patchedCases.push({ url, body: init?.body as string | undefined });
+        return new Response(null, { status: 204 });
+      }
+      return new Response(JSON.stringify([]), { status: 200 });
+    });
+    vi.stubGlobal('fetch', stub);
+
+    const app = buildApp();
+    const res = await app.request(postReq(body), undefined, ENV as any);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true });
+    // customer_id 後付け紐付けの PATCH (customer_id=is.null フィルタ付き) を 1 回発行する
+    const attachPatch = patchedCases.find((p) => p.url.includes('customer_id=is.null'));
+    expect(attachPatch).toBeDefined();
+    expect(attachPatch!.url).toContain(`line_user_id=eq.${LINE_USER_ID}`);
+    expect(JSON.parse(attachPatch!.body as string).customer_id).toBe('cust-1');
+  });
+
+  // idempotency: null case が無ければ cases PATCH を呼ばない。
+  test('does not PATCH cases when there are no null-customer cases', async () => {
+    let casesPatched = false;
+    const stub = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = (init?.method as string) ?? 'GET';
+      if (url.startsWith('https://api.line.me/v2/profile')) {
+        return new Response(JSON.stringify({ userId: LINE_USER_ID }), { status: 200 });
+      }
+      if (url.includes('/rest/v1/customers') && method === 'GET') {
+        return new Response(JSON.stringify([{ id: 'cust-1' }]), { status: 200 });
+      }
+      if (url.includes('/rest/v1/cases') && method === 'GET') {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/rest/v1/cases') && method === 'PATCH') {
+        // customer_id 後付け紐付け PATCH のみ検知 (chat_summary 紐付け PATCH は無視)
+        if (url.includes('customer_id=is.null')) casesPatched = true;
+        return new Response(null, { status: 204 });
+      }
+      return new Response(JSON.stringify([]), { status: 200 });
+    });
+    vi.stubGlobal('fetch', stub);
+
+    const app = buildApp();
+    const res = await app.request(postReq(body), undefined, ENV as any);
+    expect(res.status).toBe(200);
+    expect(casesPatched).toBe(false);
+  });
 });
