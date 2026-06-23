@@ -385,7 +385,16 @@ function cleanEmptyNodes(obj: unknown): void {
  */
 export function messageToLogPayload(message: Message): { messageType: string; content: string } {
   if (message.type === 'text') return { messageType: 'text', content: message.text };
-  if (message.type === 'flex') return { messageType: 'flex', content: JSON.stringify(message.contents) };
+  if (message.type === 'flex') {
+    // 会話履歴 (dashboard) で raw JSON が dump されると UI が崩壊する。
+    // LINE 仕様で必須の altText を抽出して人間可読なラベルだけ保存する
+    // (raw JSON は捨てる)。altText 欠落時は contents から先頭 text を救出。
+    return { messageType: 'flex', content: flexLogContent(message.altText, message.contents) };
+  }
+  if (message.type === 'template') {
+    // template も altText 必須。raw template JSON は保存しない。
+    return { messageType: 'template', content: flexLogContent(message.altText, undefined) };
+  }
   if (message.type === 'image') {
     return {
       messageType: 'image',
@@ -396,6 +405,26 @@ export function messageToLogPayload(message: Message): { messageType: string; co
     };
   }
   return { messageType: message.type, content: JSON.stringify(message) };
+}
+
+/**
+ * Flex / template の messages_log content を `[flex] {altText}` 形式に整える。
+ * altText が空なら contents から先頭 text を救出し、それも無ければ `[flex]` だけ。
+ */
+export function flexLogContent(altText: unknown, contents: unknown): string {
+  const fromAlt = typeof altText === 'string' ? altText.trim() : '';
+  const label = fromAlt || (contents === undefined ? '' : safeExtractAltText(contents));
+  return label ? `[flex] ${label}` : '[flex]';
+}
+
+function safeExtractAltText(contents: unknown): string {
+  try {
+    const found = extractFlexAltText(contents);
+    // extractFlexAltText は見つからないと 'お知らせ' を返す → 救出失敗扱いで空に倒す。
+    return found && found !== 'お知らせ' ? found : '';
+  } catch {
+    return '';
+  }
 }
 
 export function buildMessage(messageType: string, messageContent: string, altText?: string): Message {

@@ -79,7 +79,10 @@ describe('recordOutgoingMessages (真因 4: bot outgoing 記録)', () => {
     expect(textIns.bindings[5]).toBe('pkg1');
 
     expect(flexIns.bindings[2]).toBe('flex');
-    expect(JSON.parse(flexIns.bindings[3] as string)).toEqual({ type: 'bubble' });
+    // Bug-C-001: Flex は raw JSON でなく altText を [flex] prefix で保存する
+    // (dashboard 会話履歴で JSON dump させない)。
+    expect(flexIns.bindings[3]).toBe('[flex] メニュー');
+    expect(flexIns.bindings[3] as string).not.toContain('bubble');
   });
 
   it('記録した行は normalizeDirection で bot (右側) に分類される', async () => {
