@@ -58,3 +58,50 @@ export async function resolveCaseLineUserId(c: Context<Env>, caseId: string): Pr
   if (!rows[0]) return { status: 'not_found' };
   return { status: 'ok', lineUserId: rows[0].line_user_id ?? null };
 }
+
+/**
+ * 会話履歴の時間範囲を取得する。
+ *
+ * 当 case の created_at 〜 同 line_user_id の「次 case の created_at」までの時間窓を返す。
+ * messages_log は friend_id 単位で全件保存されているので、case 単位の会話タブで
+ * friend_id だけで絞ると過去 case の会話も全部出てしまう (実機 bug)。
+ *
+ * - status='ok' + startAt + endAt(null 可・null=現在まで)
+ * - status='not_found' or 'tenant_unconfigured' は resolveCaseLineUserId と同形式
+ * - case に line_user_id が無い (dashboard 起票) なら null/null を返す
+ */
+export interface CaseConversationRange {
+  status: 'ok' | 'not_found' | 'tenant_unconfigured';
+  startAt?: string | null;
+  endAt?: string | null;
+}
+
+export async function resolveCaseConversationRange(c: Context<Env>, caseId: string): Promise<CaseConversationRange> {
+  const tenantId = c.env.TRYCLE_TENANT_ID;
+  if (!tenantId) return { status: 'tenant_unconfigured' };
+
+  // 1) 当 case の created_at + line_user_id を取る
+  const cur = await supabaseSelect<{ line_user_id: string | null; created_at: string }>(
+    c.env,
+    'cases',
+    { id: `eq.${caseId}`, tenant_id: `eq.${tenantId}` },
+    { select: 'line_user_id,created_at', limit: 1 },
+  );
+  if (!cur[0]) return { status: 'not_found' };
+  const startAt = cur[0].created_at;
+  const lineUserId = cur[0].line_user_id;
+  if (!lineUserId) return { status: 'ok', startAt: null, endAt: null };
+
+  // 2) 同 line_user_id の next case (created_at > startAt) の最古を end として取る
+  const next = await supabaseSelect<{ created_at: string }>(
+    c.env,
+    'cases',
+    {
+      tenant_id: `eq.${tenantId}`,
+      line_user_id: `eq.${lineUserId}`,
+      created_at: `gt.${startAt}`,
+    },
+    { select: 'created_at', order: 'created_at.asc', limit: 1 },
+  );
+  return { status: 'ok', startAt, endAt: next[0]?.created_at ?? null };
+}

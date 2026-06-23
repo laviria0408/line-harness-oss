@@ -26,7 +26,7 @@
  */
 import { Hono } from 'hono';
 import type { Env } from '../index.js';
-import { resolveCaseLineUserId, verifyDashboardToken } from '../lib/dashboard-auth.js';
+import { resolveCaseConversationRange, resolveCaseLineUserId, verifyDashboardToken } from '../lib/dashboard-auth.js';
 
 export const casesMessages = new Hono<Env>();
 
@@ -144,21 +144,36 @@ casesMessages.get('/api/cases/:caseId/messages', async (c) => {
       return c.json({ success: true, data: { messages: [], nextCursor: null } });
     }
 
-    // 3) messages_log (D1・friend_id フィルタ・newest first・cursor pagination)
+    // 2.5) 当 case の時間範囲を取る。messages_log は friend 単位で全件保存されているため、
+    //      friend_id だけで絞ると同顧客の過去 case の会話も全部出てしまう (実機 bug 修正)。
+    //      当 case の created_at 〜 同 line_user_id の次 case の created_at 直前まで。
+    //      次 case が無ければ「現在まで (上限なし)」。
+    const range = await resolveCaseConversationRange(c, caseId);
+    const startAt = range.status === 'ok' ? range.startAt ?? null : null;
+    const endAt = range.status === 'ok' ? range.endAt ?? null : null;
+
+    // 3) messages_log (D1・friend_id + 時間範囲・newest first・cursor pagination)
     //    julianday() で sub-second / TZ 差を吸収する (conversations.ts と同方針)。
-    const sql = cursor
-      ? `SELECT id, direction, message_type, content, delivery_type, source, broadcast_id, scenario_step_id, created_at
+    const whereClauses: string[] = ['friend_id = ?'];
+    const baseBindings: (string | number)[] = [friend.id];
+    if (startAt) {
+      whereClauses.push('julianday(created_at) >= julianday(?)');
+      baseBindings.push(startAt);
+    }
+    if (endAt) {
+      whereClauses.push('julianday(created_at) < julianday(?)');
+      baseBindings.push(endAt);
+    }
+    if (cursor) {
+      whereClauses.push('julianday(created_at) < julianday(?)');
+      baseBindings.push(cursor);
+    }
+    const sql = `SELECT id, direction, message_type, content, delivery_type, source, broadcast_id, scenario_step_id, created_at
          FROM messages_log
-         WHERE friend_id = ? AND julianday(created_at) < julianday(?)
-         ORDER BY created_at DESC LIMIT ?`
-      : `SELECT id, direction, message_type, content, delivery_type, source, broadcast_id, scenario_step_id, created_at
-         FROM messages_log
-         WHERE friend_id = ?
+         WHERE ${whereClauses.join(' AND ')}
          ORDER BY created_at DESC LIMIT ?`;
     // limit+1 を取って次ページ有無を判定する。
-    const bindings: (string | number)[] = cursor
-      ? [friend.id, cursor, limit + 1]
-      : [friend.id, limit + 1];
+    const bindings: (string | number)[] = [...baseBindings, limit + 1];
     const { results } = await c.env.DB.prepare(sql)
       .bind(...bindings)
       .all<MessagesLogRow>();
