@@ -135,7 +135,13 @@ async function supabaseMock(input: RequestInfo | URL, init?: RequestInit): Promi
   }
   if (method === 'DELETE') {
     const filters = parseFilters(url);
+    const removed = rows.filter((r) => matchRow(r, filters));
     tables[table] = rows.filter((r) => !matchRow(r, filters));
+    const prefer = (init!.headers as Record<string, string>)?.Prefer ?? '';
+    if (typeof prefer === 'string' && prefer.includes('return=representation')) {
+      // claim-and-delete: 消した行を返す (二重押下の冪等化テスト用)。
+      return new Response(JSON.stringify(removed), { status: 200 });
+    }
     return new Response(null, { status: 204 });
   }
   return new Response(null, { status: 200 });
@@ -470,6 +476,32 @@ describe('reservation flow (店舗 → 日付 → 時間 → 確認)', () => {
     expect(lastReplyAny()).toContain(`action=pkg1_reserve_time&value=${date}t`);
     expect(sessionReservationStep()).toBe('awaiting_time');
     expect(tables.cases).toHaveLength(0);
+  });
+
+  // ── 二重押下の冪等化 (2026-06-23 真因: 「はい」連打で 2 案件) ─────────────────
+  it('confirm=ok を 2 回押しても case は 1 件だけ作られる (idempotent claim)', async () => {
+    await reachStoreSelection();
+    await postback('action=pkg1_reserve_store&value=s1');
+    const dt = nextMondayAt14();
+    const date = dt.slice(0, 10);
+    await postback(`action=pkg1_reserve_date&value=${date}`);
+    await postback(`action=pkg1_reserve_time&value=${dt}`);
+
+    // 1 回目: case 作成 + 引継 reply。
+    await postback('action=pkg1_reserve_confirm&value=ok');
+    expect(tables.cases).toHaveLength(1);
+    expect(tables.quote_versions).toHaveLength(1);
+    // 確定で reservation session は消えている。
+    expect(tables.bot_sessions.some((r) => r.kind === 'reservation')).toBe(false);
+
+    // 2 回目 (連打 / webhook retry 相当): session は claim 済みで空 → 二重 finalize
+    // は起きず graceful フォールバックを返す。
+    await postback('action=pkg1_reserve_confirm&value=ok');
+    // case / quote_version が増えない (= スタッフ引継も二重にならない)。
+    expect(tables.cases).toHaveLength(1);
+    expect(tables.quote_versions).toHaveLength(1);
+    // 2 回目は確定文言ではなく再開導線 (reservationLost)。
+    expect(lastReplyText()).toContain('もう一度はじめから');
   });
 });
 

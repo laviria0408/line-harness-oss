@@ -51,7 +51,7 @@ import {
   clearPkg1Cart,
   getReservationSession,
   setReservationSession,
-  clearReservationSession,
+  claimReservationSession,
   setManualMode,
   emptyPkg1State,
   cartSubtotal,
@@ -693,11 +693,11 @@ async function reofferTimeOrDate(
 
 async function onReservationConfirmed(ctx: Pkg1Context, value: string | null): Promise<void> {
   const env = repoEnv(ctx);
-  const session = await getReservationSession(env, ctx.lineUserId);
-  if (!session) return reservationLost(ctx);
 
   if (value === 'change') {
-    // 時間選択に戻る (date は維持)。store/date が引けなければ日付選択に倒す。
+    // 「別の日時にする」は session を消さずに時間選択へ戻る (date は維持)。
+    const session = await getReservationSession(env, ctx.lineUserId);
+    if (!session) return reservationLost(ctx);
     const store = session.storeId ? await findStoreById(env, session.storeId) : null;
     if (!store) return reservationLost(ctx);
     await setReservationSession(env, ctx.lineUserId, { ...session, step: 'awaiting_time', visitAtIso: undefined });
@@ -706,7 +706,21 @@ async function onReservationConfirmed(ctx: Pkg1Context, value: string | null): P
   }
   if (value !== 'ok') return;
 
-  return finalizeReservation(ctx, session);
+  // 二重押下の冪等化 (2026-06-23 真因): 確認 Flex「はい」を連続 2 回押す /
+  // webhook retry で `pkg1_reserve_confirm=ok` が 2 回届くと、素朴な実装では
+  // 2 回とも finalize して case が 2 件作られる。確定の最初の操作で session を
+  // **原子的に claim (DELETE … RETURNING)** し、行を受け取れた request だけが
+  // finalize する。claim が空 = ①連打の 2 回目 (1 回目が既に消費) ②session 失効
+  // のどちらか。両者は claim 結果からは区別できないため、reservation フロー共通の
+  // graceful フォールバック (reservationLost) に倒す。重要不変条件 (case を 2 件
+  // 作らない) はここで担保され、2 回目の finalize は構造的に起きない。
+  const claimed = await claimReservationSession(env, ctx.lineUserId).catch((err) => {
+    console.error('[trycle-pkg1] claimReservationSession failed', err);
+    return null;
+  });
+  if (!claimed) return reservationLost(ctx);
+
+  return finalizeReservation(ctx, claimed);
 }
 
 /**
@@ -788,7 +802,8 @@ async function finalizeReservation(ctx: Pkg1Context, session: ReservationState):
     text: 'スタッフ引継: 来店予定の受付',
   });
 
-  await clearReservationSession(env, ctx.lineUserId).catch((err) => console.error('[trycle-pkg1] clearReservationSession failed', err));
+  // reservation session は onReservationConfirmed の claimReservationSession で
+  // 既に削除済み (冪等化)。ここでは pkg1 見積 session だけ片付ける。
   await clearPkg1Session(env, ctx.lineUserId).catch((err) => console.error('[trycle-pkg1] clearPkg1Session failed', err));
 
   const visitLabel = visitAtIso ? formatVisitAt(visitAtIso) : '';

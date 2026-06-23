@@ -20,6 +20,7 @@ import {
   supabaseSelect,
   supabaseUpsert,
   supabaseDelete,
+  supabaseDeleteReturning,
   type SupabaseEnvLike,
 } from './supabase.js';
 import { getTenantId, type TrycleRepoEnv } from './trycle-repo.js';
@@ -265,6 +266,36 @@ export async function clearReservationSession(
     line_user_id: `eq.${lineUserId}`,
     kind: `eq.${RESERVATION_KIND}`,
   });
+}
+
+/**
+ * 来店予定確定を **原子的に claim** する (二重押下の冪等化・2026-06-23 真因)。
+ *
+ * LINE の確認 Flex「はい」を連続 2 回押す / webhook が retry すると、
+ * `pkg1_reserve_confirm=ok` が 2 回届く。素朴な「read → 処理 → 末尾で delete」だと
+ * 2 回目が delete 前の session を読み再度 finalize → case が 2 件作られる。
+ *
+ * DELETE … RETURNING representation で「自分が消した行」を受け取り、行があれば
+ * この request が claim 成功 (=最初の 1 回)、空なら別 request が既に処理済み
+ * (=2 回目以降) と判定できる。PostgREST の DELETE は単一行をアトミックに消すため、
+ * 同時 2 リクエストでも「片方だけが行を受け取る」ことが保証される。
+ *
+ * @returns claim できた session state / 既に消費済みなら null。
+ */
+export async function claimReservationSession(
+  env: TrycleRepoEnv,
+  lineUserId: string,
+): Promise<ReservationState | null> {
+  const deleted = await supabaseDeleteReturning<{ state: ReservationState }>(
+    env,
+    'bot_sessions',
+    {
+      tenant_id: `eq.${getTenantId(env)}`,
+      line_user_id: `eq.${lineUserId}`,
+      kind: `eq.${RESERVATION_KIND}`,
+    },
+  );
+  return deleted[0]?.state ?? null;
 }
 
 // ── 有人モード (REQ-PKG1-024) ────────────────────────────────────────────────

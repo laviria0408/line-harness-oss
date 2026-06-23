@@ -174,3 +174,36 @@ export async function supabaseDelete(
     throw new Error(`supabase DELETE ${table} ${res.status}: ${body}`);
   }
 }
+
+/**
+ * DELETE that RETURNS the deleted rows (PostgREST `Prefer: return=representation`).
+ *
+ * Use this for atomic claim-and-delete: a single DELETE deletes the matching
+ * row(s) and reports exactly which rows it removed, so two concurrent requests
+ * (e.g. a double-tapped LINE postback) cannot both receive the same row — only
+ * the request that actually deleted it gets a non-empty array. The other gets
+ * an empty array and can treat it as "already consumed".
+ */
+export async function supabaseDeleteReturning<T>(
+  env: SupabaseEnvLike,
+  table: string,
+  filter: Record<string, string>,
+  select = '*',
+): Promise<T[]> {
+  if (Object.keys(filter).length === 0) {
+    throw new Error('supabaseDeleteReturning requires at least one filter');
+  }
+  const config = getSupabaseConfig(env);
+  const params = new URLSearchParams(filter);
+  params.set('select', select);
+  const url = `${config.url}/rest/v1/${encodeURIComponent(table)}?${params.toString()}`;
+  const res = await fetch(url, {
+    method: 'DELETE',
+    headers: buildHeaders(config, { Prefer: 'return=representation' }),
+  });
+  if (!res.ok) {
+    const body = await readErrorBody(res);
+    throw new Error(`supabase DELETE ${table} ${res.status}: ${body}`);
+  }
+  return (await res.json()) as T[];
+}

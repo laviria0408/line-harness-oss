@@ -78,8 +78,14 @@ function buildStatefulSupabase(opts: MockOpts = {}) {
         return new Response('[]', { status: 201 });
       }
       if (method === 'DELETE') {
-        sessions.set(kind, undefined as unknown);
+        const existing = sessions.get(kind);
         sessions.delete(kind);
+        const prefer = (init?.headers as Record<string, string> | undefined)?.Prefer ?? '';
+        if (typeof prefer === 'string' && prefer.includes('return=representation')) {
+          // claim-and-delete: 消した行を返す (来店予定確定の冪等化用)。
+          const removed = existing === undefined ? [] : [{ state: existing }];
+          return new Response(JSON.stringify(removed), { status: 200 });
+        }
         return new Response(null, { status: 204 });
       }
     }

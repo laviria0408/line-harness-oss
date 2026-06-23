@@ -5,6 +5,7 @@ import {
   supabaseUpsert,
   supabaseUpdate,
   supabaseDelete,
+  supabaseDeleteReturning,
   type SupabaseEnvLike,
 } from './supabase.js';
 
@@ -176,5 +177,53 @@ describe('supabaseDelete', () => {
     expect(fetchCall[1].method).toBe('DELETE');
     expect(fetchCall[0]).toContain('tenant_id=eq.t1');
     expect(fetchCall[0]).toContain('line_user_id=eq.U1');
+  });
+});
+
+describe('supabaseDeleteReturning (atomic claim-and-delete)', () => {
+  beforeEach(() => {
+    globalThis.fetch = vi.fn();
+  });
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it('refuses delete without filter', async () => {
+    await expect(supabaseDeleteReturning(env, 'bot_sessions', {})).rejects.toThrow(
+      /at least one filter/,
+    );
+  });
+
+  it('DELETEs with return=representation and returns the deleted rows', async () => {
+    const removed = [{ state: { step: 'awaiting_confirm' } }];
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      json: async () => removed,
+    });
+    const result = await supabaseDeleteReturning<{ state: unknown }>(
+      env,
+      'bot_sessions',
+      { tenant_id: 'eq.t1', line_user_id: 'eq.U1', kind: 'eq.reservation' },
+      'state',
+    );
+    expect(result).toEqual(removed);
+    const fetchCall = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(fetchCall[1].method).toBe('DELETE');
+    expect((fetchCall[1].headers as Record<string, string>).Prefer).toContain(
+      'return=representation',
+    );
+    expect(fetchCall[0]).toContain('select=state');
+  });
+
+  it('returns empty array when no row matched (already consumed)', async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      json: async () => [],
+    });
+    const result = await supabaseDeleteReturning(env, 'bot_sessions', {
+      tenant_id: 'eq.t1',
+      kind: 'eq.reservation',
+    });
+    expect(result).toEqual([]);
   });
 });
