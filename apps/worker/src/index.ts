@@ -80,6 +80,7 @@ import adminUpdate from './routes/admin-update.js';
 import { trycle } from './routes/trycle.js';
 import { consent } from './routes/consent.js';
 import { casesMessages } from './routes/cases-messages.js';
+import { pushMessage } from './routes/push-message.js';
 
 export type Env = {
   Bindings: {
@@ -178,6 +179,7 @@ app.route('/', liffRoutes);
 app.route('/', trycle);
 app.route('/', consent);
 app.route('/', casesMessages);
+app.route('/', pushMessage);
 
 // Mount route groups — Round 3
 app.route('/', webhooks);

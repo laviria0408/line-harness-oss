@@ -186,7 +186,10 @@ export async function authMiddleware(c: Context<Env>, next: Next): Promise<Respo
     path === '/api/consent-callback' ||
     // TRYCLE 会話履歴タブ: dashboard server が内部 token (DASHBOARD_INTERNAL_TOKEN)
     // で叩くため staff 認証は bypass し、route 内で token を verify する。
-    path.match(/^\/api\/cases\/[^/]+\/messages$/)
+    path.match(/^\/api\/cases\/[^/]+\/messages$/) ||
+    // TRYCLE LINE 共有 (token 一元化): dashboard server が内部 token で叩く。
+    // staff 認証は bypass し、route 内で token を verify する。
+    path.match(/^\/api\/cases\/[^/]+\/push-message$/)
   ) {
     return next();
   }

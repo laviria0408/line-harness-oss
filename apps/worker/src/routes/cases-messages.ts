@@ -26,7 +26,7 @@
  */
 import { Hono } from 'hono';
 import type { Env } from '../index.js';
-import { supabaseSelect } from '../lib/supabase.js';
+import { resolveCaseLineUserId, verifyDashboardToken } from '../lib/dashboard-auth.js';
 
 export const casesMessages = new Hono<Env>();
 
@@ -107,14 +107,9 @@ function displayText(row: MessagesLogRow): string {
 
 casesMessages.get('/api/cases/:caseId/messages', async (c) => {
   // 内部 token 認証 (staff auth は bypass されている)。
-  const expected = c.env.DASHBOARD_INTERNAL_TOKEN;
-  if (!expected) {
-    return c.json({ success: false, error: 'internal token not configured' }, 503);
-  }
-  const auth = c.req.header('Authorization');
-  const token = auth && auth.startsWith('Bearer ') ? auth.slice('Bearer '.length).trim() : null;
-  if (!token || token !== expected) {
-    return c.json({ success: false, error: 'unauthorized' }, 401);
+  const authResult = verifyDashboardToken(c);
+  if (!authResult.ok) {
+    return c.json({ success: false, error: authResult.error }, authResult.status);
   }
 
   const caseId = c.req.param('caseId');
@@ -127,20 +122,14 @@ casesMessages.get('/api/cases/:caseId/messages', async (c) => {
 
   try {
     // 1) caseId → line_user_id (Supabase・tenant スコープ)
-    const tenantId = c.env.TRYCLE_TENANT_ID;
-    if (!tenantId) {
+    const lookup = await resolveCaseLineUserId(c, caseId);
+    if (lookup.status === 'tenant_unconfigured') {
       return c.json({ success: false, error: 'tenant not configured' }, 503);
     }
-    const caseRows = await supabaseSelect<{ line_user_id: string | null }>(
-      c.env,
-      'cases',
-      { id: `eq.${caseId}`, tenant_id: `eq.${tenantId}` },
-      { select: 'line_user_id', limit: 1 },
-    );
-    const lineUserId = caseRows[0]?.line_user_id ?? null;
-    if (!caseRows[0]) {
+    if (lookup.status === 'not_found') {
       return c.json({ success: false, error: 'case not found' }, 404);
     }
+    const lineUserId = lookup.lineUserId;
     // case はあるが LINE 未連携 (dashboard 起票) → 空配列。
     if (!lineUserId) {
       return c.json({ success: true, data: { messages: [], nextCursor: null } });
