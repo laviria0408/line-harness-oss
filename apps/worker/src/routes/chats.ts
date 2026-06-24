@@ -1,6 +1,10 @@
 import { Hono } from 'hono';
 import { extractFlexAltText } from '../utils/flex-alt-text.js';
 import {
+  shouldSyncCaseComplete,
+  syncCaseCompleteOnChatResolved,
+} from '../lib/trycle-chat-resolve-sync.js';
+import {
   getOperators,
   getOperatorById,
   createOperator,
@@ -461,10 +465,29 @@ chats.put('/api/chats/:id', async (c) => {
     const id = c.req.param('id');
     const resolved = await resolveOrCreateChat(c.env.DB, id);
     if (!resolved) return c.json({ success: false, error: 'Not found' }, 404);
+    const previousStatus = resolved.status;
     const body = await c.req.json<{ operatorId?: string | null; status?: string; notes?: string }>();
     await updateChat(c.env.DB, resolved.id, body);
     const updated = await getChatById(c.env.DB, resolved.id);
     if (!updated) return c.json({ success: false, error: 'Not found' }, 404);
+
+    // TRYCLE: 解決済へ遷移したら dashboard の相談中 case を完了へ連動 (Task #33)。
+    // best-effort — 失敗しても chat の status 変更 (上で完了済) は巻き戻さない。
+    if (shouldSyncCaseComplete(body.status, previousStatus)) {
+      const friend = await getFriendById(c.env.DB, updated.friend_id);
+      const lineUserId = friend?.line_user_id;
+      if (lineUserId) {
+        const sync = syncCaseCompleteOnChatResolved(c.env, lineUserId).catch((err) =>
+          console.error('[chats] case 完了連動の予期せぬ失敗:', err),
+        );
+        if (c.executionCtx?.waitUntil) {
+          c.executionCtx.waitUntil(sync);
+        } else {
+          await sync;
+        }
+      }
+    }
+
     return c.json({
       success: true,
       // 公開 ID は friend_id に統一
