@@ -435,11 +435,33 @@ export default function ChatsPage() {
   // chat list returns id = friend_id, so selectedChatId === friendId is correct.
   // If no chat exists yet, loadChatDetail will fail and the user can fall back to
   // the friend list — acceptable for now.
+  //
+  // TRYCLE Phase 4: dashboard LineButton は ?friend=<lineUserId> (U + 32 hex) を渡すため、
+  // LINE User ID 形式と検出したら friends API で friend_id を解決してから setSelectedChatId する。
   useEffect(() => {
     if (typeof window === 'undefined') return
     const params = new URLSearchParams(window.location.search)
-    const friendId = params.get('friend')
-    if (friendId) setSelectedChatId(friendId)
+    const friendParam = params.get('friend')
+    if (!friendParam) return
+    const isLineUserId = /^U[0-9a-fA-F]{32}$/.test(friendParam)
+    if (!isLineUserId) {
+      setSelectedChatId(friendParam)
+      return
+    }
+    // LINE User ID → friend_id 解決
+    ;(async () => {
+      try {
+        const res = await fetchApi(`/api/friends/by-line-user-id/${friendParam}`)
+        if (res.success && (res.data as { id: string } | undefined)?.id) {
+          setSelectedChatId((res.data as { id: string }).id)
+        } else {
+          // 解決失敗時: 値をそのまま試す (古い deep link との互換)
+          setSelectedChatId(friendParam)
+        }
+      } catch {
+        setSelectedChatId(friendParam)
+      }
+    })()
   }, [])
 
   useEffect(() => {

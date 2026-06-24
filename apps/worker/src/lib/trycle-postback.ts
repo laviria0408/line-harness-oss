@@ -19,6 +19,9 @@ import type { Env } from '../index.js';
 import { handlePkg8Postback, isPkg8Postback } from './trycle-pkg8.js';
 import { handlePkg1Postback, isPkg1Postback } from './trycle-pkg1.js';
 import { startStaffConsultFromPkg1 } from './trycle-staff.js';
+import { clearManualMode } from './trycle-session.js';
+import { clearStaffConsult } from './trycle-staff-session.js';
+import type { TrycleRepoEnv } from './trycle-repo.js';
 import {
   handleReservationGatePostback,
   isReservationPostback,
@@ -62,6 +65,15 @@ export async function tryHandleTryclePostback(
   // 補完経路。handlePkg1Postback には対応 handler が無いため、ここで intercept して
   // 共通スタッフ相談フロー (B1 内容確認ループ) に直接入る。
   if (data === 'pkg1_staff') {
+    // 2 回目以降の staff 相談で前回 staff_consult state や manual mode が残っていると
+    // silent falldown するため、開始前に明示的に reset (= ループ再起動を保証)。
+    const repoEnv = ctx.env as unknown as TrycleRepoEnv;
+    await clearManualMode(ctx.env, ctx.lineUserId).catch((err) =>
+      console.error('[trycle-postback] clearManualMode failed', err),
+    );
+    await clearStaffConsult(repoEnv, ctx.lineUserId).catch((err) =>
+      console.error('[trycle-postback] clearStaffConsult failed', err),
+    );
     await startStaffConsultFromPkg1(
       {
         replyToken: ctx.replyToken,

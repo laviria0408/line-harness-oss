@@ -344,6 +344,34 @@ friends.get('/api/friends', async (c) => {
   }
 });
 
+// GET /api/friends/by-line-user-id/:lineUserId - resolve friends.id from LINE User ID (`U...`)
+// (TRYCLE Phase 4: dashboard LineButton deep link が ?friend=<lineUserId> を受けるとき、
+// LH chats page から friend_id を解決して個別 chat 画面に遷移するために使う)
+friends.get('/api/friends/by-line-user-id/:lineUserId', async (c) => {
+  try {
+    const lineUserId = c.req.param('lineUserId');
+    const accountId = c.req.query('accountId');
+    let row: { id: string; line_user_id: string; line_account_id: string } | null;
+    if (accountId) {
+      row = await c.env.DB.prepare(
+        'SELECT id, line_user_id, line_account_id FROM friends WHERE line_user_id = ? AND line_account_id = ? LIMIT 1',
+      ).bind(lineUserId, accountId).first();
+    } else {
+      // accountId 未指定: 最初に見つかった friend を返す (1 user は 1 LINE OA = 1 friend と仮定)
+      row = await c.env.DB.prepare(
+        'SELECT id, line_user_id, line_account_id FROM friends WHERE line_user_id = ? LIMIT 1',
+      ).bind(lineUserId).first();
+    }
+    if (!row) {
+      return c.json({ success: false, error: 'not found' }, 404);
+    }
+    return c.json({ success: true, data: { id: row.id, lineUserId: row.line_user_id, lineAccountId: row.line_account_id } });
+  } catch (err) {
+    console.error('GET /api/friends/by-line-user-id error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
 // GET /api/friends/count - friend count (must be before /:id)
 friends.get('/api/friends/count', async (c) => {
   try {

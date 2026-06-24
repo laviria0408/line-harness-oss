@@ -25,6 +25,7 @@ import { fireEvent } from '../services/event-bus.js';
 import { buildMessage, expandVariables } from '../services/step-delivery.js';
 import { tryHandleTryclePostback } from '../lib/trycle-postback.js';
 import { isManualMode, clearManualMode, getPkg1Session } from '../lib/trycle-session.js';
+import { getStaffConsult } from '../lib/trycle-staff-session.js';
 import { resolvePostbackLabel } from '../lib/trycle-postback-label.js';
 import type { TrycleRepoEnv } from '../lib/trycle-repo.js';
 import type { Env } from '../index.js';
@@ -612,9 +613,18 @@ async function handleEvent(
 
     // REQ-PKG1-024 有人モード: スタッフ対応中は bot 自動応答を抑止する。
     // 受信ログ (上) は記録済。chat を unread にしてスタッフに気づかせて return。
+    // ただし staff_consult ループ (Pkg1/Pkg8 共通) が awaiting='input' のときは
+    // 顧客の相談内容入力を受け付ける必要があるので manual mode でも text を通す。
+    // (1 回目 staff 通知後に manual mode になる → 2 回目 staff 相談で silent falldown
+    // していた問題の解消)。
     if (workerEnv && (await isManualMode(workerEnv, userId))) {
-      await upsertChatOnMessage(db, friend.id);
-      return;
+      const staffState = await getStaffConsult(workerEnv as unknown as TrycleRepoEnv, userId).catch(() => null);
+      const inStaffConsultInput = staffState?.awaiting === 'input';
+      if (!inStaffConsultInput) {
+        await upsertChatOnMessage(db, friend.id);
+        return;
+      }
+      // staff_consult が awaiting='input' → 顧客の相談内容入力を受ける (下に流す)
     }
 
     // Cross-account trigger: send message from another account via UUID
