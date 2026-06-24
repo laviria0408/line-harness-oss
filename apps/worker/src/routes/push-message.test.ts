@@ -22,21 +22,41 @@ type TestEnv = {
   };
 };
 
+/** messages_log への INSERT を捕捉する型 (会話履歴記録の検証用)。 */
+interface LogInsert {
+  source: string;
+  deliveryType: string;
+  content: string;
+}
+
 /**
- * D1 を最小モック。SQL 文字列で friends / line_accounts を呼び分ける。
+ * D1 を最小モック。SQL 文字列で friends / line_accounts / messages_log を呼び分ける。
  * - opts.lineAccountId が null → friend は line_account_id なし (env fallback)
  * - opts.accountToken が undefined → account 行が無い (env fallback)
+ * - opts.friendId が null → friend 行なし (recordOutgoingMessages は記録スキップ)
+ * - opts.logInserts → messages_log INSERT の bind 引数を捕捉する配列
  */
-function makeDb(opts: { lineAccountId?: string | null; accountToken?: string } = {}) {
-  const { lineAccountId = 'acc-1', accountToken = D1_TOKEN } = opts;
+function makeDb(
+  opts: {
+    lineAccountId?: string | null;
+    accountToken?: string;
+    friendId?: string | null;
+    logInserts?: LogInsert[];
+  } = {},
+) {
+  const { lineAccountId = 'acc-1', accountToken = D1_TOKEN, friendId = 'friend-1', logInserts } = opts;
   return {
     prepare(sql: string) {
       return {
-        bind(..._args: unknown[]) {
+        bind(...args: unknown[]) {
           return {
             async first<T>(): Promise<T | null> {
               if (sql.includes('FROM friends')) {
-                return { line_account_id: lineAccountId } as unknown as T;
+                // resolveAccessToken (SELECT line_account_id) と
+                // getFriendByLineUserId (SELECT *) の両方を満たす。friend 不在は null。
+                return (friendId === null
+                  ? null
+                  : ({ id: friendId, line_account_id: lineAccountId } as unknown)) as T | null;
               }
               if (sql.includes('FROM line_accounts')) {
                 return (accountToken !== undefined
@@ -44,6 +64,17 @@ function makeDb(opts: { lineAccountId?: string | null; accountToken?: string } =
                   : null) as T | null;
               }
               return null;
+            },
+            async run(): Promise<void> {
+              if (sql.includes('INSERT INTO messages_log') && logInserts) {
+                // recordOutgoingMessages の bind 順:
+                //   id, friend_id, message_type, content, delivery_type, source, created_at
+                logInserts.push({
+                  content: String(args[3]),
+                  deliveryType: String(args[4]),
+                  source: String(args[5]),
+                });
+              }
             },
           };
         },
@@ -123,6 +154,7 @@ const MESSAGES = [{ type: 'text', text: 'hello' }];
 beforeEach(() => {
   vi.restoreAllMocks();
   vi.spyOn(console, 'error').mockImplementation(() => undefined);
+  vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 });
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -222,6 +254,38 @@ describe('POST /api/cases/:caseId/push-message — 成功', () => {
     const res = await post(buildApp(), env, { messages: MESSAGES });
     expect(res.status).toBe(200);
     expect(lineCalls[0].token).toBe(ENV_TOKEN);
+  });
+
+  test('送信成功後に messages_log へ outgoing を記録する (会話履歴用)', async () => {
+    const logInserts: LogInsert[] = [];
+    installFetchStub({});
+    const env = baseEnv({ DB: makeDb({ logInserts }) });
+    const res = await post(buildApp(), env, { messages: MESSAGES });
+    expect(res.status).toBe(200);
+    expect(logInserts).toHaveLength(1);
+    expect(logInserts[0].deliveryType).toBe('push');
+    // source 未指定なら既定 'dashboard-push' で記録。
+    expect(logInserts[0].source).toBe('dashboard-push');
+  });
+
+  test('body の source を messages_log に反映する (completion-followup 等)', async () => {
+    const logInserts: LogInsert[] = [];
+    installFetchStub({});
+    const env = baseEnv({ DB: makeDb({ logInserts }) });
+    const res = await post(buildApp(), env, { messages: MESSAGES, source: 'completion-followup' });
+    expect(res.status).toBe(200);
+    expect(logInserts).toHaveLength(1);
+    expect(logInserts[0].source).toBe('completion-followup');
+  });
+
+  test('messages_log 記録の失敗は送信成否に影響しない (best-effort)', async () => {
+    const lineCalls: LineCall[] = [];
+    installFetchStub({ lineCalls });
+    // friend 不在 → recordOutgoingMessages は記録スキップ (warn) するが 200 のまま。
+    const env = baseEnv({ DB: makeDb({ friendId: null }) });
+    const res = await post(buildApp(), env, { messages: MESSAGES });
+    expect(res.status).toBe(200);
+    expect(lineCalls).toHaveLength(1);
   });
 });
 

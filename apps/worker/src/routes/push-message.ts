@@ -30,11 +30,18 @@
  * ## エラー中継
  *   LINE の生ステータス + body を response に含める。dashboard 側が
  *   `describeLinePushError` で人間可読化するため、ここでは翻訳しない。
+ *
+ * ## 会話履歴記録 (2026-06-25)
+ *   送信成功後に messages_log へ outgoing を best-effort で記録する。記録しないと
+ *   案件詳細「会話履歴」タブに dashboard 起点の push (再予約案内等) が出ない。
+ *   body の任意 `source` で分類を上書きできる (既定 'dashboard-push'・いずれも
+ *   normalizeDirection で 'bot' 表示)。記録失敗は送信成否に影響しない。
  */
 import { Hono } from 'hono';
 import type { Env } from '../index.js';
 import { resolveCaseLineUserId, verifyDashboardToken } from '../lib/dashboard-auth.js';
 import { isValidLineUserId, maskLineUserId, validatePushMessages } from '../lib/push-message-validate.js';
+import { recordOutgoingMessages } from '../lib/trycle-outgoing-log.js';
 
 export const pushMessage = new Hono<Env>();
 
@@ -86,6 +93,9 @@ pushMessage.post('/api/cases/:caseId/push-message', async (c) => {
   if (!validation.ok) {
     return c.json({ success: false, error: validation.error }, 400);
   }
+  // 任意 source (会話履歴の分類用)。未指定は 'dashboard-push' (normalizeDirection で bot 表示)。
+  const rawSource = (rawBody as { source?: unknown }).source;
+  const logSource = typeof rawSource === 'string' && rawSource.trim() ? rawSource.trim() : 'dashboard-push';
 
   try {
     // 1) caseId → line_user_id (Supabase・tenant スコープ)
@@ -136,6 +146,9 @@ pushMessage.post('/api/cases/:caseId/push-message', async (c) => {
       );
       return c.json({ success: false, status: res.status, error: detail }, 502);
     }
+
+    // 送信成功 → 会話履歴へ outgoing を記録 (best-effort・失敗しても送信は成立済)。
+    await recordOutgoingMessages(c.env, lineUserId, validation.messages, 'push', logSource);
 
     return c.json({ success: true });
   } catch (err) {

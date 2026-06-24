@@ -13,8 +13,11 @@ const LINE_USER_ID_RE = /^U[0-9a-f]{32}$/i;
 /** LINE Push API の messages は 1〜5 件 (公式仕様)。 */
 const MAX_MESSAGES = 5;
 
+/** 構造検証を通った 1 件 (type は string 保証・内容は LINE 側に委ねる)。 */
+export type ValidatedMessage = { readonly type: string; readonly [key: string]: unknown };
+
 export type MessagesValidation =
-  | { readonly ok: true; readonly messages: ReadonlyArray<Record<string, unknown>> }
+  | { readonly ok: true; readonly messages: ReadonlyArray<ValidatedMessage> }
   | { readonly ok: false; readonly error: string };
 
 /**
@@ -42,7 +45,7 @@ export function validatePushMessages(body: unknown): MessagesValidation {
       return { ok: false, error: 'each message must be an object with a string "type"' };
     }
   }
-  return { ok: true, messages: messages as ReadonlyArray<Record<string, unknown>> };
+  return { ok: true, messages: messages as ReadonlyArray<ValidatedMessage> };
 }
 
 /** 送信先 LINE userId のフォーマット検証 (生値はここで止め、route は cleaned のみ使う)。 */
