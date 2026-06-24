@@ -24,6 +24,7 @@ import {
   type NotifyResolution,
 } from './trycle-notify-rules.js';
 import {
+  createStaffConsultCase,
   findLatestCaseByLineUserId,
   markCaseTalking,
   insertNotification,
@@ -298,20 +299,42 @@ export async function notifyStaffConsult(
   input: StaffConsultNotifyInput,
 ): Promise<StaffConsultNotifyResult> {
   const repoEnv = env as TrycleRepoEnv;
-  let caseRef: CaseRef | null = null;
+  // 直近 case は新規 case の store/assignee 引き継ぎヒントとしてのみ参照 (既存 case の status は触らない)。
+  let inherited: CaseRef | null = null;
   try {
-    caseRef = await findLatestCaseByLineUserId(repoEnv, input.lineUserId);
+    inherited = await findLatestCaseByLineUserId(repoEnv, input.lineUserId);
   } catch (err) {
     console.error('[trycle-staff] findLatestCaseByLineUserId failed', err);
   }
 
-  // 案件を相談中へ (案件 / talking status 無しなら no-op)。
+  // 顧客 (customer_id) 解決: line_user_id から既存顧客があれば紐付け (経路 E と同じパターン)。
+  let customerId: string | null = null;
+  try {
+    const customer = await findCustomerByLineUserId(repoEnv, input.lineUserId);
+    customerId = customer?.id ?? null;
+  } catch (err) {
+    console.error('[trycle-staff] findCustomerByLineUserId failed', err);
+  }
+
+  // **新規 case を作成** (status='talking')。既存 case (見積完了・予約済等) は不変。
+  let caseRef: CaseRef | null = null;
   let caseMarked = false;
-  if (caseRef) {
-    caseMarked = await markCaseTalking(repoEnv, caseRef.caseId).catch((err) => {
-      console.error('[trycle-staff] markCaseTalking failed', err);
-      return false;
+  try {
+    const created = await createStaffConsultCase(repoEnv, {
+      lineUserId: input.lineUserId,
+      customerId,
+      inquiryText: input.inquiryContent,
+      inheritedStoreId: inherited?.storeId ?? null,
+      inheritedAssigneeId: inherited?.assigneeId ?? null,
     });
+    caseRef = {
+      caseId: created.caseId,
+      assigneeId: inherited?.assigneeId ?? null,
+      storeId: inherited?.storeId ?? null,
+    };
+    caseMarked = true;
+  } catch (err) {
+    console.error('[trycle-staff] createStaffConsultCase failed', err);
   }
 
   // 通知ルール解決 (案件が無くても unassigned ルールで manager へは飛ばせる)。

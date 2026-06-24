@@ -27,8 +27,10 @@ export interface CaseRef {
 }
 
 /**
- * 直近の (未削除) 案件を line_user_id で 1 件引く (相談中遷移・related_case_id 用)。
+ * 直近の (未削除) 案件を line_user_id で 1 件引く (assignee / store の引き継ぎ用)。
  * 案件が無い (まだ見積も予約もしていない) 相談もあるため null 許容。
+ * スタッフ相談で **既存 case を相談中に降格させない** ため status の参照のみに使う
+ * (新規 case 作成時の assignee / store ヒントとして・既存 case の status は不変)。
  */
 export async function findLatestCaseByLineUserId(
   env: TrycleRepoEnv,
@@ -65,8 +67,9 @@ export async function findTalkingStatusId(env: TrycleRepoEnv): Promise<string | 
 }
 
 /**
- * 案件を相談中 (talking) に遷移させる。talking status が未定義 / case 無しなら no-op。
- * 失敗してもユーザーフローは止めない (呼び出し側 catch)。
+ * @deprecated 既存 case を相談中に「降格」させる旧実装。Phase 4 bugfix で削除予定。
+ * 代わりに createStaffConsultCase を使う (= 新規 case を status='talking' で insert)。
+ * このまま残すと既存 case (見積完了・予約済み等) を上書きしてしまうため使ってはいけない。
  */
 export async function markCaseTalking(env: TrycleRepoEnv, caseId: string): Promise<boolean> {
   const statusId = await findTalkingStatusId(env);
@@ -81,6 +84,61 @@ export async function markCaseTalking(env: TrycleRepoEnv, caseId: string): Promi
     { status_id: statusId, updated_at: new Date().toISOString() },
   );
   return true;
+}
+
+export interface CreateStaffConsultCaseInput {
+  readonly lineUserId: string;
+  readonly customerId: string | null;
+  readonly inquiryText: string;
+  /** 直近 case から引き継ぐ store/assignee。新規顧客なら null。 */
+  readonly inheritedStoreId: string | null;
+  readonly inheritedAssigneeId: string | null;
+}
+
+/**
+ * スタッフ相談用に **新規 case を 1 件作成** する (既存 case は触らない)。
+ * status は 'talking' (相談中)・work_note と chat_summary に経路情報を残す。
+ *
+ * - line_user_id は引数で必須
+ * - customer_id は引数で渡す (未登録顧客なら NULL・後で経路 E 同様に attach 可)
+ * - store_id / assignee_id は直近 case から引き継ぎ (新規顧客は NULL)
+ * - status_id は case_statuses.key='talking'
+ *
+ * 失敗すると Throws (呼び出し側で catch すること)。
+ */
+export async function createStaffConsultCase(
+  env: TrycleRepoEnv,
+  input: CreateStaffConsultCaseInput,
+): Promise<{ caseId: string }> {
+  const tenantId = getTenantId(env);
+  const statusId = await findTalkingStatusId(env);
+  if (!statusId) {
+    throw new Error('createStaffConsultCase: talking status not found in case_statuses');
+  }
+  const chatSummary = input.inquiryText.trim().length > 0
+    ? `スタッフ相談: ${input.inquiryText.trim().slice(0, 200)}`
+    : 'スタッフ相談 (内容未入力でゲート起動)';
+  const rows = await supabaseUpsert<{ id: string }>(
+    env,
+    'cases',
+    [
+      {
+        tenant_id: tenantId,
+        customer_id: input.customerId,
+        store_id: input.inheritedStoreId,
+        status_id: statusId,
+        assignee_id: input.inheritedAssigneeId,
+        line_user_id: input.lineUserId,
+        work_note: 'スタッフ相談 (B1 内容確認ループ)',
+        chat_summary: chatSummary,
+        updated_at: new Date().toISOString(),
+      },
+    ],
+    { returning: 'representation' },
+  );
+  const caseId = rows?.[0]?.id;
+  if (!caseId) throw new Error('createStaffConsultCase: cases insert returned no id');
+  return { caseId };
 }
 
 export interface NotificationInput {

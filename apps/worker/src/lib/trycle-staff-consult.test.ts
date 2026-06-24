@@ -111,12 +111,20 @@ describe('notifyStaffConsult', () => {
         }
         if (url.includes('/cases?') && method === 'GET') {
           return new Response(
-            JSON.stringify([{ id: 'case-1', assignee_id: null, store_id: 's-1' }]),
+            JSON.stringify([{ id: 'case-existing', assignee_id: null, store_id: 's-1' }]),
             { status: 200 },
           );
         }
+        // 新実装: createStaffConsultCase が cases POST で新規 case を insert (returning row)
+        if (url.includes('/cases') && method === 'POST') {
+          return new Response(JSON.stringify([{ id: 'case-new-staff-consult' }]), { status: 201 });
+        }
         if (url.includes('/case_statuses')) {
           return new Response(JSON.stringify([{ id: 'status-talking' }]), { status: 200 });
+        }
+        // customers?line_user_id=eq.U1 (findCustomerByLineUserId) — 既存顧客あり想定
+        if (url.includes('/customers?') && method === 'GET') {
+          return new Response(JSON.stringify([{ id: 'cust-1' }]), { status: 200 });
         }
         if (url.includes('/tenants')) {
           return new Response(JSON.stringify([{ settings: {} }]), { status: 200 });
@@ -132,7 +140,7 @@ describe('notifyStaffConsult', () => {
         if (url.includes('/users') && url.includes('role=eq.owner')) {
           return new Response('[]', { status: 200 });
         }
-        return new Response('[]', { status: 200 }); // cases PATCH, notifications POST, etc.
+        return new Response('[]', { status: 200 }); // notifications POST, etc.
       },
     );
 
@@ -147,10 +155,16 @@ describe('notifyStaffConsult', () => {
     expect(calls.some((c) => c.url.includes('script.example.com'))).toBe(true);
   });
 
-  it('still ok=true and writes dashboard even with no case (manager unassigned rule)', async () => {
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (i: RequestInfo | URL) => {
+  it('creates a new case + writes dashboard even with no prior case (manager unassigned rule)', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (i: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof i === 'string' ? i : i.toString();
-      if (url.includes('/cases?')) return new Response('[]', { status: 200 }); // no case
+      const method = (init?.method ?? 'GET').toUpperCase();
+      if (url.includes('/cases?') && method === 'GET') return new Response('[]', { status: 200 }); // no prior case (inheritance hint = null)
+      if (url.includes('/cases') && method === 'POST') {
+        return new Response(JSON.stringify([{ id: 'case-new-staff-consult' }]), { status: 201 });
+      }
+      if (url.includes('/case_statuses')) return new Response(JSON.stringify([{ id: 'status-talking' }]), { status: 200 });
+      if (url.includes('/customers?') && method === 'GET') return new Response('[]', { status: 200 }); // 新規顧客 (customer_id=null)
       if (url.includes('/tenants')) return new Response(JSON.stringify([{ settings: {} }]), { status: 200 });
       if (url.includes('/users') && url.includes('role=eq.manager')) {
         return new Response(
@@ -164,7 +178,7 @@ describe('notifyStaffConsult', () => {
 
     const res = await notifyStaffConsult(bindings(), input);
     expect(res.ok).toBe(true);
-    expect(res.caseMarked).toBe(false); // no case
+    expect(res.caseMarked).toBe(true); // 新規 case 作成成功 (旧実装の no-case = caseMarked=false から仕様変更)
     expect(res.dashboardCount).toBe(1); // manager dashboard row
     expect(res.emailCount).toBe(0); // manager has no email
   });
