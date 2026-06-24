@@ -26,42 +26,102 @@ export interface LaborRow {
   readonly category: string;
   readonly name: string;
   readonly price: number;
+  /** 上限額 (range 見積)。null = open-ended または固定額 (price_open_ended で区別)。 */
+  readonly price_max: number | null;
   readonly price_open_ended: boolean;
   readonly notes: string | null;
+  /** お悩み (A1) マッチング用タグ (0028 で追加)。未設定は空配列。 */
+  readonly tags: ReadonlyArray<string>;
+  /** お悩みマッチング用の説明文 (0028 で追加)。 */
+  readonly description: string | null;
+}
+
+interface LaborCache {
+  /** code → row (既存・variant sample 解決用)。 */
+  readonly byCode: Map<string, LaborRow>;
+  /** id → row (包括メンテ menu / お悩み候補の解決用)。 */
+  readonly byId: Map<string, LaborRow>;
+  /** sort_order 昇順の全件 (お悩み trigram スキャン用)。 */
+  readonly all: ReadonlyArray<LaborRow>;
 }
 
 interface LaborCacheEntry {
-  readonly value: Map<string, LaborRow>;
+  readonly value: LaborCache;
   readonly expiresAt: number;
 }
 
 const LABOR_TTL_MS = 5 * 60 * 1000;
 const laborCacheByTenant = new Map<string, LaborCacheEntry>();
 
+/** Supabase の生 row (tags/description は null になりうる) を LaborRow に正規化する。 */
+function normalizeLaborRow(raw: {
+  id: string;
+  code: string;
+  category: string;
+  name: string;
+  price: number;
+  price_max: number | null;
+  price_open_ended: boolean;
+  notes: string | null;
+  tags: string[] | null;
+  description: string | null;
+}): LaborRow {
+  return {
+    id: raw.id,
+    code: raw.code,
+    category: raw.category,
+    name: raw.name,
+    price: raw.price,
+    price_max: raw.price_max ?? null,
+    price_open_ended: raw.price_open_ended,
+    notes: raw.notes ?? null,
+    tags: Array.isArray(raw.tags) ? raw.tags : [],
+    description: raw.description ?? null,
+  };
+}
+
 /**
- * tenant の labor_master を全件取得して code→row の Map を 5 分 cache で返す。
- * dashboard で master 更新 → bot 反映は最大 5 分遅延 (本物と同方針)。
+ * tenant の labor_master を全件取得して code/id Map + 全件配列を 5 分 cache で返す。
+ * dashboard で master 更新 → bot 反映は最大 5 分遅延 (本物と同方針)。お悩みマッチング
+ * (trycle-labor-search) と包括メンテ menu 解決でこの全件 cache を共有する。
  */
-async function loadLaborByCode(env: TrycleRepoEnv): Promise<Map<string, LaborRow>> {
+async function loadLaborCache(env: TrycleRepoEnv): Promise<LaborCache> {
   const tenantId = getTenantId(env);
   const now = Date.now();
   const hit = laborCacheByTenant.get(tenantId);
   if (hit && hit.expiresAt > now) return hit.value;
 
-  const rows = await supabaseSelect<LaborRow>(
+  const rawRows = await supabaseSelect<{
+    id: string;
+    code: string;
+    category: string;
+    name: string;
+    price: number;
+    price_max: number | null;
+    price_open_ended: boolean;
+    notes: string | null;
+    tags: string[] | null;
+    description: string | null;
+  }>(
     env,
     'labor_master',
     { tenant_id: `eq.${tenantId}`, archived: 'eq.false' },
     {
-      select: 'id,code,category,name,price,price_open_ended,notes',
+      select: 'id,code,category,name,price,price_max,price_open_ended,notes,tags,description',
       order: 'sort_order.asc',
       limit: 2000,
     },
   );
-  const map = new Map<string, LaborRow>();
-  for (const row of rows) map.set(row.code, row);
-  laborCacheByTenant.set(tenantId, { value: map, expiresAt: now + LABOR_TTL_MS });
-  return map;
+  const all = rawRows.map(normalizeLaborRow);
+  const byCode = new Map<string, LaborRow>();
+  const byId = new Map<string, LaborRow>();
+  for (const row of all) {
+    byCode.set(row.code, row);
+    byId.set(row.id, row);
+  }
+  const cache: LaborCache = { byCode, byId, all };
+  laborCacheByTenant.set(tenantId, { value: cache, expiresAt: now + LABOR_TTL_MS });
+  return cache;
 }
 
 /** code (= regions.ts の sample) で labor をピンポイント取得する。 */
@@ -69,8 +129,42 @@ export async function findLaborByCode(
   env: TrycleRepoEnv,
   code: string,
 ): Promise<LaborRow | null> {
-  const map = await loadLaborByCode(env);
-  return map.get(code) ?? null;
+  const cache = await loadLaborCache(env);
+  return cache.byCode.get(code) ?? null;
+}
+
+/** id (uuid) で labor をピンポイント取得する (包括メンテ menu / お悩み候補の解決用)。 */
+export async function findLaborById(
+  env: TrycleRepoEnv,
+  id: string,
+): Promise<LaborRow | null> {
+  const cache = await loadLaborCache(env);
+  return cache.byId.get(id) ?? null;
+}
+
+/** tenant の labor_master 全件 (sort_order 昇順) を返す (お悩み trigram スキャン用)。 */
+export async function loadAllLabor(env: TrycleRepoEnv): Promise<ReadonlyArray<LaborRow>> {
+  const cache = await loadLaborCache(env);
+  return cache.all;
+}
+
+/**
+ * labor_master 1 行から QuoteLineItem を作る (qty 適用前)。包括メンテ menu / お悩み
+ * 候補の確定で使う (buildLineItemFromPending の labor→item 部分を共有)。
+ *   - unitPrice    = labor.price
+ *   - unitPriceMax = open-ended → null / price_max あり → price_max / 固定 → price
+ */
+export function laborToLineItem(labor: LaborRow): QuoteLineItem {
+  const unitPriceMax = labor.price_open_ended
+    ? null
+    : labor.price_max ?? labor.price;
+  return makeLineItem({
+    name: labor.name,
+    unitPrice: labor.price,
+    unitPriceMax,
+    qty: 1,
+    ...(labor.notes ? { notes: labor.notes } : {}),
+  });
 }
 
 /** テスト用: labor cache をクリアする。 */
@@ -332,6 +426,59 @@ export async function saveQuote(env: TrycleRepoEnv, input: SaveQuoteInput): Prom
   );
 
   return { caseId, quoteId, quoteVersionId, quoteNo: issued.quoteNo };
+}
+
+// ── cases 単体保存 (見積なし・来店予定ゲート Phase 4) ─────────────────────────
+
+export interface SaveVisitCaseInput {
+  readonly lineUserId: string;
+  readonly customerId: string | null;
+  readonly storeId: string | null;
+  readonly statusId: string;
+  /** 既定担当者 (stores.default_assignee_id)。未設定なら null。 */
+  readonly assigneeId: string | null;
+  /** "...+09:00" 形式の来店日時 (timestamptz)。 */
+  readonly visitScheduledAt: string | null;
+  /** cases.work_note 補助 (例 '来店予定 (各種予約)')。 */
+  readonly caseLabel: string;
+  /** cases.chat_summary 初期値 (通常 null・flush helper が後で移す)。 */
+  readonly chatSummary: string | null;
+}
+
+/**
+ * 見積を伴わない来店予約 case を 1 件作成する (来店予定ゲート Phase 4)。Pkg1 の
+ * saveQuote と違い quotes / quote_versions は作らず cases 1 行のみ insert する
+ * (buildQuote は空 cart で throw するため見積経路を流用できない)。assignee_id は
+ * 店舗の既定担当者を入れる (nullable・migration 0011)。失敗は throw (呼び出し側で
+ * graceful 案内)。
+ */
+export async function saveVisitOnlyCase(
+  env: TrycleRepoEnv,
+  input: SaveVisitCaseInput,
+): Promise<{ caseId: string }> {
+  const tenantId = getTenantId(env);
+  const caseRows = await supabaseUpsert<InsertedRow>(
+    env,
+    'cases',
+    [
+      {
+        tenant_id: tenantId,
+        customer_id: input.customerId,
+        store_id: input.storeId,
+        status_id: input.statusId,
+        assignee_id: input.assigneeId,
+        line_user_id: input.lineUserId,
+        visit_scheduled_at: input.visitScheduledAt,
+        work_note: input.caseLabel,
+        chat_summary: input.chatSummary,
+        updated_at: new Date().toISOString(),
+      },
+    ],
+    { returning: 'representation' },
+  );
+  const caseId = caseRows?.[0]?.id;
+  if (!caseId) throw new Error('saveVisitOnlyCase: cases insert returned no id');
+  return { caseId };
 }
 
 /** PDF 発行後に cases.pdf_url / quote_versions.pdf_url を更新する。 */

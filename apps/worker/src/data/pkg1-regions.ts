@@ -43,9 +43,25 @@ export interface Region {
   readonly value: string;
   readonly label: string;
   readonly symptoms: ReadonlyArray<Symptom> | null; // null = 自由記述 → スタッフ送り
+  /**
+   * region の種別 (Phase 4・v1.6)。未指定 = 通常の症状ヒアリング region。
+   *   - 'overhaul': 包括メンテゲート (A2)。symptom 階層を持たず、専用 handler で
+   *     maintenance_menus 4 件の Flex carousel + 違いマトリクスを出す。
+   */
+  readonly kind?: 'overhaul';
 }
 
 export const REGIONS: ReadonlyArray<Region> = [
+  {
+    // 包括メンテ (A2・Phase 4 v1.6)。symptom 階層を持たず、専用 handler が
+    // maintenance_menus 4 件 (OH プレミアム/スタンダード/ライト + ライトメンテ) の
+    // Flex carousel + オーバーホール違いマトリクスを出す。選んだメニューは
+    // labor_master 経由で通常 cart に積み、variant/qty を持たないので確認へ直行する。
+    value: 'overhaul-gate',
+    label: '包括メンテ（オーバーホール）',
+    symptoms: null,
+    kind: 'overhaul',
+  },
   {
     // オーバーホール関係 (コンポーネント関係のみ)。OH 本体・バラカンは第一弾スコープ外。
     value: 'overhaul-related',

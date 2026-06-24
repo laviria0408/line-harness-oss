@@ -29,6 +29,11 @@ import type { QuoteLineItem } from './quote.js';
 export const PKG1_SESSION_KIND = 'pkg1_estimate';
 export const PKG1_CART_KIND = 'pkg1_cart';
 export const RESERVATION_KIND = 'reservation';
+/**
+ * 来店予定ゲート (各種予約「その他」経由)。Pkg1 来店予約 (RESERVATION_KIND) と分離する。
+ * 見積 cart を持たない純粋な来店予約 (自由文 + 日時) のフロー state を保持する。
+ */
+export const VISIT_GATE_KIND = 'visit_gate';
 export const MANUAL_MODE_KIND = 'manual_mode';
 /**
  * 来店予定が「直近で確定済み」かを残す短命マーカー (連打の 2 回目を完全 silent に
@@ -47,7 +52,14 @@ export const SESSION_STALE_MS = 24 * 60 * 60 * 1000;
  */
 export const RECENT_CONFIRM_WINDOW_MS = 30 * 1000;
 
-/** 本物 `Pkg1Step` (pkg1-estimate.ts) に揃える (CRITICAL #5・設計 v1.2.1 §4)。 */
+/**
+ * 本物 `Pkg1Step` (pkg1-estimate.ts) に揃える (CRITICAL #5・設計 v1.2.1 §4)。
+ *
+ * v1.6 追加 (Phase 4):
+ *   - awaiting_overhaul_menu : 包括メンテ (A2) の 4 メニュー提示後・メニュー選択待ち
+ *   - awaiting_osayami_input : お悩み (A1) の自由文入力待ち (text 経路で受ける)
+ *   - awaiting_osayami_result: お悩みマッチ 3 件提示後・候補/再質問/相談の選択待ち
+ */
 export type Pkg1Step =
   | 'awaiting_dispatch'
   | 'awaiting_region'
@@ -57,7 +69,13 @@ export type Pkg1Step =
   | 'awaiting_cart_decision'
   | 'awaiting_confirm'
   | 'awaiting_consent_form'
+  | 'awaiting_overhaul_menu'
+  | 'awaiting_osayami_input'
+  | 'awaiting_osayami_result'
   | 'completed';
+
+/** お悩み (A1) 自由文マッチングの上限回数 (顧客に残回数表示・到達でスタッフ強制)。 */
+export const OSAYAMI_MAX_LOOPS = 5;
 
 /** 選択途中保持 (本物 `PendingSelection`)。region/symptom/variant は index 参照。 */
 export interface PendingSelection {
@@ -82,6 +100,17 @@ export interface Pkg1State {
   readonly pending?: PendingSelection;
   /** Step ID 流入制御: 1 つ前の step (rollback 許容用)。 */
   readonly previousStep?: Pkg1Step;
+  /**
+   * お悩み (A1) 自由文マッチングのループ回数 (Phase 4・v1.6)。awaiting_osayami_input /
+   * awaiting_osayami_result で保持する。1 回の質問→提示ごとに +1 し、OSAYAMI_MAX_LOOPS
+   * 到達でスタッフ相談へ強制移行する (顧客に残回数を表示する)。未存在は 0 扱い。
+   */
+  readonly osayamiLoopCount?: number;
+  /**
+   * お悩みマッチで提示した候補の labor code (awaiting_osayami_result の選択解決用)。
+   * 「このメニューで」postback の value=index → osayamiCandidates[index] で labor を引く。
+   */
+  readonly osayamiCandidates?: ReadonlyArray<string>;
 }
 
 interface BotSessionRow {
@@ -114,6 +143,33 @@ export interface ReservationState {
   readonly visitAtIso?: string;
   /** Step ID 流入制御: 1 つ前の step (rollback 許容用・2026-06-24)。 */
   readonly previousStep?: ReservationStep;
+}
+
+/**
+ * 来店予定ゲート (各種予約「その他」経由) の state。Pkg1 来店予約と違い cart を
+ * 持たない (見積なしの純粋な来店予約)。フローは「自由文 → 店舗 (複数時) → 日付 →
+ * 時間 → 確認」。`inquiry` は任意の来店内容、`date`/`visitAtIso` は picker と同じ形式。
+ */
+export type VisitGateStep =
+  | 'awaiting_inquiry'
+  | 'awaiting_store'
+  | 'awaiting_date'
+  | 'awaiting_time'
+  | 'awaiting_confirm'
+  | 'completed';
+
+export interface VisitGateState {
+  readonly step: VisitGateStep;
+  /** 自由文の来店内容 (任意・skip 時 undefined)。 */
+  readonly inquiry?: string;
+  readonly storeId?: string;
+  readonly storeName?: string;
+  /** "YYYY-MM-DD" (選択した来店日)。 */
+  readonly date?: string;
+  /** "YYYY-MM-DDtHH:mm" (選択した来店日時)。 */
+  readonly visitAtIso?: string;
+  /** Step ID 流入制御: 1 つ前の step (rollback 許容用)。 */
+  readonly previousStep?: VisitGateStep;
 }
 
 /** 空の Pkg1 セッション初期値 (本物 startFlow: awaiting_dispatch + 空 cart)。 */
@@ -415,6 +471,80 @@ export async function wasReservationRecentlyDone(
   return Number.isFinite(elapsed) && elapsed >= 0 && elapsed <= RECENT_CONFIRM_WINDOW_MS;
 }
 
+// ── 来店予定ゲート (各種予約「その他」経由) ───────────────────────────────────
+
+export async function getVisitGateSession(
+  env: TrycleRepoEnv,
+  lineUserId: string,
+): Promise<VisitGateState | null> {
+  const rows = await supabaseSelect<{ state: VisitGateState }>(
+    env,
+    'bot_sessions',
+    {
+      tenant_id: `eq.${getTenantId(env)}`,
+      line_user_id: `eq.${lineUserId}`,
+      kind: `eq.${VISIT_GATE_KIND}`,
+    },
+    { select: 'state', limit: 1 },
+  );
+  return rows[0]?.state ?? null;
+}
+
+export async function setVisitGateSession(
+  env: TrycleRepoEnv,
+  lineUserId: string,
+  state: VisitGateState,
+): Promise<void> {
+  await supabaseUpsert(
+    env,
+    'bot_sessions',
+    [
+      {
+        tenant_id: getTenantId(env),
+        line_user_id: lineUserId,
+        kind: VISIT_GATE_KIND,
+        state,
+        updated_at: new Date().toISOString(),
+      },
+    ],
+    { onConflict: 'tenant_id,line_user_id,kind' },
+  );
+}
+
+export async function clearVisitGateSession(
+  env: TrycleRepoEnv,
+  lineUserId: string,
+): Promise<void> {
+  await supabaseDelete(env, 'bot_sessions', {
+    tenant_id: `eq.${getTenantId(env)}`,
+    line_user_id: `eq.${lineUserId}`,
+    kind: `eq.${VISIT_GATE_KIND}`,
+  });
+}
+
+/**
+ * 来店予定ゲートの確定を **原子的に claim** する (二重押下の冪等化)。Pkg1 来店予約と
+ * 同じく DELETE … RETURNING で「自分が消した行」を受け取り、行があれば最初の 1 回・
+ * 空なら 2 回目以降と判定する。これで case が 2 件作られるのを防ぐ。
+ *
+ * @returns claim できた session state / 既に消費済みなら null。
+ */
+export async function claimVisitGateSession(
+  env: TrycleRepoEnv,
+  lineUserId: string,
+): Promise<VisitGateState | null> {
+  const deleted = await supabaseDeleteReturning<{ state: VisitGateState }>(
+    env,
+    'bot_sessions',
+    {
+      tenant_id: `eq.${getTenantId(env)}`,
+      line_user_id: `eq.${lineUserId}`,
+      kind: `eq.${VISIT_GATE_KIND}`,
+    },
+  );
+  return deleted[0]?.state ?? null;
+}
+
 // ── 有人モード (REQ-PKG1-024) ────────────────────────────────────────────────
 
 /**
@@ -492,6 +622,11 @@ function normalizeState(state: Partial<Pkg1State> | null | undefined): Pkg1State
     cart: Array.isArray(state?.cart) ? state!.cart : [],
     pending: state?.pending,
     previousStep: state?.previousStep,
+    osayamiLoopCount:
+      typeof state?.osayamiLoopCount === 'number' ? state.osayamiLoopCount : undefined,
+    osayamiCandidates: Array.isArray(state?.osayamiCandidates)
+      ? state.osayamiCandidates
+      : undefined,
   };
 }
 

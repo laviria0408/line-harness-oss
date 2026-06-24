@@ -38,9 +38,13 @@ import {
   findInitialCaseStatus,
   findDefaultStore,
   findStoreCode,
+  findLaborById,
+  findLaborByCode,
+  laborToLineItem,
   saveQuote,
   updateQuotePdfUrl,
   type SavedQuote,
+  type LaborRow,
 } from './trycle-pkg1-repo.js';
 import {
   getPkg1Session,
@@ -55,9 +59,9 @@ import {
   claimReservationSession,
   markReservationDone,
   wasReservationRecentlyDone,
-  setManualMode,
   emptyPkg1State,
   cartSubtotal,
+  OSAYAMI_MAX_LOOPS,
   type Pkg1State,
   type Pkg1Step,
   type PendingSelection,
@@ -67,7 +71,29 @@ import {
 import { evaluateStep, injectStepIntoMessages, parseStep } from './trycle-step.js';
 import { jstWallToIsoZ, parseJstDatetime, validateVisitAt } from './trycle-store-hours.js';
 import { generateVisitDays, nowJst, type VisitDay } from './trycle-visit-slots.js';
-import { notifyStaff } from './trycle-staff.js';
+import { notifyStaff, startStaffConsultFromPkg1 } from './trycle-staff.js';
+import { listOverhaulMenus, buildOverhaulMatrix } from './trycle-overhaul-repo.js';
+import {
+  overhaulMenuCarousel,
+  overhaulEntryActions,
+  overhaulMenuPicker,
+  overhaulMatrixMessages,
+  OVERHAUL_LEAD_TEXT,
+} from './trycle-overhaul-flex.js';
+import { searchLaborByOsayami } from './trycle-labor-search.js';
+import {
+  osayamiInputText,
+  osayamiResultMessages,
+  osayamiNoMatchPrompt,
+  candidateViewFromItem,
+  type OsayamiCandidateView,
+} from './trycle-osayami-flex.js';
+import {
+  evaluateOsayamiTurn,
+  candidateCodes,
+  pickCandidateCode,
+  matchNote,
+} from './trycle-osayami-flow.js';
 import { appendChatSummary, flushChatSummaryBuffer } from './trycle-chat-summary.js';
 import { recordOutgoingMessages } from './trycle-outgoing-log.js';
 import { issueEstimatePdf, type EstimatePdfResult } from './trycle-pkg1-pdf.js';
@@ -87,7 +113,6 @@ import {
   reservationConfirmPrompt,
   textMessage,
   formatVisitAt,
-  DISPATCH_LABELS,
   MAX_REPLY_MESSAGES,
   type Dispatch,
   type LineMessage,
@@ -187,6 +212,12 @@ async function route(data: string, ctx: Pkg1Context): Promise<void> {
       return onCartDecision(ctx, value);
     case 'pkg1_confirm':
       return onConfirm(ctx, value);
+    case 'pkg1_overhaul':
+      return onOverhaulAction(ctx, value);
+    case 'pkg1_overhaul_menu':
+      return onOverhaulMenuSelected(ctx, value);
+    case 'pkg1_osayami':
+      return onOsayamiResult(ctx, value);
     default:
       return; // 未知の pkg1_ postback は黙って無視 (本物 default 準拠)
   }
@@ -203,6 +234,11 @@ const PKG1_ACTION_STEP: Readonly<Record<string, Pkg1Step>> = {
   pkg1_qty: 'awaiting_qty',
   pkg1_cart: 'awaiting_cart_decision',
   pkg1_confirm: 'awaiting_confirm',
+  // 包括メンテ (A2): 初期 carousel + entry actions・menu picker 全て awaiting_overhaul_menu。
+  pkg1_overhaul: 'awaiting_overhaul_menu',
+  pkg1_overhaul_menu: 'awaiting_overhaul_menu',
+  // お悩み (A1): 結果提示後の [このメニューで/もう一度/相談] は awaiting_osayami_result。
+  pkg1_osayami: 'awaiting_osayami_result',
 };
 
 /** 来店予定フローの action → その action が押せる正しい step。 */
@@ -322,17 +358,16 @@ async function onDispatch(ctx: Pkg1Context, value: string | null): Promise<void>
   const dispatch = parseDispatch(value);
   if (!dispatch) return;
 
-  // 包括メンテ・原因わからない → スタッフ相談誘導をもって完成 (本物 onDispatch)。
-  if (dispatch !== 'identified') {
-    await clearPkg1Session(repoEnv(ctx), ctx.lineUserId).catch((err) => console.error('[trycle-pkg1] clearPkg1Session failed', err));
-    await escalate(
-      ctx,
-      DISPATCH_LABELS[dispatch],
-      `「${DISPATCH_LABELS[dispatch]}」ですね。こちらは現物確認が必要なため、スタッフがご相談を承ります。`,
-    );
-    return;
+  // 包括メンテ (A2) → オーバーホール 4 メニューゲートへ (v1.6・旧 escalate を置換)。
+  if (dispatch === 'comprehensive') {
+    return startOverhaulGate(ctx);
+  }
+  // 原因がわからない (A1) → お悩み自由文マッチングへ (v1.6・旧 escalate を置換)。
+  if (dispatch === 'unknown') {
+    return startOsayamiFlow(ctx, '原因がわからない');
   }
 
+  // identified → 通常の症状ヒアリング (region 選択)。
   await upsertPkg1Session(
     repoEnv(ctx),
     ctx.lineUserId,
@@ -349,10 +384,14 @@ async function onRegion(ctx: Pkg1Context, value: string | null): Promise<void> {
     await safeReply(ctx, regionMessages(REGIONS), 'awaiting_region');
     return;
   }
-  // 「その他（自由記述）」はスタッフ送り (REQ-PKG1-018)。選択した部位ラベルを
-  // 種別タグ判定 (Add-D) の起点に渡す。
+  // 包括メンテ region (A2) → オーバーホール 4 メニューゲートへ (v1.6)。
+  if (region.kind === 'overhaul') {
+    return startOverhaulGate(ctx);
+  }
+  // 「その他（自由記述）」は お悩み自由文マッチングへ (v1.6・旧 escalate を置換)。
+  // 選択した部位ラベルを種別タグ判定 (Add-D) の起点に渡す。
   if (region.symptoms === null) {
-    return finishWithEscalation(ctx, region.label);
+    return startOsayamiFlow(ctx, region.label);
   }
   const session = await currentSession(ctx);
   await upsertPkg1Session(
@@ -460,7 +499,13 @@ async function onQty(ctx: Pkg1Context, value: string | null): Promise<void> {
  */
 export async function handlePkg1Text(text: string, ctx: Pkg1Context): Promise<boolean> {
   const session = await getPkg1Session(repoEnv(ctx), ctx.lineUserId).catch(() => null);
-  if (!session || session.step !== 'awaiting_qty' || !session.pending) return false;
+  if (!session) return false;
+  // お悩み自由文入力 (A1・v1.6): awaiting_osayami_input なら trigram マッチに回す。
+  if (session.step === 'awaiting_osayami_input') {
+    await processOsayamiInput(ctx, text, session);
+    return true;
+  }
+  if (session.step !== 'awaiting_qty' || !session.pending) return false;
   const symptom = currentSymptom(session.pending);
   if (!symptom) return false;
   const qty = Number.parseInt(text.trim(), 10);
@@ -1028,72 +1073,314 @@ async function finalizeReservation(ctx: Pkg1Context, session: ReservationState):
 // ── スタッフ送り (escalate) ───────────────────────────────────────────────────
 
 /**
- * 確定不能症状 (region その他・symptom/variant sample=null・labor 解決不能) の
- * スタッフ送り。専用文言 + notifyStaff (見積サマリ同梱) + 有人モード。
+ * 確定不能症状 (region その他・symptom/variant sample=null・labor 解決不能) の導線。
  *
- * inquiryText = お客様の選択ラベル (region/symptom)。classifyInquiry (Add-D) が
- * これを起点に種別タグを判定する (省略すると定型 reason が誤分類されるため・
- * REQ-ADD-D-001 メニュー起点判定 / REQ-ADD-F-002 カーボン補修=矢野口固定)。
+ * v1.6 (Phase 4): 旧仕様は即スタッフ送り (escalate) だったが、まず お悩み自由文
+ * マッチング (A1) を挟み、近いメニューを提示してから (それでも合わなければ) スタッフ
+ * 相談へ倒す。inquiryText = お客様の選択ラベル (region/symptom)。お悩み入力前置きの
+ * 種別判定起点に使う。
  */
 async function finishWithEscalation(ctx: Pkg1Context, inquiryText?: string): Promise<void> {
-  await escalate(
-    ctx,
-    '確定不能症状',
-    '確定のお見積もりが難しいご相談のため、スタッフから折り返しご連絡いたします 🙇',
-    inquiryText,
-  );
+  await startOsayamiFlow(ctx, inquiryText ?? '確定不能症状');
 }
 
 /**
- * スタッフ送り共通: session 破棄 + 有人モード + Gmail 通知 (tag/店舗振り分け・
- * 見積サマリ同梱) + 文言 reply。
+ * スタッフ相談へ倒す (v1.6・Phase 4)。subagent B の内容確認ループ
+ * (startStaffConsultFromPkg1) に委譲し、Pkg1 / Pkg8 でスタッフ相談フローを統一する。
  *
- * inquiryText を渡すと classifyInquiry (Add-D) がそれを起点に種別タグを判定する。
- * 省略時は定型 reason を分類してしまい、カーボン補修等の選択が「other」へ誤分類
- * される (REQ-ADD-D-001 受入基準・REQ-ADD-F-002 違反) ため、呼び出し側は可能な
- * 限り選択ラベルを渡すこと。
+ * 旧 escalate (notifyStaff + 有人モード + 定型 reply) は B 側の内容確認ループ
+ * (相談内容を確認 → notifyStaffConsult → 有人モード) に一本化された。Pkg1 側の責務は
+ * 「見積 session を片付けて」「自由文 (inquiryText) を渡して」B のループを開始するだけ。
+ * 失敗時 (B 未配線等) は無反応を避けるため graceful な文言で締める。
  */
-async function escalate(
-  ctx: Pkg1Context,
-  reason: string,
-  introText: string,
-  inquiryText?: string,
-): Promise<void> {
+async function routeToStaffConsult(ctx: Pkg1Context, inquiryText?: string): Promise<void> {
   const env = repoEnv(ctx);
-  // 見積中なら同梱物 (cart サマリ) を集める (REQ-PKG1-017)。
-  const session = await getPkg1Session(env, ctx.lineUserId).catch(() => null);
-  const estimateSummary =
-    session && session.cart.length > 0 ? estimateSummaryText(session.cart) : null;
-  const customerName = await resolveCustomerName(ctx);
+  await clearPkg1Session(env, ctx.lineUserId).catch((err) =>
+    console.error('[trycle-pkg1] routeToStaffConsult clearPkg1Session failed', err),
+  );
+  const seed = inquiryText && inquiryText.trim() !== '' ? inquiryText.trim() : '';
+  try {
+    await startStaffConsultFromPkg1(
+      {
+        replyToken: ctx.replyToken,
+        lineUserId: ctx.lineUserId,
+        lineClient: ctx.lineClient,
+        env: ctx.env,
+      },
+      seed,
+      'お悩み相談',
+    );
+  } catch (err) {
+    console.error('[trycle-pkg1] startStaffConsultFromPkg1 failed', err);
+    await safeReply(ctx, [
+      textMessage(
+        'スタッフにおつなぎします。ご相談内容をこのトークにお送りください。\nbot に戻るときは下のメニューから操作してください。',
+      ),
+    ]);
+  }
+}
 
-  await clearPkg1Session(env, ctx.lineUserId).catch((err) => console.error('[trycle-pkg1] clearPkg1Session failed', err));
-  await setManualMode(env, ctx.lineUserId).catch((err) => console.error('[trycle-pkg1] setManualMode failed', err));
+// ── 包括メンテ (A2・Phase 4 v1.6) ─────────────────────────────────────────────
 
-  await notifyStaff(ctx.env, {
-    lineUserId: ctx.lineUserId,
-    customerName,
-    reason,
-    estimateSummary,
-    pdfUrl: null,
-    note: null,
-    // 種別タグ (Add-D) は選択ラベル起点で判定。無ければ reason へフォールバック
-    // (空文字も含めて分類根拠が無いとみなす)。
-    inquiryText: inquiryText && inquiryText.trim() !== '' ? inquiryText : reason,
-  }).catch((err) => console.error('[trycle-pkg1] notifyStaff failed', err));
+/**
+ * 包括メンテゲート: maintenance_menus 4 件を Flex carousel で提示し、初期メッセージ +
+ * [メニューの選択に進む][違いについて知る] を出す。session を awaiting_overhaul_menu
+ * に進めて、続く overhaul postback を Step ID ゲートで受けられるようにする。
+ */
+async function startOverhaulGate(ctx: Pkg1Context): Promise<void> {
+  const env = repoEnv(ctx);
+  let menus: Awaited<ReturnType<typeof listOverhaulMenus>> = [];
+  try {
+    menus = await listOverhaulMenus(env);
+  } catch (err) {
+    console.error('[trycle-pkg1] listOverhaulMenus failed', err);
+  }
+  // メニュー未投入 / 取得失敗 → お悩み相談へ倒す (無反応を避ける)。
+  if (menus.length === 0) {
+    return startOsayamiFlow(ctx, '包括メンテ（オーバーホール）');
+  }
 
-  // スタッフ送り。直近 case があれば append・無ければバッファ (後続 case 生成時に flush)。
   await appendChatSummary(env, ctx.lineUserId, {
     flowType: 'pkg1',
-    speaker: 'bot',
-    text: `スタッフ引継: ${inquiryText && inquiryText.trim() !== '' ? inquiryText : reason}`,
-  });
+    speaker: '顧客',
+    text: '包括メンテ（オーバーホール）を相談',
+  }).catch(() => undefined);
 
-  await safeReply(ctx, [
-    textMessage(introText),
-    textMessage(
-      'この後はスタッフが直接ご対応します。ご相談内容をこのトークにお送りください。\nbot に戻るときは下のメニューから操作してください。',
-    ),
-  ]);
+  await upsertPkg1Session(
+    env,
+    ctx.lineUserId,
+    advancePkg1(await currentSession(ctx), 'awaiting_overhaul_menu', {
+      pending: undefined,
+      osayamiLoopCount: undefined,
+      osayamiCandidates: undefined,
+    }),
+  );
+  await safeReply(
+    ctx,
+    [textMessage(OVERHAUL_LEAD_TEXT), overhaulMenuCarousel(menus), overhaulEntryActions()],
+    'awaiting_overhaul_menu',
+  );
+}
+
+/** 包括メンテの entry action ([メニューの選択に進む]/[違いについて知る])。 */
+async function onOverhaulAction(ctx: Pkg1Context, value: string | null): Promise<void> {
+  const env = repoEnv(ctx);
+  let menus: Awaited<ReturnType<typeof listOverhaulMenus>> = [];
+  try {
+    menus = await listOverhaulMenus(env);
+  } catch (err) {
+    console.error('[trycle-pkg1] onOverhaulAction listOverhaulMenus failed', err);
+  }
+  if (menus.length === 0) return startOsayamiFlow(ctx, '包括メンテ（オーバーホール）');
+
+  if (value === 'matrix') {
+    let matrix: Awaited<ReturnType<typeof buildOverhaulMatrix>> = [];
+    try {
+      matrix = await buildOverhaulMatrix(env);
+    } catch (err) {
+      console.error('[trycle-pkg1] buildOverhaulMatrix failed', err);
+    }
+    if (matrix.length === 0) {
+      // マトリクス不能でもメニュー選択には進めるようにする。
+      await safeReply(ctx, [overhaulMenuPicker(menus)], 'awaiting_overhaul_menu');
+      return;
+    }
+    await safeReply(
+      ctx,
+      [...overhaulMatrixMessages(matrix), overhaulMenuPicker(menus)],
+      'awaiting_overhaul_menu',
+    );
+    return;
+  }
+
+  // 'picker' (既定): メニューの 4 択を出す。
+  await safeReply(ctx, [overhaulMenuPicker(menus)], 'awaiting_overhaul_menu');
+}
+
+/**
+ * 包括メンテ menu 確定 (labor_master_id) → labor を cart に積み、確認 (概算) へ直行する。
+ * variant/qty を持たない単品なので通常フローの awaiting_confirm へ合流する。
+ */
+async function onOverhaulMenuSelected(ctx: Pkg1Context, value: string | null): Promise<void> {
+  const env = repoEnv(ctx);
+  const laborId = value ?? '';
+  let labor: LaborRow | null = null;
+  if (laborId) {
+    try {
+      labor = await findLaborById(env, laborId);
+    } catch (err) {
+      console.error('[trycle-pkg1] onOverhaulMenuSelected findLaborById failed', err);
+    }
+  }
+  if (!labor) {
+    // 解決不能 → お悩み相談へ倒す (無反応を避ける)。
+    return startOsayamiFlow(ctx, '包括メンテ（オーバーホール）');
+  }
+  await addResolvedLaborToCart(ctx, labor);
+}
+
+// ── お悩み (A1・Phase 4 v1.6) ─────────────────────────────────────────────────
+
+/**
+ * お悩み自由文マッチングを開始する。session を awaiting_osayami_input へ進め、
+ * 「お悩みを教えてください」を出す (text 経路で受ける)。inquiryText は前置きの起点。
+ * loop count は 0 から開始する (新規お悩み)。
+ */
+async function startOsayamiFlow(ctx: Pkg1Context, _inquiryText?: string): Promise<void> {
+  const env = repoEnv(ctx);
+  const session = await currentSession(ctx);
+  await upsertPkg1Session(env, ctx.lineUserId, {
+    ...session,
+    previousStep: session.step,
+    step: 'awaiting_osayami_input',
+    osayamiLoopCount: 0,
+    osayamiCandidates: undefined,
+    pending: undefined,
+  });
+  // 入力プロンプトは postback を持たない (text 入力で受ける) ため step stamp 不要。
+  await safeReply(ctx, [textMessage(osayamiInputText(OSAYAMI_MAX_LOOPS))]);
+}
+
+/**
+ * お悩み自由文を 1 ターン処理する (text 経路 handlePkg1Text から呼ばれる)。
+ * trigram マッチ → 0 件/上限/候補ありで分岐し、提示 or スタッフ相談へ倒す。
+ */
+async function processOsayamiInput(ctx: Pkg1Context, text: string, session: Pkg1State): Promise<void> {
+  const env = repoEnv(ctx);
+  const query = text.trim();
+  if (query === '') {
+    await safeReply(ctx, [textMessage(osayamiInputText(remainingFromCount(session.osayamiLoopCount)))]);
+    return;
+  }
+
+  let matches: Awaited<ReturnType<typeof searchLaborByOsayami>> = [];
+  try {
+    matches = await searchLaborByOsayami(env, query);
+  } catch (err) {
+    console.error('[trycle-pkg1] searchLaborByOsayami failed', err);
+  }
+
+  const turn = evaluateOsayamiTurn(session.osayamiLoopCount ?? 0, matches);
+
+  await appendChatSummary(env, ctx.lineUserId, {
+    flowType: 'pkg1',
+    speaker: '顧客',
+    text: `お悩み: ${query.length > 40 ? `${query.slice(0, 39)}…` : query}`,
+  }).catch(() => undefined);
+
+  if (turn.kind === 'staff_max') {
+    await safeReply(ctx, [
+      textMessage('これ以上、自動でのご案内が難しいようです。スタッフにおつなぎしますね。'),
+    ]);
+    return routeToStaffConsult(ctx, query);
+  }
+  if (turn.kind === 'staff_no_match') {
+    // 0 件: スタッフ相談 / もう一度 の CTA を出す (session は result 待ちに進める)。
+    await upsertPkg1Session(env, ctx.lineUserId, {
+      ...session,
+      previousStep: 'awaiting_osayami_input',
+      step: 'awaiting_osayami_result',
+      osayamiLoopCount: turn.nextLoopCount,
+      osayamiCandidates: [],
+    });
+    await safeReply(ctx, [osayamiNoMatchPrompt()], 'awaiting_osayami_result');
+    return;
+  }
+
+  // present: 候補 3 件を cart に積む前の view へ整形して提示する。
+  const views: OsayamiCandidateView[] = turn.matches.map((m) =>
+    candidateViewFromItem(laborToLineItem(m.labor), matchNote(m.labor)),
+  );
+  await upsertPkg1Session(env, ctx.lineUserId, {
+    ...session,
+    previousStep: 'awaiting_osayami_input',
+    step: 'awaiting_osayami_result',
+    osayamiLoopCount: turn.nextLoopCount,
+    osayamiCandidates: candidateCodes(turn.matches),
+  });
+  await safeReply(
+    ctx,
+    osayamiResultMessages(views, turn.remainingLoops),
+    'awaiting_osayami_result',
+  );
+}
+
+/** お悩み結果画面の操作 (pick:N / again / staff)。 */
+async function onOsayamiResult(ctx: Pkg1Context, value: string | null): Promise<void> {
+  const env = repoEnv(ctx);
+  const session = await currentSession(ctx);
+
+  if (value === 'staff') {
+    return routeToStaffConsult(ctx, '');
+  }
+  if (value === 'again') {
+    // もう一度質問する。上限内なら入力プロンプトへ戻す。上限到達ならスタッフへ。
+    if ((session.osayamiLoopCount ?? 0) >= OSAYAMI_MAX_LOOPS) {
+      await safeReply(ctx, [
+        textMessage('これ以上、自動でのご案内が難しいようです。スタッフにおつなぎしますね。'),
+      ]);
+      return routeToStaffConsult(ctx, '');
+    }
+    await upsertPkg1Session(env, ctx.lineUserId, {
+      ...session,
+      previousStep: 'awaiting_osayami_result',
+      step: 'awaiting_osayami_input',
+      osayamiCandidates: undefined,
+    });
+    await safeReply(ctx, [textMessage(osayamiInputText(remainingFromCount(session.osayamiLoopCount)))]);
+    return;
+  }
+  if (value && value.startsWith('pick:')) {
+    const index = Number.parseInt(value.slice('pick:'.length), 10);
+    const code = pickCandidateCode(session.osayamiCandidates, Number.isFinite(index) ? index : -1);
+    if (!code) {
+      // 候補解決不能 → スタッフ相談へ倒す (無反応を避ける)。
+      return routeToStaffConsult(ctx, '');
+    }
+    let labor: LaborRow | null = null;
+    try {
+      labor = await findLaborByCode(env, code);
+    } catch (err) {
+      console.error('[trycle-pkg1] onOsayamiResult findLaborByCode failed', err);
+    }
+    if (!labor) return routeToStaffConsult(ctx, '');
+    return addResolvedLaborToCart(ctx, labor);
+  }
+}
+
+/** 残り質問可能回数 (MAX - 使用済み)。0 未満は 0。 */
+function remainingFromCount(loopCount: number | undefined): number {
+  return Math.max(0, OSAYAMI_MAX_LOOPS - (loopCount ?? 0));
+}
+
+/**
+ * 解決済み labor 1 件を cart に積み、概算見積の確認 (awaiting_confirm) へ直行する。
+ * 包括メンテ menu 選択 / お悩み候補確定の共通終端 (variant/qty を持たない単品)。
+ * 既存 cart があれば追記する (お悩み→確定の前に通常見積を積んでいたケースを保全)。
+ */
+async function addResolvedLaborToCart(ctx: Pkg1Context, labor: LaborRow): Promise<void> {
+  const env = repoEnv(ctx);
+  const session = await currentSession(ctx);
+  const item = laborToLineItem(labor);
+  const cart = [...session.cart, item];
+
+  await appendChatSummary(env, ctx.lineUserId, {
+    flowType: 'pkg1',
+    speaker: '顧客',
+    text: item.name,
+  }).catch(() => undefined);
+
+  await upsertPkg1Session(env, ctx.lineUserId, {
+    ...session,
+    cart,
+    step: 'awaiting_confirm',
+    previousStep: undefined,
+    pending: undefined,
+    osayamiLoopCount: undefined,
+    osayamiCandidates: undefined,
+  });
+  const taxOptions = await getTenantQuoteSettings(env);
+  await safeReply(ctx, confirmMessages(cart, taxOptions), 'awaiting_confirm');
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -1146,10 +1433,6 @@ async function resolveCustomerContact(
   } catch {
     return { name: null, phone: null };
   }
-}
-
-async function resolveCustomerName(ctx: Pkg1Context): Promise<string | null> {
-  return (await resolveCustomerContact(ctx)).name;
 }
 
 interface SaveQuoteArgs {

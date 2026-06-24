@@ -2,8 +2,9 @@ import { describe, it, expect } from 'vitest';
 import { REGIONS, findRegionByValue } from './pkg1-regions.js';
 
 describe('REGIONS catalog (本物 regions.ts 移植)', () => {
-  it('has the 9 部位 in the expected order', () => {
+  it('has the 10 部位 in the expected order (v1.6: 包括メンテゲートを先頭に追加)', () => {
     expect(REGIONS.map((r) => r.value)).toEqual([
+      'overhaul-gate',
       'overhaul-related',
       'brake',
       'shift',
@@ -16,11 +17,19 @@ describe('REGIONS catalog (本物 regions.ts 移植)', () => {
     ]);
   });
 
-  it('marks the free-text その他 region with null symptoms (→ スタッフ送り)', () => {
-    expect(findRegionByValue('other')!.symptoms).toBeNull();
+  it('marks the 包括メンテゲート region with kind=overhaul + null symptoms (v1.6)', () => {
+    const gate = findRegionByValue('overhaul-gate')!;
+    expect(gate.kind).toBe('overhaul');
+    expect(gate.symptoms).toBeNull();
   });
 
-  it('each non-other region ends with an その他 symptom (sample=null)', () => {
+  it('marks the free-text その他 region with null symptoms (→ お悩みフロー)', () => {
+    expect(findRegionByValue('other')!.symptoms).toBeNull();
+    // 通常の region は kind 未指定 (overhaul ゲートだけ kind を持つ)。
+    expect(findRegionByValue('other')!.kind).toBeUndefined();
+  });
+
+  it('each region with symptoms ends with an その他 symptom (sample=null)', () => {
     for (const region of REGIONS) {
       if (region.symptoms === null) continue;
       const last = region.symptoms[region.symptoms.length - 1];

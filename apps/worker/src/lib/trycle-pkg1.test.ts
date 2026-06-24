@@ -27,17 +27,22 @@ interface Tables {
   tenant_fy_counters: Record<string, unknown>[];
   consents: Record<string, unknown>[];
   customers: Record<string, unknown>[];
+  maintenance_menus: Record<string, unknown>[];
+  maintenance_features: Record<string, unknown>[];
+  maintenance_menu_features: Record<string, unknown>[];
 }
 
 let tables: Tables;
 let idSeq = 0;
 
 function laborSeed() {
-  // 必要な sample のみ用意 (テストで使う code)。
+  // 必要な sample のみ用意 (テストで使う code)。tags/description は お悩みマッチ用 (v1.6)。
   return [
-    { id: 'la1', tenant_id: TENANT, code: 'brake-adjust-both', category: 'brake', name: 'ブレーキ調整', price: 3000, price_open_ended: false, notes: null, archived: false, sort_order: 0 },
-    { id: 'la2', tenant_id: TENANT, code: 'chain-swap', category: 'drivetrain', name: 'チェーン交換', price: 2000, price_open_ended: false, notes: null, archived: false, sort_order: 1 },
-    { id: 'la3', tenant_id: TENANT, code: 'spoke-swap', category: 'wheel', name: 'スポーク交換', price: 1500, price_open_ended: false, notes: null, archived: false, sort_order: 2 },
+    { id: 'la1', tenant_id: TENANT, code: 'brake-adjust-both', category: 'brake', name: 'ブレーキ調整', price: 3000, price_max: null, price_open_ended: false, notes: null, tags: ['ブレーキ', '効かない'], description: 'ブレーキの効きを調整します', archived: false, sort_order: 0 },
+    { id: 'la2', tenant_id: TENANT, code: 'chain-swap', category: 'drivetrain', name: 'チェーン交換', price: 2000, price_max: null, price_open_ended: false, notes: null, tags: ['チェーン'], description: null, archived: false, sort_order: 1 },
+    { id: 'la3', tenant_id: TENANT, code: 'spoke-swap', category: 'wheel', name: 'スポーク交換', price: 1500, price_max: null, price_open_ended: false, notes: null, tags: ['スポーク'], description: null, archived: false, sort_order: 2 },
+    // 包括メンテ menu (labor 本体)。お悩み「全体」でも拾える tags 付き。
+    { id: 'la-oh', tenant_id: TENANT, code: 'oh-premium', category: 'オーバーホール', name: 'オーバーホール プレミアム', price: 80000, price_max: null, price_open_ended: false, notes: null, tags: ['オーバーホール', '全体', 'メンテナンス'], description: '全バラシのコース', archived: false, sort_order: 3 },
   ];
 }
 
@@ -65,6 +70,18 @@ function resetTables(): void {
     tenant_fy_counters: [],
     consents: [],
     customers: [],
+    // 包括メンテ (v1.6): labor la-oh と 1:1 の menu + 機能 + マトリクス。
+    maintenance_menus: [
+      { id: 'mm1', tenant_id: TENANT, labor_master_id: 'la-oh', duration_days_min: 14, duration_days_max: 20, detailed_description: '全バラシのコースです。', hero_image_url: null, sort_order: 0 },
+    ],
+    maintenance_features: [
+      { id: 'mf1', tenant_id: TENANT, category: '全体', name: '分解・洗浄・組み立て', archived: false, sort_order: 0 },
+      { id: 'mf2', tenant_id: TENANT, category: 'オプション', name: '油圧ホース交換', archived: false, sort_order: 1 },
+    ],
+    maintenance_menu_features: [
+      { labor_master_id: 'la-oh', feature_id: 'mf1', option_price: null, option_price_open_ended: false, notes: null, sort_order: 0 },
+      { labor_master_id: 'la-oh', feature_id: 'mf2', option_price: 12000, option_price_open_ended: false, notes: null, sort_order: 1 },
+    ],
   };
   idSeq = 0;
 }
@@ -87,6 +104,11 @@ function matchRow(row: Record<string, unknown>, filters: Record<string, string>)
       if (String(cell) !== val) return false;
     } else if (op === 'is') {
       if (val === 'null' && cell != null) return false;
+    } else if (op === 'in') {
+      // in.(a,b,c) — 括弧内を split して membership 判定 (maintenance_menu_features 用)。
+      const inner = val.replace(/^\(/, '').replace(/\)$/, '');
+      const allowed = inner.split(',').map((v) => v.trim());
+      if (!allowed.includes(String(cell))) return false;
     }
   }
   return true;
@@ -257,18 +279,22 @@ describe('dispatch (REQ-PKG1-002)', () => {
     expect(sessionStep()).toBe('awaiting_region');
   });
 
-  it('包括メンテ escalates to staff (manual_mode + session cleared)', async () => {
+  it('包括メンテ → 包括メンテゲート (v1.6・4 メニュー carousel)', async () => {
     await postback('pkg1_start');
     await postback('action=pkg1_dispatch&value=comprehensive');
-    expect(lastReplyText()).toContain('現物確認が必要');
-    expect(sessionStep()).toBeUndefined();
-    expect(tables.bot_sessions.some((r) => r.kind === 'manual_mode')).toBe(true);
+    // harness は maintenance_menus を 1 件 seed → carousel + entry actions が出る。
+    expect(lastReplyAny()).toContain('action=pkg1_overhaul&value=picker');
+    // 旧スタッフ即送りには倒れない (manual_mode を即立てない)。
+    expect(tables.bot_sessions.some((r) => r.kind === 'manual_mode')).toBe(false);
+    expect(sessionStep()).toBe('awaiting_overhaul_menu');
   });
 
-  it('原因がわからない escalates to staff', async () => {
+  it('原因がわからない → お悩み自由文入力 (v1.6)', async () => {
     await postback('pkg1_start');
     await postback('action=pkg1_dispatch&value=unknown');
-    expect(tables.bot_sessions.some((r) => r.kind === 'manual_mode')).toBe(true);
+    expect(lastReplyText()).toContain('どのようなことでお困りですか');
+    expect(sessionStep()).toBe('awaiting_osayami_input');
+    expect(tables.bot_sessions.some((r) => r.kind === 'manual_mode')).toBe(false);
   });
 });
 
@@ -659,31 +685,34 @@ describe('reservation flow (店舗 → 日付 → 時間 → 確認)', () => {
 
 // ── escalation paths (REQ-018) ────────────────────────────────────────────────
 
-describe('escalation paths (REQ-PKG1-018)', () => {
-  it('region=その他(自由記述) escalates', async () => {
+describe('escalation paths (REQ-PKG1-018・v1.6: お悩みフロー経由)', () => {
+  it('region=その他(自由記述) → お悩み自由文入力 (旧スタッフ即送りを置換)', async () => {
     await postback('pkg1_start');
     await postback('action=pkg1_dispatch&value=identified');
     await postback('action=pkg1_region&value=other');
-    expect(tables.bot_sessions.some((r) => r.kind === 'manual_mode')).toBe(true);
-    expect(sessionStep()).toBeUndefined();
+    expect(lastReplyText()).toContain('どのようなことでお困りですか');
+    expect(sessionStep()).toBe('awaiting_osayami_input');
+    // お悩みを挟むので、即 manual_mode へは倒れない。
+    expect(tables.bot_sessions.some((r) => r.kind === 'manual_mode')).toBe(false);
   });
 
-  it('symptom=その他 (sample=null) escalates', async () => {
+  it('symptom=その他 (sample=null) → お悩み自由文入力', async () => {
     await postback('pkg1_start');
     await postback('action=pkg1_dispatch&value=identified');
     await postback('action=pkg1_region&value=drivetrain');
     await postback(`action=pkg1_symptom&value=${DRIVETRAIN_OTHER}`);
-    expect(tables.bot_sessions.some((r) => r.kind === 'manual_mode')).toBe(true);
+    expect(lastReplyText()).toContain('どのようなことでお困りですか');
+    expect(sessionStep()).toBe('awaiting_osayami_input');
   });
 });
 
-// ── escalate → notifyStaff の種別タグ判定 (Add-D / Add-F) ──────────────────────
+// ── staff 通知の種別タグ判定 (Add-D / Add-F) ──────────────────────────────────
 //
-// audit-coverage 指摘の実証: 旧実装は escalate() が notifyStaff に「reason のみ」
-// (定型文字列) を渡し、classifyInquiry が定型 reason を誤分類していた
-// (確定不能症状 → other 固定)。修正後は「お客様の選択ラベル」を inquiryText として
-// 渡すため、選択起点で種別タグが判定される (REQ-ADD-D-001 メニュー起点判定)。
-describe('escalate → staff 通知の種別タグ (Add-D / Add-F)', () => {
+// v1.6: Pkg1 の確定不能導線は「お悩みフロー → (合わなければ) スタッフ相談」へ移行し、
+// 即 notifyStaff は呼ばなくなった (スタッフ相談は subagent B の内容確認ループが担う)。
+// notifyStaff / classifyInquiry / routeInquiry の種別タグ・店舗振り分けの不変条件は
+// 引き続き直接検証する (お悩み→スタッフ後も B が同じ classifyInquiry を使うため重要)。
+describe('staff 通知の種別タグ (Add-D / Add-F)', () => {
   // gmail_notify (callGas → GAS_WEB_APP_URL) の POST を捕捉する。
   let gasCalls: { type: string; payload: Record<string, unknown> }[];
   const GAS_URL = 'https://gas.example.com/exec';
@@ -727,18 +756,15 @@ describe('escalate → staff 通知の種別タグ (Add-D / Add-F)', () => {
     return gasCalls.filter((c) => c.type === 'gmail_notify').at(-1)?.payload;
   }
 
-  it('region=その他 escalate は選択ラベル (定型 reason ではない) を分類根拠にする', async () => {
+  it('region=その他 は即 notifyStaff せず お悩みフローへ入る (v1.6)', async () => {
     await gasPostback('pkg1_start');
     await gasPostback('action=pkg1_dispatch&value=identified');
     await gasPostback('action=pkg1_region&value=other');
 
-    const payload = lastStaffNotify();
-    expect(payload).toBeDefined();
-    // 「その他（自由記述）」= サービス種別不明 → other (旧実装と値は同じだが、
-    // 分類の起点が定型 reason でなく選択ラベルになっていることが要点)。
-    expect(payload!.tag).toBe('other');
-    // 確定不能症状 (canned reason) でなく、有人モードへ切り替わっている。
-    expect(tables.bot_sessions.some((r) => r.kind === 'manual_mode')).toBe(true);
+    // 旧実装は即 gmail_notify したが、v1.6 はまず お悩み入力を出す。
+    expect(lastStaffNotify()).toBeUndefined();
+    expect(lastReplyText()).toContain('どのようなことでお困りですか');
+    expect(tables.bot_sessions.some((r) => r.kind === 'manual_mode')).toBe(false);
   });
 
   it('カーボン補修ルートで escalate すると carbon タグ + 矢野口固定で通知 (REQ-ADD-F-002)', async () => {
@@ -778,6 +804,144 @@ describe('escalate → staff 通知の種別タグ (Add-D / Add-F)', () => {
     expect(classifyInquiry('原因がわからない')).toBe('other');
     // 「来店予定の受付」だけは 来店 を拾って reservation になる (偶然の正解)。
     expect(classifyInquiry('来店予定の受付')).toBe('reservation');
+  });
+});
+
+// ── 包括メンテゲート (A2・v1.6) ───────────────────────────────────────────────
+
+describe('包括メンテゲート (A2・v1.6)', () => {
+  async function enterGate() {
+    await postback('pkg1_start');
+    await postback('action=pkg1_dispatch&value=comprehensive');
+  }
+
+  it('comprehensive → 4 メニュー carousel + entry actions を出す', async () => {
+    await enterGate();
+    const s = lastReplyAny();
+    expect(s).toContain('オーバーホール プレミアム');
+    expect(s).toContain('action=pkg1_overhaul&value=picker');
+    expect(s).toContain('action=pkg1_overhaul&value=matrix');
+    expect(sessionStep()).toBe('awaiting_overhaul_menu');
+  });
+
+  it('「メニューの選択に進む」→ 4 択 picker', async () => {
+    await enterGate();
+    await postback('action=pkg1_overhaul&value=picker');
+    expect(lastReplyText()).toContain('action=pkg1_overhaul_menu&value=la-oh');
+  });
+
+  it('「違いについて知る」→ マトリクス (含まれる内容 + オプション) + picker', async () => {
+    await enterGate();
+    await postback('action=pkg1_overhaul&value=matrix');
+    const s = lastReplyAny();
+    expect(s).toContain('分解・洗浄・組み立て'); // 含まれる
+    expect(s).toContain('油圧ホース交換'); // オプション
+    expect(s).toContain('¥12,000');
+  });
+
+  it('メニュー確定 → cart に積んで確認 (概算) へ直行', async () => {
+    await enterGate();
+    await postback('action=pkg1_overhaul_menu&value=la-oh');
+    expect(sessionStep()).toBe('awaiting_confirm');
+    const c = cart();
+    expect(c.length).toBe(1);
+    expect((c[0] as { name: string }).name).toContain('オーバーホール プレミアム');
+    // 概算見積 + 3 択 (pdf_only / reserve / redo)。
+    expect(lastReplyText()).toContain('action=pkg1_confirm&value=pdf_only');
+  });
+
+  it('包括メンテ region (overhaul-gate) からも同じゲートに入る', async () => {
+    await postback('pkg1_start');
+    await postback('action=pkg1_dispatch&value=identified');
+    await postback('action=pkg1_region&value=overhaul-gate');
+    expect(sessionStep()).toBe('awaiting_overhaul_menu');
+    expect(lastReplyAny()).toContain('action=pkg1_overhaul_menu&value=la-oh');
+  });
+});
+
+// ── お悩みマッチング (A1・v1.6) ───────────────────────────────────────────────
+
+describe('お悩みマッチング (A1・v1.6)', () => {
+  function consultSession(): Record<string, unknown> | undefined {
+    return tables.bot_sessions.find((r) => r.line_user_id === USER && r.kind === 'staff_consult');
+  }
+  function osayamiState(): { step?: string; osayamiLoopCount?: number; osayamiCandidates?: string[] } | undefined {
+    const s = tables.bot_sessions.find((r) => r.line_user_id === USER && r.kind === 'pkg1_estimate');
+    return s?.state as never;
+  }
+  async function text(t: string): Promise<boolean> {
+    return handlePkg1Text(t, ctx());
+  }
+
+  it('unknown → お悩み入力 → マッチ 3 件提示 (loop count=1・残回数表示)', async () => {
+    await postback('pkg1_start');
+    await postback('action=pkg1_dispatch&value=unknown');
+    expect(osayamiState()?.step).toBe('awaiting_osayami_input');
+
+    const handled = await text('ブレーキが効かない');
+    expect(handled).toBe(true);
+    const st = osayamiState();
+    expect(st?.step).toBe('awaiting_osayami_result');
+    expect(st?.osayamiLoopCount).toBe(1);
+    const s = lastReplyAny();
+    // ブレーキ調整が候補に出る + 操作 3 択。
+    expect(s).toContain('ブレーキ調整');
+    expect(s).toContain('action=pkg1_osayami&value=pick:0');
+    expect(s).toContain('action=pkg1_osayami&value=again');
+    expect(s).toContain('action=pkg1_osayami&value=staff');
+  });
+
+  it('候補確定 (pick:0) → cart に積んで確認へ', async () => {
+    await postback('pkg1_start');
+    await postback('action=pkg1_dispatch&value=unknown');
+    await text('ブレーキが効かない');
+    await postback('action=pkg1_osayami&value=pick:0');
+    expect(sessionStep()).toBe('awaiting_confirm');
+    expect(cart().length).toBe(1);
+    expect(lastReplyText()).toContain('action=pkg1_confirm&value=pdf_only');
+  });
+
+  it('もう一度質問する (again) → 入力に戻る (loop 維持)', async () => {
+    await postback('pkg1_start');
+    await postback('action=pkg1_dispatch&value=unknown');
+    await text('ブレーキが効かない');
+    await postback('action=pkg1_osayami&value=again');
+    expect(osayamiState()?.step).toBe('awaiting_osayami_input');
+    expect(lastReplyText()).toContain('どのようなことでお困りですか');
+  });
+
+  it('0 件マッチ → スタッフ相談 CTA (no-match prompt)', async () => {
+    await postback('pkg1_start');
+    await postback('action=pkg1_dispatch&value=unknown');
+    await text('zzz該当なし無関係xxx');
+    expect(osayamiState()?.step).toBe('awaiting_osayami_result');
+    const s = lastReplyAny();
+    expect(s).toContain('action=pkg1_osayami&value=staff');
+  });
+
+  it('スタッフに相談する (staff) → 内容確認ループ (staff_consult session) へ委譲', async () => {
+    await postback('pkg1_start');
+    await postback('action=pkg1_dispatch&value=unknown');
+    await text('ブレーキが効かない');
+    await postback('action=pkg1_osayami&value=staff');
+    // pkg1 session は片付き、staff_consult session が立つ (subagent B のループ)。
+    expect(sessionStep()).toBeUndefined();
+    expect(consultSession()).toBeDefined();
+  });
+
+  it('5 回上限に達すると自動でスタッフへ移行する', async () => {
+    await postback('pkg1_start');
+    await postback('action=pkg1_dispatch&value=unknown');
+    // 5 回まで present、6 回目の入力で staff_max → スタッフ移行。
+    for (let i = 0; i < 5; i += 1) {
+      await text('ブレーキが効かない');
+      // 上限未満は result へ。最後 (5 回目) で残 0。
+      await postback('action=pkg1_osayami&value=again').catch(() => undefined);
+    }
+    // again は上限到達でスタッフへ倒れる場合があるため、最終状態で staff_consult を確認。
+    const consult = consultSession();
+    const pkg1 = osayamiState();
+    expect(consult !== undefined || (pkg1?.osayamiLoopCount ?? 0) >= 5).toBe(true);
   });
 });
 
