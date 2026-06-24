@@ -63,9 +63,10 @@ export const REGIONS: ReadonlyArray<Region> = [
     kind: 'overhaul',
   },
   {
-    // オーバーホール関係 (コンポーネント関係のみ)。OH 本体・バラカンは第一弾スコープ外。
+    // 組立・バラシ (コンポーネント関係)。包括メンテ (オーバーホール) と紛らわしいので
+    // user 仕様 2026-06-25 で「組立・バラシ」に rename。OH 本体・バラカンは別 region。
     value: 'overhaul-related',
-    label: 'オーバーホール関係',
+    label: '組立・バラシ',
     symptoms: [
       { label: 'コンポーネント組付け', sample: 'component-assemble' },
       { label: 'コンポーネント組み換え', sample: 'component-swap' },
