@@ -49,6 +49,18 @@ const BARE_ACTION_LABELS: Readonly<Record<string, string>> = {
   pkg1_wage: '工賃の確認',
   pkg8_start: 'よくある質問',
   faq_start: 'よくある質問',
+  // Phase 4 各種予約 3 分岐 + 来店予定ゲート。
+  reservation_start: '各種予約を開く',
+  reservation_stores: '洗車・試乗・フィッティング（STORES）を選択',
+  reservation_maintenance: 'メンテナンスの予約を選択',
+  reservation_visit_start: 'その他（来店予約）を選択',
+  reservation_visit_skip: 'ご来店内容の入力をスキップ',
+};
+
+/** 来店予定ゲート確定の分岐。 */
+const VISIT_CONFIRM_LABELS: Readonly<Record<string, string>> = {
+  ok: '予約する',
+  change: '日時を変更する',
 };
 
 /**
@@ -99,6 +111,13 @@ export async function resolvePostbackLabel(
   if (BARE_ACTION_LABELS[raw]) return op(BARE_ACTION_LABELS[raw]);
 
   const action = parseAction(raw);
+
+  // Phase 4 各種予約: 入口 3 択 (value 非依存) + 来店予定ゲートの選択。
+  if (BARE_ACTION_LABELS[action] && !raw.includes('value=')) return op(BARE_ACTION_LABELS[action]);
+  if (action.startsWith('reservation_')) {
+    return resolveReservationAction(action, parseValue(raw), ctx);
+  }
+
   if (!action.startsWith('pkg1_')) return null;
   const value = parseValue(raw);
 
@@ -141,6 +160,27 @@ async function resolveAction(
       return value && RESERVE_CONFIRM_LABELS[value] ? op(RESERVE_CONFIRM_LABELS[value]) : null;
     default:
       return null; // 未知の pkg1_ postback は翻訳しない (raw のまま)。
+  }
+}
+
+/** Phase 4 各種予約 / 来店予定ゲートの postback ラベル解決。 */
+async function resolveReservationAction(
+  action: string,
+  value: string | null,
+  ctx: PostbackLabelContext,
+): Promise<string | null> {
+  switch (action) {
+    case 'reservation_visit_store':
+      return resolveStore(value, ctx);
+    case 'reservation_visit_date':
+      return value ? op(`ご来店日「${formatVisitAt(`${value}t00:00`)}」を選択`) : op('ご来店日を選択');
+    case 'reservation_visit_time':
+      return value ? op(`ご来店日時「${formatVisitAt(value)}」を選択`) : op('ご来店時間を選択');
+    case 'reservation_visit_confirm':
+      return value && VISIT_CONFIRM_LABELS[value] ? op(VISIT_CONFIRM_LABELS[value]) : null;
+    default:
+      // 入口 3 択など value 非依存は BARE_ACTION_LABELS で解決済み。未知は raw。
+      return BARE_ACTION_LABELS[action] ? op(BARE_ACTION_LABELS[action]) : null;
   }
 }
 

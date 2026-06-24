@@ -6,8 +6,9 @@
  *                       postback は本物 `action=pkg1_X&value=Y` 形式 + 素の
  *                       `pkg1_start` / `pkg1_wage`。datetimepicker の選択値は
  *                       postback.params.datetime で来るため datetime を渡す。
+ *   - reservation_    : 各種予約 3 分岐 + 来店予定ゲート (Phase 4・trycle-reservation-gate.ts)。
+ *                       reservation_maintenance だけはここで pkg1_start に橋渡しする。
  *   - consent_        : 同意書は LIFF (apps/consent-liff/) → HTTP route で取得 (stub)
- *   - reservation_    : 旧予約導線。Pkg1 の「来店予定」に統合済 (stub)
  *
  * Return value:
  *   true  → TRYCLE handled it. Caller MUST NOT continue with auto-reply matching.
@@ -17,14 +18,19 @@ import type { LineClient } from '@line-crm/line-sdk';
 import type { Env } from '../index.js';
 import { handlePkg8Postback, isPkg8Postback } from './trycle-pkg8.js';
 import { handlePkg1Postback, isPkg1Postback } from './trycle-pkg1.js';
+import {
+  handleReservationGatePostback,
+  isReservationPostback,
+} from './trycle-reservation-gate.js';
 import type { TrycleRepoEnv } from './trycle-repo.js';
 
-const TRYCLE_STUB_PREFIXES = ['consent_', 'reservation_'] as const;
+const TRYCLE_STUB_PREFIXES = ['consent_'] as const;
 
 export function isTryclePostback(data: string): boolean {
   return (
     isPkg8Postback(data) ||
     isPkg1Postback(data) ||
+    isReservationPostback(data) ||
     TRYCLE_STUB_PREFIXES.some((prefix) => data.startsWith(prefix))
   );
 }
@@ -61,7 +67,27 @@ export async function tryHandleTryclePostback(
       datetime: ctx.datetime,
     });
   }
-  // consent_ / reservation_ は通常ここに来ない (LIFF / 来店予定ヒアリングへ統合)。
+  // 各種予約 (Phase 4): 3 分岐 + 来店予定ゲート。「メンテナンスの予約」は Pkg1 通常
+  // フローへ橋渡しする (gate は reservation_maintenance を未処理で返すので、ここで
+  // pkg1_start を発火する)。それ以外の reservation_ は gate が完結処理する。
+  if (isReservationPostback(data)) {
+    if (parseAction(data) === 'reservation_maintenance') {
+      return handlePkg1Postback('pkg1_start', {
+        replyToken: ctx.replyToken,
+        lineUserId: ctx.lineUserId,
+        lineClient: ctx.lineClient,
+        env: ctx.env,
+        datetime: ctx.datetime,
+      });
+    }
+    return handleReservationGatePostback(data, {
+      replyToken: ctx.replyToken,
+      lineUserId: ctx.lineUserId,
+      lineClient: ctx.lineClient,
+      env: ctx.env,
+    });
+  }
+  // consent_ は通常ここに来ない (LIFF / 来店予定ヒアリングへ統合)。
   // 誤発火しても auto-reply 経路には流さない (重複返信防止)。
   if (TRYCLE_STUB_PREFIXES.some((prefix) => data.startsWith(prefix))) {
     try {
@@ -74,4 +100,10 @@ export async function tryHandleTryclePostback(
     return true;
   }
   return false;
+}
+
+/** postback data の `action=` を取り出す (素のトークンはそのまま返す)。 */
+function parseAction(data: string): string {
+  if (!data.includes('action=')) return data;
+  return new URLSearchParams(data).get('action') ?? '';
 }

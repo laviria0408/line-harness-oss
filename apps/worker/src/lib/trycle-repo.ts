@@ -78,6 +78,32 @@ export async function getTenantQuoteSettings(
   }
 }
 
+/**
+ * STORES 予約トップ URL を解決する (Phase 4 各種予約)。優先順は
+ * tenants.settings.storesUrl → env TRYCLE_STORES_URL → null。null のときは
+ * 呼び出し側 (storesLinkPrompt) が fail-loud でスタッフ折り返しに倒す。
+ */
+export async function getStoresUrl(
+  env: TrycleRepoEnv & { TRYCLE_STORES_URL?: string },
+): Promise<string | null> {
+  try {
+    const rows = await supabaseSelect<{ settings: { storesUrl?: unknown } | null }>(
+      env,
+      'tenants',
+      { id: `eq.${getTenantId(env)}` },
+      { select: 'settings', limit: 1 },
+    );
+    const fromSettings = rows[0]?.settings?.storesUrl;
+    if (typeof fromSettings === 'string' && fromSettings.trim() !== '') {
+      return fromSettings.trim();
+    }
+  } catch (err) {
+    console.error('[trycle-repo] getStoresUrl settings lookup failed', err);
+  }
+  const fromEnv = env.TRYCLE_STORES_URL;
+  return typeof fromEnv === 'string' && fromEnv.trim() !== '' ? fromEnv.trim() : null;
+}
+
 // ── Customer ────────────────────────────────────────────────────────────────
 
 export interface CustomerRow {
@@ -290,6 +316,29 @@ export async function findStoreById(
     { limit: 1 },
   );
   return rows[0] ?? null;
+}
+
+/**
+ * 店舗の既定担当者 ID を返す (stores.default_assignee_id・migration 0011)。
+ * 来店予定ゲートが作る case の assignee_id に使う。未設定・例外時は null
+ * (assignee_id は nullable なので未設定でも case 作成は成立する)。
+ */
+export async function findStoreDefaultAssigneeId(
+  env: TrycleRepoEnv,
+  storeId: string,
+): Promise<string | null> {
+  try {
+    const rows = await supabaseSelect<{ default_assignee_id: string | null }>(
+      env,
+      'stores',
+      { tenant_id: `eq.${getTenantId(env)}`, id: `eq.${storeId}` },
+      { select: 'default_assignee_id', limit: 1 },
+    );
+    return rows[0]?.default_assignee_id ?? null;
+  } catch (err) {
+    console.error('[trycle-repo] findStoreDefaultAssigneeId failed', err);
+    return null;
+  }
 }
 
 // ── Labor master ────────────────────────────────────────────────────────────

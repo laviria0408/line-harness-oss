@@ -401,7 +401,10 @@ async function handleEvent(
         postbackData === 'pkg1_start' ||
         postbackData === 'pkg1_wage' ||
         postbackData === 'faq_start' ||
-        postbackData === 'pkg8_start'
+        postbackData === 'pkg8_start' ||
+        // Phase 4: リッチメニュー「各種予約」も bot 操作なので有人モードを解除する。
+        postbackData === 'action=reservation_start' ||
+        postbackData === 'reservation_start'
       ) {
         await clearManualMode(workerEnv as TrycleRepoEnv, userId).catch((err) => {
           console.error('Failed to clear manual mode', err);
@@ -732,6 +735,26 @@ async function handleEvent(
 
         matched = true;
         break;
+      }
+    }
+
+    // TRYCLE 各種予約 (Phase 4): 来店予定ゲートの自由文入力 (awaiting_inquiry) を受ける。
+    // active な visit_gate session が無ければ false で後続 (Pkg1 qty / Pkg8) へ流す。
+    if (!matched && !replyTokenConsumed && workerEnv && workerEnv.TRYCLE_TENANT_ID && event.replyToken) {
+      try {
+        const { handleReservationGateText } = await import('../lib/trycle-reservation-gate.js');
+        const handled = await handleReservationGateText(incomingText, {
+          replyToken: event.replyToken,
+          lineUserId: userId,
+          lineClient,
+          env: workerEnv,
+        });
+        if (handled) {
+          matched = true;
+          replyTokenConsumed = true;
+        }
+      } catch (err) {
+        console.error('[trycle-reservation-gate] inquiry text failed', err);
       }
     }
 
