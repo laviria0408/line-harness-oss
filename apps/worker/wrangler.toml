@@ -48,6 +48,9 @@ LIFF_PUBLIC_URL = "https://trycle-poc-liff.pages.dev"
 CF_ACCOUNT_ID = "375ccebf7904d6088d4ba97c643533d5"
 # Pkg1 整備見積 (Step 4-7): 同意書 LIFF の公開 URL (非機密ゆえ var)。
 LIFF_CONSENT_URL = "https://liff.line.me/2010454164-PQzCGMhy"
+# Phase 4 スタッフ通知メール本文の case-detail link で使用 (非機密ゆえ var)。
+# 未設定だとメール本文に dashboard link が出ない (本文のみ送信される)。
+DASHBOARD_PUBLIC_URL = "https://trycle-dashboard-pwa.vercel.app"
 # GMAIL_NOTIFICATION_TO (店舗スタッフ通知先) と GAS_WEB_APP_URL は secret:
 #   wrangler secret put GMAIL_NOTIFICATION_TO
 #   wrangler secret put GAS_WEB_APP_URL
