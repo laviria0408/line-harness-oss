@@ -26,7 +26,6 @@ import {
   handleReservationGatePostback,
   isReservationPostback,
 } from './trycle-reservation-gate.js';
-import type { TrycleRepoEnv } from './trycle-repo.js';
 
 const TRYCLE_STUB_PREFIXES = ['consent_'] as const;
 

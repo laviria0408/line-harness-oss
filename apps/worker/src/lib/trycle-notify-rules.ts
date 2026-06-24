@@ -25,6 +25,7 @@ export type NotifyRuleTarget =
   | 'owner'
   | 'all_owners'
   | 'all'
+  | 'superadmin'
   | { user_id: string };
 
 /** 通知経路。web_push は Phase 4 では未実装 (受けるが skip)。 */
@@ -36,6 +37,8 @@ export interface NotifyRule {
 }
 
 export interface CaseStaffConsultRules {
+  /** superadmin 向け (UI 非表示・default: all へ dashboard・user 仕様 2026-06-24)。 */
+  readonly superadmin?: NotifyRule;
   readonly unassigned: NotifyRule;
   readonly assigned: NotifyRule;
   readonly owner: NotifyRule;
@@ -43,6 +46,7 @@ export interface CaseStaffConsultRules {
 
 /** dashboard DEFAULT_CASE_STAFF_CONSULT_RULES と完全一致 (fallback の正本)。 */
 export const DEFAULT_CASE_STAFF_CONSULT_RULES: CaseStaffConsultRules = {
+  superadmin: { to: 'superadmin', via: ['dashboard'] },
   unassigned: { to: 'manager', via: ['dashboard', 'email'] },
   assigned: { to: 'assignee', via: ['dashboard', 'email'] },
   owner: { to: 'all_owners', via: ['dashboard'] },
@@ -54,6 +58,7 @@ const VALID_TARGETS: ReadonlySet<string> = new Set([
   'owner',
   'all_owners',
   'all',
+  'superadmin',
 ]);
 const VALID_CHANNELS: ReadonlyArray<NotifyRuleChannel> = ['dashboard', 'email', 'web_push'];
 
@@ -127,6 +132,7 @@ function sanitizeRule(raw: unknown, fallback: NotifyRule): NotifyRule {
 export function mergeCaseStaffConsult(raw: unknown): CaseStaffConsultRules {
   const r = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
   return {
+    superadmin: sanitizeRule(r.superadmin, DEFAULT_CASE_STAFF_CONSULT_RULES.superadmin ?? { to: 'all', via: ['dashboard'] }),
     unassigned: sanitizeRule(r.unassigned, DEFAULT_CASE_STAFF_CONSULT_RULES.unassigned),
     assigned: sanitizeRule(r.assigned, DEFAULT_CASE_STAFF_CONSULT_RULES.assigned),
     owner: sanitizeRule(r.owner, DEFAULT_CASE_STAFF_CONSULT_RULES.owner),
@@ -220,6 +226,10 @@ export async function resolveTarget(
     if (target === 'all') {
       return [{ userId: null, email: null, displayName: null }];
     }
+    if (target === 'superadmin') {
+      const supers = await findUsersByRole(env, 'superadmin');
+      return supers.map(toRecipient);
+    }
     if (target === 'assignee') {
       if (!caseRef.assigneeId) return [];
       const u = await findUserById(env, caseRef.assigneeId);
@@ -276,11 +286,14 @@ export async function resolveCaseStaffConsult(
   const state: 'assigned' | 'unassigned' = caseRef.assigneeId ? 'assigned' : 'unassigned';
   const primaryRule = rules[state];
   const ownerRule = rules.owner;
+  // superadmin は user 仕様で「基本全部」(UI 非表示・user 自身が受け取る前提)。
+  // rule が無ければ default を使う (mergeCaseStaffConsult 経由で補完済のはず)。
+  const superadminRule = rules.superadmin ?? DEFAULT_CASE_STAFF_CONSULT_RULES.superadmin!;
 
   const dashboard: ResolvedRecipient[] = [];
   const emails: ResolvedRecipient[] = [];
 
-  for (const rule of [primaryRule, ownerRule]) {
+  for (const rule of [primaryRule, ownerRule, superadminRule]) {
     const recipients = await resolveTarget(env, rule.to, caseRef);
     if (rule.via.includes('dashboard')) dashboard.push(...recipients);
     if (rule.via.includes('email')) {
