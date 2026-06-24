@@ -28,6 +28,8 @@ interface StubOptions {
   talkingCases?: Array<{ id: string }>;
   /** PATCH (cases UPDATE) 呼び出しを捕捉する配列。 */
   patches?: Array<{ url: string; body: unknown }>;
+  /** cases SELECT (GET) の URL を捕捉する配列。 */
+  caseSelects?: string[];
 }
 
 /**
@@ -49,6 +51,7 @@ function installFetchStub(opts: StubOptions = {}) {
         return new Response(JSON.stringify(statuses), { status: 200 });
       }
       if (url.includes('/rest/v1/cases') && method === 'GET') {
+        opts.caseSelects?.push(url);
         return new Response(JSON.stringify(talkingCases), { status: 200 });
       }
       if (url.includes('/rest/v1/cases') && method === 'PATCH') {
@@ -125,10 +128,31 @@ describe('syncCaseCompleteOnChatResolved', () => {
     const body = patches[0].body as Record<string, unknown>;
     expect(body.status_id).toBe(DONE_ID);
     expect(typeof body.updated_at).toBe('string');
-    // tenant + line_user_id + 旧 status_id を WHERE に残し競合上書きを防ぐ
-    expect(patches[0].url).toContain(`tenant_id=eq.${TENANT_ID}`);
+    // 単一 case を id 指定で更新 (1:1 連動)。旧 status_id を WHERE に残し競合上書きを防ぐ
+    expect(patches[0].url).toContain('id=eq.case-1');
     expect(patches[0].url).toContain(`status_id=eq.${TALKING_ID}`);
     expect(patches[0].url).toContain('deleted_at=is.null');
+  });
+
+  test('updates only the newest talking case (1:1) when several exist', async () => {
+    const patches: Array<{ url: string; body: unknown }> = [];
+    const caseSelects: string[] = [];
+    // SELECT は order=created_at.desc&limit=1 で最新 1 件のみを返す前提なので、
+    // スタブは先頭 (= 最新) の 1 件だけ返す。複数残骸があっても巻き込まないことを保証。
+    installFetchStub({ patches, caseSelects, talkingCases: [{ id: 'case-newest' }] });
+
+    const result = await syncCaseCompleteOnChatResolved(baseEnv(), LINE_USER_ID);
+
+    expect(result.updatedCount).toBe(1);
+    // SELECT は最新 1 件に絞る (limit=1 + 降順)
+    expect(caseSelects).toHaveLength(1);
+    expect(caseSelects[0]).toContain('limit=1');
+    expect(caseSelects[0]).toContain('order=created_at.desc');
+    // PATCH は最新 case の id 1 件だけを対象にする (一括 UPDATE しない)
+    expect(patches).toHaveLength(1);
+    expect(patches[0].url).toContain('id=eq.case-newest');
+    // 旧仕様の「line_user_id で一括」ではない (生 line_user_id が WHERE に出ない)
+    expect(patches[0].url).not.toContain(`line_user_id=eq.${LINE_USER_ID}`);
   });
 
   test('skips (no PATCH) when no talking case exists', async () => {

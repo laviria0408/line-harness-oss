@@ -292,7 +292,7 @@ function DirectMessagePanel({ friendId, friend, onBack, onSent }: {
 }
 
 export default function ChatsPage() {
-  const { selectedAccountId } = useAccount()
+  const { selectedAccountId, setSelectedAccountId } = useAccount()
   const [chats, setChats] = useState<Chat[]>([])
   const [allFriends, setAllFriends] = useState<FriendItem[]>([])
   const [selectedChatId, setSelectedChatId] = useState<string | null>(null)
@@ -438,6 +438,11 @@ export default function ChatsPage() {
   //
   // TRYCLE Phase 4: dashboard LineButton は ?friend=<lineUserId> (U + 32 hex) を渡すため、
   // LINE User ID 形式と検出したら friends API で friend_id を解決してから setSelectedChatId する。
+  //
+  // friend の所属 account (line_account_id) が現在選択中の account と異なると、chat list /
+  // chat detail が別 account に向いたままで該当 chat が表示されず真っ白になる。解決した
+  // lineAccountId へ account を切り替えてから chat を選択することで、deep link 先の chat を
+  // 確実に開けるようにする。
   useEffect(() => {
     if (typeof window === 'undefined') return
     const params = new URLSearchParams(window.location.search)
@@ -448,12 +453,20 @@ export default function ChatsPage() {
       setSelectedChatId(friendParam)
       return
     }
-    // LINE User ID → friend_id 解決
+    // LINE User ID → friend_id 解決 (+ 所属 account への切り替え)
     ;(async () => {
       try {
-        const res = await fetchApi(`/api/friends/by-line-user-id/${friendParam}`)
-        if (res.success && (res.data as { id: string } | undefined)?.id) {
-          setSelectedChatId((res.data as { id: string }).id)
+        const res = await fetchApi<{
+          success: boolean
+          data?: { id?: string; lineAccountId?: string }
+        }>(`/api/friends/by-line-user-id/${friendParam}`)
+        const data = res.success ? res.data : undefined
+        if (data?.id) {
+          // chat を選ぶ前に該当 friend の account へ切り替える (別 account だと真っ白になる)
+          if (data.lineAccountId) {
+            setSelectedAccountId(data.lineAccountId)
+          }
+          setSelectedChatId(data.id)
         } else {
           // 解決失敗時: 値をそのまま試す (古い deep link との互換)
           setSelectedChatId(friendParam)
@@ -462,7 +475,7 @@ export default function ChatsPage() {
         setSelectedChatId(friendParam)
       }
     })()
-  }, [])
+  }, [setSelectedAccountId])
 
   useEffect(() => {
     if (selectedChatId) {

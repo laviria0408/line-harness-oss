@@ -88,8 +88,9 @@ function isReady(env: ChatResolveSyncEnv): true | ChatResolveSyncResult {
  * chat 解決済 → dashboard case を「完了」に連動する本体。
  *
  * 対象 = tenant スコープ・line_user_id 一致・現ステータスが 'talking' (相談中) の
- * 案件すべて。最新 1 件に絞らないのは、同一ユーザーに相談中案件が複数あれば
- * いずれも解決済と見なすのが自然 (運用上は通常 1 件)。
+ * 案件のうち **最新 1 件のみ** (1:1 連動)。chat 解決はその時点で進行中の 1 案件を
+ * 閉じる操作であり、過去に取り残された talking 案件 (リグレッション残骸) まで
+ * 巻き込んで一括完了するのは仕様外 (user 指示: 1:1 にしたい)。
  */
 export async function syncCaseCompleteOnChatResolved(
   env: ChatResolveSyncEnv,
@@ -122,7 +123,7 @@ export async function syncCaseCompleteOnChatResolved(
       return { updatedCount: 0, skippedReason: 'no-done-status' };
     }
 
-    // 2) 相談中の対象 case を特定。talking status が無ければ対象なし。
+    // 2) 相談中の対象 case を最新 1 件だけ特定。talking status が無ければ対象なし。
     if (!talkingId) {
       return { updatedCount: 0, skippedReason: 'no-talking-case' };
     }
@@ -135,20 +136,21 @@ export async function syncCaseCompleteOnChatResolved(
         status_id: `eq.${talkingId}`,
         deleted_at: 'is.null',
       },
-      { select: 'id', order: 'created_at.desc', limit: 50 },
+      { select: 'id', order: 'created_at.desc', limit: 1 },
     );
     if (cases.length === 0) {
       return { updatedCount: 0, skippedReason: 'no-talking-case' };
     }
+    const targetCaseId = cases[0].id;
 
-    // 3) 相談中 → 完了 へ status_id を更新 (status_id 一致を WHERE に残し、
-    //    同期中に他経路で status が変わった行を上書きしない = 競合に安全)。
+    // 3) その 1 件だけを 相談中 → 完了 へ更新。id 指定 + status_id 一致を WHERE に
+    //    残すことで、(a) 最新 1 件のみ更新 = 1:1 連動 (b) 同期中に他経路で status が
+    //    変わった行を上書きしない = 競合に安全、の両方を満たす。
     await supabaseUpdate(
       env,
       'cases',
       {
-        tenant_id: `eq.${tenantId}`,
-        line_user_id: `eq.${lineUserId}`,
+        id: `eq.${targetCaseId}`,
         status_id: `eq.${talkingId}`,
         deleted_at: 'is.null',
       },
@@ -158,7 +160,7 @@ export async function syncCaseCompleteOnChatResolved(
       },
     );
 
-    return { updatedCount: cases.length };
+    return { updatedCount: 1 };
   } catch (err) {
     console.error(
       `[trycle-chat-resolve-sync] case 完了連動に失敗 (user=${maskLineUserId(lineUserId)}):`,
