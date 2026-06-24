@@ -52,6 +52,8 @@ import {
   getReservationSession,
   setReservationSession,
   claimReservationSession,
+  markReservationDone,
+  wasReservationRecentlyDone,
   setManualMode,
   emptyPkg1State,
   cartSubtotal,
@@ -710,15 +712,26 @@ async function onReservationConfirmed(ctx: Pkg1Context, value: string | null): P
   // webhook retry で `pkg1_reserve_confirm=ok` が 2 回届くと、素朴な実装では
   // 2 回とも finalize して case が 2 件作られる。確定の最初の操作で session を
   // **原子的に claim (DELETE … RETURNING)** し、行を受け取れた request だけが
-  // finalize する。claim が空 = ①連打の 2 回目 (1 回目が既に消費) ②session 失効
-  // のどちらか。両者は claim 結果からは区別できないため、reservation フロー共通の
-  // graceful フォールバック (reservationLost) に倒す。重要不変条件 (case を 2 件
-  // 作らない) はここで担保され、2 回目の finalize は構造的に起きない。
+  // finalize する。重要不変条件 (case を 2 件作らない) はここで担保される。
   const claimed = await claimReservationSession(env, ctx.lineUserId).catch((err) => {
     console.error('[trycle-pkg1] claimReservationSession failed', err);
     return null;
   });
-  if (!claimed) return reservationLost(ctx);
+
+  // claim が空 = ①連打の 2 回目 (1 回目が既に消費) ②session 失効 のどちらか。
+  // 2026-06-23 真因 II: 両者を一律 graceful (reservationLost) に倒すと、連打の
+  // 2 回目に「受付がリセットされました」+ 整備見積スタートが出てユーザが戸惑う。
+  // finalize 成功時に残す「直近確定マーカー」の鮮度で両者を分離する:
+  //   - 直近 (RECENT_CONFIRM_WINDOW_MS 以内) に確定済み → 連打の重複 → 完全 silent
+  //   - マーカー無し / 古い                          → 本当の失効 → graceful 導線
+  if (!claimed) {
+    const recentlyDone = await wasReservationRecentlyDone(env, ctx.lineUserId);
+    if (recentlyDone) {
+      console.log('[trycle-pkg1] reserve_confirm duplicate within window → silent no-op', ctx.lineUserId);
+      return; // silent: reply も log (chat_summary / case) も一切しない
+    }
+    return reservationLost(ctx);
+  }
 
   return finalizeReservation(ctx, claimed);
 }
@@ -740,6 +753,15 @@ async function reservationLost(ctx: Pkg1Context): Promise<void> {
 /** 来店予定確定 → cases + quote_versions 保存 → PDF 発行 → LINE 共有。 */
 async function finalizeReservation(ctx: Pkg1Context, session: ReservationState): Promise<void> {
   const env = repoEnv(ctx);
+
+  // 直近確定マーカーを最初に残す (連打の完全 silent 化・2026-06-23 真因 II)。
+  // claim はこの request が取れているので、これ以降に届く同 confirm の空 claim は
+  // このマーカーを見て「直近確定の重複」と判定し silent no-op になる。失敗しても
+  // finalize は止めない (マーカー無しなら 2 回目は従来の graceful 導線に倒れるだけ)。
+  await markReservationDone(env, ctx.lineUserId).catch((err) =>
+    console.error('[trycle-pkg1] markReservationDone failed', err),
+  );
+
   const quote = buildQuote(session.cart, await getTenantQuoteSettings(env));
   // 表示用 (notifyStaff の文言)・JST 壁時計のまま (formatVisitAt が wall-clock parse する)
   const visitAtIso = session.visitAtIso ?? null;

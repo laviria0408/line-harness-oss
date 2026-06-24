@@ -479,7 +479,7 @@ describe('reservation flow (店舗 → 日付 → 時間 → 確認)', () => {
   });
 
   // ── 二重押下の冪等化 (2026-06-23 真因: 「はい」連打で 2 案件) ─────────────────
-  it('confirm=ok を 2 回押しても case は 1 件だけ作られる (idempotent claim)', async () => {
+  it('confirm=ok を 2 回押しても case は 1 件だけ作られ、2 回目は完全 silent (no-op)', async () => {
     await reachStoreSelection();
     await postback('action=pkg1_reserve_store&value=s1');
     const dt = nextMondayAt14();
@@ -493,14 +493,39 @@ describe('reservation flow (店舗 → 日付 → 時間 → 確認)', () => {
     expect(tables.quote_versions).toHaveLength(1);
     // 確定で reservation session は消えている。
     expect(tables.bot_sessions.some((r) => r.kind === 'reservation')).toBe(false);
+    // 直近確定マーカーが残っている (連打 silent 判定の根拠)。
+    expect(tables.bot_sessions.some((r) => r.kind === 'reservation_done')).toBe(true);
 
-    // 2 回目 (連打 / webhook retry 相当): session は claim 済みで空 → 二重 finalize
-    // は起きず graceful フォールバックを返す。
+    const repliesAfterFirst = replied.length;
+
+    // 2 回目 (連打 / webhook retry 相当): session は claim 済みで空 + 直近確定
+    // マーカーが鮮度内 → 完全 silent no-op (reply 一切なし・case も増えない)。
     await postback('action=pkg1_reserve_confirm&value=ok');
     // case / quote_version が増えない (= スタッフ引継も二重にならない)。
     expect(tables.cases).toHaveLength(1);
     expect(tables.quote_versions).toHaveLength(1);
-    // 2 回目は確定文言ではなく再開導線 (reservationLost)。
+    // reply が 1 回も増えていない (= 完全無音)。
+    expect(replied.length).toBe(repliesAfterFirst);
+    // 「リセットされました」graceful 導線も出ない。
+    expect(lastReplyText()).not.toContain('リセット');
+    expect(lastReplyText()).not.toContain('もう一度はじめから');
+  });
+
+  it('session が本当に失効していれば confirm=ok は graceful 導線を返す (silent でない)', async () => {
+    await reachStoreSelection();
+    await postback('action=pkg1_reserve_store&value=s1');
+    const dt = nextMondayAt14();
+    const date = dt.slice(0, 10);
+    await postback(`action=pkg1_reserve_date&value=${date}`);
+    await postback(`action=pkg1_reserve_time&value=${dt}`);
+
+    // reservation session を外部要因で失効させる (確定マーカーも無い状態)。
+    tables.bot_sessions = tables.bot_sessions.filter((r) => r.kind !== 'reservation');
+
+    await postback('action=pkg1_reserve_confirm&value=ok');
+    // case は作られない。
+    expect(tables.cases).toHaveLength(0);
+    // 直近確定マーカーが無い空 claim は失効として graceful 導線 (reservationLost)。
     expect(lastReplyText()).toContain('もう一度はじめから');
   });
 });

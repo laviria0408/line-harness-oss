@@ -30,9 +30,22 @@ export const PKG1_SESSION_KIND = 'pkg1_estimate';
 export const PKG1_CART_KIND = 'pkg1_cart';
 export const RESERVATION_KIND = 'reservation';
 export const MANUAL_MODE_KIND = 'manual_mode';
+/**
+ * 来店予定が「直近で確定済み」かを残す短命マーカー (連打の 2 回目を完全 silent に
+ * するため・2026-06-23 真因 II)。finalize 成功時に confirmed_at を書き、確認 Flex
+ * の 2 回目タップが空 claim になったとき「直近確定の重複」か「session 失効」かを
+ * これで区別する。state.confirmed_at に ISO timestamp を持つ。
+ */
+export const RESERVATION_DONE_KIND = 'reservation_done';
 
 /** 24 時間無操作で stale 扱い (設計 §7 session ライフサイクル)。 */
 export const SESSION_STALE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * 連打を「重複」と見なす時間窓 (この窓内の 2 回目以降は完全 silent no-op)。
+ * 窓を超えた空 claim は本当の session 失効として graceful 導線へ倒す。
+ */
+export const RECENT_CONFIRM_WINDOW_MS = 30 * 1000;
 
 /** 本物 `Pkg1Step` (pkg1-estimate.ts) に揃える (CRITICAL #5・設計 v1.2.1 §4)。 */
 export type Pkg1Step =
@@ -296,6 +309,72 @@ export async function claimReservationSession(
     },
   );
   return deleted[0]?.state ?? null;
+}
+
+/**
+ * 来店予定 finalize 成功直後に「直近確定」マーカーを書く (連打の完全 silent 化)。
+ *
+ * claimReservationSession は「最初の 1 回」と「それ以外 (連打 2 回目 / session 失効)」
+ * しか区別できない。後 2 者を分けるため、claim に成功した request だけがここで
+ * confirmed_at を残す。2 回目の空 claim はこのマーカーの鮮度を見て
+ * 「直近確定の重複 (= silent no-op)」か「本当の失効 (= graceful)」かを判定する。
+ *
+ * onConflict UPSERT なので 1 ユーザー : 1 行 (最新 confirmed_at で上書き)。
+ */
+export async function markReservationDone(
+  env: TrycleRepoEnv,
+  lineUserId: string,
+  now: Date = new Date(),
+): Promise<void> {
+  await supabaseUpsert(
+    env,
+    'bot_sessions',
+    [
+      {
+        tenant_id: getTenantId(env),
+        line_user_id: lineUserId,
+        kind: RESERVATION_DONE_KIND,
+        state: { confirmed_at: now.toISOString() },
+        updated_at: now.toISOString(),
+      },
+    ],
+    { onConflict: 'tenant_id,line_user_id,kind' },
+  );
+}
+
+/**
+ * 来店予定が直近 (RECENT_CONFIRM_WINDOW_MS 以内) に確定済みかを判定する。
+ * confirm の空 claim が「連打の 2 回目」なら true (→ silent)、それより古い /
+ * マーカー無し なら false (→ session 失効として graceful 導線)。
+ *
+ * フェイルセーフ: 読み取り失敗時は false を返し graceful 導線へ倒す
+ * (silent に倒して無反応に見せるより、再開導線を出すほうが安全)。
+ */
+export async function wasReservationRecentlyDone(
+  env: TrycleRepoEnv,
+  lineUserId: string,
+  now: Date = new Date(),
+): Promise<boolean> {
+  let rows: { state: { confirmed_at?: string } }[];
+  try {
+    rows = await supabaseSelect<{ state: { confirmed_at?: string } }>(
+      env,
+      'bot_sessions',
+      {
+        tenant_id: `eq.${getTenantId(env)}`,
+        line_user_id: `eq.${lineUserId}`,
+        kind: `eq.${RESERVATION_DONE_KIND}`,
+      },
+      { select: 'state', limit: 1 },
+    );
+  } catch (err) {
+    console.error('[trycle-session] wasReservationRecentlyDone lookup failed', err);
+    return false;
+  }
+  const confirmedAt = rows[0]?.state?.confirmed_at;
+  if (!confirmedAt) return false;
+  const elapsed = now.getTime() - new Date(confirmedAt).getTime();
+  return Number.isFinite(elapsed) && elapsed >= 0 && elapsed <= RECENT_CONFIRM_WINDOW_MS;
 }
 
 // ── 有人モード (REQ-PKG1-024) ────────────────────────────────────────────────

@@ -5,7 +5,9 @@ import {
   emptyPkg1State,
   getPkg1Session,
   getPkg1Cart,
+  wasReservationRecentlyDone,
   SESSION_STALE_MS,
+  RECENT_CONFIRM_WINDOW_MS,
 } from './trycle-session.js';
 import type { TrycleRepoEnv } from './trycle-repo.js';
 import type { QuoteLineItem } from './quote.js';
@@ -121,5 +123,38 @@ describe('getPkg1Cart (同意書未取得時の cart 退避)', () => {
   it('returns null when no stash exists', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('[]', { status: 200 }));
     expect(await getPkg1Cart(env(), 'U1')).toBeNull();
+  });
+});
+
+describe('wasReservationRecentlyDone (連打の完全 silent 判定)', () => {
+  beforeEach(() => vi.restoreAllMocks());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('returns true when the confirm marker is within the recent window', async () => {
+    const now = new Date();
+    const confirmedAt = new Date(now.getTime() - 5 * 1000).toISOString(); // 5s 前
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify([{ state: { confirmed_at: confirmedAt } }]), { status: 200 }),
+    );
+    expect(await wasReservationRecentlyDone(env(), 'U1', now)).toBe(true);
+  });
+
+  it('returns false when the confirm marker is older than the window', async () => {
+    const now = new Date();
+    const confirmedAt = new Date(now.getTime() - RECENT_CONFIRM_WINDOW_MS - 1000).toISOString();
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify([{ state: { confirmed_at: confirmedAt } }]), { status: 200 }),
+    );
+    expect(await wasReservationRecentlyDone(env(), 'U1', now)).toBe(false);
+  });
+
+  it('returns false when no confirm marker exists (= 本当の session 失効)', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('[]', { status: 200 }));
+    expect(await wasReservationRecentlyDone(env(), 'U1')).toBe(false);
+  });
+
+  it('fails safe (false → graceful) on Supabase error', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('err', { status: 500 }));
+    expect(await wasReservationRecentlyDone(env(), 'U1')).toBe(false);
   });
 });
