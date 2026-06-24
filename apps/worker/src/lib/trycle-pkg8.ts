@@ -38,6 +38,14 @@ import {
   TEXT_MUTED,
   type FlexMessage,
 } from './trycle-flex-helpers.js';
+import {
+  startStaffConsult,
+  handleStaffConsultText,
+  handleStaffConsultPostback,
+  isStaffConsultPostback,
+  type StaffConsultContext,
+} from './trycle-staff.js';
+import type { Env } from '../index.js';
 
 const FAQ_PREFIXES = ['faq_', 'pkg8_'] as const;
 const TOP_FAQS_COUNT = 3;
@@ -45,7 +53,21 @@ const SEARCH_RESULTS_LIMIT = 5;
 const MIN_SEARCH_QUERY_LENGTH = 2;
 
 export function isPkg8Postback(data: string): boolean {
+  if (isStaffConsultPostback(data)) return true;
   return FAQ_PREFIXES.some((prefix) => data.startsWith(prefix));
+}
+
+/** Pkg8Context から StaffConsult ループ用の最小 context を作る。 */
+function staffConsultCtx(ctx: Pkg8Context): StaffConsultContext {
+  return {
+    replyToken: ctx.replyToken,
+    lineUserId: ctx.lineUserId,
+    lineClient: ctx.lineClient,
+    // Pkg8Context.env は TrycleRepoEnv (narrow)・StaffConsult は Env['Bindings'] を
+    // 要する (notifyStaffConsult が GAS / DASHBOARD_PUBLIC_URL を読む)。実体は同じ
+    // Bindings なので cast する (Pkg8 の replyAndLog と同方針)。
+    env: ctx.env as unknown as Env['Bindings'],
+  };
 }
 
 export interface Pkg8Context {
@@ -78,12 +100,21 @@ export async function handlePkg8Postback(data: string, ctx: Pkg8Context): Promis
   if (!isPkg8Postback(data)) return false;
 
   try {
+    // スタッフ相談 内容確認ループの [はい]/[追記する] (B1・Pkg1 と共通)。
+    if (isStaffConsultPostback(data)) {
+      return handleStaffConsultPostback(staffConsultCtx(ctx), data);
+    }
     if (data === 'faq_start' || data === 'pkg8_start') {
       await replyEntry(ctx);
       return true;
     }
     if (data === 'faq_staff') {
-      await replyStaffEscalation(ctx);
+      // 旧: 即 staff escalation。新 (B1): 内容確認ループへ。相談内容を入力 → 確認 →
+      // [はい] で notifyStaffConsult (二重発火)・[追記する] で連結 (2 回上限)。
+      await startStaffConsult(staffConsultCtx(ctx), {
+        source: 'pkg8',
+        reason: 'FAQ スタッフ相談',
+      });
       return true;
     }
     if (data.startsWith('faq_cat_')) {
@@ -130,6 +161,15 @@ export async function handlePkg8Postback(data: string, ctx: Pkg8Context): Promis
  * Returns false if the query is too short or no action taken.
  */
 export async function handlePkg8Text(text: string, ctx: Pkg8Context): Promise<boolean> {
+  // スタッフ相談 内容確認ループ中 (awaiting='input') の自由文はそこへ吸い込む
+  // (B1・FAQ 検索より優先)。loop が active でなければ false で素通り。
+  try {
+    const consumed = await handleStaffConsultText(staffConsultCtx(ctx), text);
+    if (consumed) return true;
+  } catch (err) {
+    console.error('[trycle-pkg8] staff consult text failed', err);
+  }
+
   const query = text.trim();
   if (query.length < MIN_SEARCH_QUERY_LENGTH) return false;
 
@@ -250,16 +290,6 @@ async function replyNoHit(ctx: Pkg8Context, query: string): Promise<void> {
     ],
   );
   await replyAndLog(ctx, [flex]);
-}
-
-async function replyStaffEscalation(ctx: Pkg8Context): Promise<void> {
-  await replyAndLog(ctx, [
-    {
-      type: 'text',
-      text:
-        'スタッフからご連絡いたします。\nご質問の内容をこちらにテキストでお送りください。\n営業時間内に順次お返事いたします。',
-    },
-  ]);
 }
 
 // ── Flex Builders ────────────────────────────────────────────────────────────

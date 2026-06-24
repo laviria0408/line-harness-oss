@@ -28,6 +28,40 @@ export interface GasResponse {
   readonly error?: string;
 }
 
+/**
+ * 単一宛先へメールを送る薄い wrapper (GAS `gmail_notify` を呼ぶ)。
+ *
+ * Apps Script 側 `gmail_notify` は payload.{to,subject,body} を MailApp.sendEmail に
+ * 渡す。スタッフ通知 (case 相談中) を「複数宛先へ個別送信」するため、宛先ごとに 1 通
+ * 送れる最小 API として切り出す。機密 (line_user_id 生値 / token) は payload に乗せ
+ * ない方針 (呼び出し側がメール本文を組む時点で除外する)。
+ *
+ * GAS_WEB_APP_URL 未設定なら ok=false で no-op (呼び出し側は user 応答を止めない)。
+ */
+export interface SendMailInput {
+  readonly to: string;
+  readonly subject: string;
+  readonly body: string;
+  /** 通知の種別 (GAS 側のログ / 振り分け用・任意)。 */
+  readonly kind?: string;
+}
+
+export async function sendMail(
+  env: Env['Bindings'],
+  input: SendMailInput,
+): Promise<GasResponse> {
+  return callGas(env, {
+    type: 'gmail_notify',
+    payload: {
+      kind: input.kind ?? 'staff_notify',
+      to: input.to,
+      subject: input.subject,
+      body: input.body,
+      ts: new Date().toISOString(),
+    },
+  });
+}
+
 export async function callGas(
   env: Env['Bindings'],
   req: GasRequest,

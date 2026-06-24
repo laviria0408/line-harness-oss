@@ -127,9 +127,16 @@ export type Env = {
     SUPABASE_SERVICE_ROLE_KEY?: string;
     TRYCLE_TENANT_ID?: string;
     GAS_WEB_APP_URL?: string;
-    // Pkg1 整備見積 (Step 4-7)。LIFF 同意書 URL・スタッフ通知先 Gmail。
+    // Pkg1 整備見積 (Step 4-7)。LIFF 同意書 URL・スタッフ通知先 Gmail (旧・単一宛先)。
     LIFF_CONSENT_URL?: string;
     GMAIL_NOTIFICATION_TO?: string;
+    // Phase 4 各種予約: 洗車・試乗・フィッティングの STORES 予約トップ URL。
+    // 未設定時は tenants.settings.storesUrl を使い、それも無ければ fail-loud。
+    TRYCLE_STORES_URL?: string;
+    // Phase 4 スタッフ相談通知: dashboard 案件詳細への deep link base URL。
+    // 例: "https://trycle-dashboard-pwa.vercel.app"。メール本文の {URL}/cases/<id>
+    // を組むのに使う (token は cookie 認証で別途・URL には機密を載せない)。
+    DASHBOARD_PUBLIC_URL?: string;
     // dashboard (Vercel) の会話履歴タブ → /api/cases/:caseId/messages 用の内部
     // 共有 token。dashboard 側 BOT_INTERNAL_TOKEN と同値。staff API key とは別。
     DASHBOARD_INTERNAL_TOKEN?: string;
