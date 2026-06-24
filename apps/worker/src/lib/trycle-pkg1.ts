@@ -46,6 +46,7 @@ import {
   getPkg1Session,
   upsertPkg1Session,
   clearPkg1Session,
+  claimPkg1Session,
   setPkg1Cart,
   getPkg1Cart,
   clearPkg1Cart,
@@ -533,6 +534,13 @@ async function onCartDecision(ctx: Pkg1Context, value: string | null): Promise<v
   }
   // 'confirm'
   if (session.cart.length === 0) {
+    // cart 空で確認に進めない異常系。region 選択へ倒すが、session も awaiting_region へ
+    // 進めておく (進めないと再提示した region ボタンが step 不一致で stale=無反応になる)。
+    await upsertPkg1Session(
+      repoEnv(ctx),
+      ctx.lineUserId,
+      advancePkg1(session, 'awaiting_region'),
+    );
     await safeReply(ctx, regionMessages(REGIONS), 'awaiting_region');
     return;
   }
@@ -574,6 +582,24 @@ async function finishPdfOnly(ctx: Pkg1Context, session: Pkg1State): Promise<void
     return;
   }
   const env = repoEnv(ctx);
+
+  // 確定の二重実行防止 (TOCTOU): pdf_only は cases + quote_versions + PDF を作る非冪等な
+  // 終端。Step ID ゲートの read-then-clear には窓があるため、保存に入る前に session を
+  // **原子的に claim** する。claim が空 = 既に別 request が確定済み → 完全 silent。
+  const claimed = await claimPkg1Session(env, ctx.lineUserId).catch((err) => {
+    console.error('[trycle-pkg1] claimPkg1Session (pdf_only) failed', err);
+    return session; // claim 自体が失敗したら従来どおり進める (フェイルオープン)
+  });
+  if (!claimed) {
+    console.log('[trycle-pkg1] pdf_only duplicate (session already claimed) → silent', ctx.lineUserId);
+    return;
+  }
+  // claim できた cart を正本に使う (claim と引数 session は同内容だが claim を優先)。
+  if (claimed.cart.length === 0) {
+    await restartToDispatch(ctx, '見積もりたい整備メニューを先にお選びください。');
+    return;
+  }
+  session = claimed;
   const quote = buildQuote(session.cart, await getTenantQuoteSettings(env));
 
   // 見積成立 (概算)。case 生成前に append → 同一 flow_id でバッファに積み、
@@ -611,7 +637,7 @@ async function finishPdfOnly(ctx: Pkg1Context, session: Pkg1State): Promise<void
   const pdfUrl = resolvePdfUrl(pdf, 'pdf_only', ctx.lineUserId);
   if (saved && pdfUrl) await updateQuotePdfUrl(env, saved, pdfUrl).catch((err) => console.error('[trycle-pkg1] updateQuotePdfUrl failed', err));
 
-  await clearPkg1Session(env, ctx.lineUserId).catch((err) => console.error('[trycle-pkg1] clearPkg1Session failed', err));
+  // session は claimPkg1Session で既に削除済み (冪等化)。追加の clear は不要。
 
   await safeReply(ctx, [
     textMessage(formatQuoteWithPdf(quote, pdfUrl)),

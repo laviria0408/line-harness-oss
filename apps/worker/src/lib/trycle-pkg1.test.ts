@@ -433,6 +433,22 @@ describe('pdf_only route (経路 D-1・v1.2.1 見積保存)', () => {
     expect(tables.cases).toHaveLength(1);
     expect(tables.cases[0].customer_id).toBe('cust-7');
   });
+
+  // 二重押下の冪等化 (H1): pdf_only も atomic claim で 2 回目は case を作らない。
+  it('pdf_only を 2 回押しても case は 1 件だけ (claimPkg1Session で TOCTOU を閉じる)', async () => {
+    await walkToConfirm();
+    // 1 回目: case 1 件作成・session は claim で削除。
+    await postback('action=pkg1_confirm&value=pdf_only&step=awaiting_confirm');
+    expect(tables.cases).toHaveLength(1);
+    expect(tables.quote_versions).toHaveLength(1);
+    const repliesAfterFirst = replied.length;
+    // 2 回目 (連打): session は claim 済みで無 → Step ID ゲートで stale silent。
+    // 仮にゲートをすり抜けても claimPkg1Session が空を返し silent。case は増えない。
+    await postback('action=pkg1_confirm&value=pdf_only&step=awaiting_confirm');
+    expect(tables.cases).toHaveLength(1);
+    expect(tables.quote_versions).toHaveLength(1);
+    expect(replied.length).toBe(repliesAfterFirst);
+  });
 });
 
 // ── 経路 D-2: 来店予定 → 同意書ゲート (来店予定押下直後) ───────────────────────

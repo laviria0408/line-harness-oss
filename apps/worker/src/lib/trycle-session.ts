@@ -182,6 +182,34 @@ export async function clearPkg1Session(
   });
 }
 
+/**
+ * Pkg1 見積 session を **原子的に claim** する (確定操作の二重実行防止)。
+ *
+ * pdf_only 確定 (`finishPdfOnly`) は cases + quote_versions + PDF を作る非冪等な終端。
+ * Step ID ゲートの read-then-clear は read と clear の間に窓があり、確定ボタンを連打
+ * すると 2 リクエストとも同 session を読んで 2 件保存しうる (TOCTOU)。来店予約確定と
+ * 同じく DELETE … RETURNING で「自分が消した行」を受け取り、行があれば最初の 1 回・
+ * 空なら 2 回目以降と判定する (PostgREST の DELETE は単一行をアトミックに消す)。
+ *
+ * @returns claim できた session state / 既に消費済みなら null。
+ */
+export async function claimPkg1Session(
+  env: TrycleRepoEnv,
+  lineUserId: string,
+): Promise<Pkg1State | null> {
+  const deleted = await supabaseDeleteReturning<{ state: Pkg1State }>(
+    env,
+    'bot_sessions',
+    {
+      tenant_id: `eq.${getTenantId(env)}`,
+      line_user_id: `eq.${lineUserId}`,
+      kind: `eq.${PKG1_SESSION_KIND}`,
+    },
+  );
+  const state = deleted[0]?.state;
+  return state ? normalizeState(state) : null;
+}
+
 // ── pkg1_cart (同意書未取得時の cart 永続化・経路 D-2) ─────────────────────────
 
 /**
