@@ -15,6 +15,7 @@
 import type { LineClient } from '@line-crm/line-sdk';
 import type { Env } from '../index.js';
 import { callGas, sendMail } from './trycle-gas-client.js';
+import { recordOutgoingMessages, type OutgoingLogEnv } from './trycle-outgoing-log.js';
 import type { TrycleRepoEnv } from './trycle-repo.js';
 import { findCustomerByLineUserId } from './trycle-repo.js';
 import { setManualMode } from './trycle-session.js';
@@ -399,9 +400,19 @@ function repoOf(ctx: StaffConsultContext): TrycleRepoEnv {
 async function reply(
   ctx: StaffConsultContext,
   messages: ReadonlyArray<{ type: string; [key: string]: unknown }>,
+  source: 'pkg1' | 'pkg8' = 'pkg1',
 ): Promise<void> {
   try {
     await ctx.lineClient.replyMessage(ctx.replyToken, messages as never);
+    // dashboard/admin の会話履歴で bot 側 (B1 内容確認ループの応答) を表示するため
+    // outgoing 記録は必須 (Pkg8 既存実装と同じく). 失敗しても LINE 送信成功は保つ。
+    await recordOutgoingMessages(
+      ctx.env as unknown as OutgoingLogEnv,
+      ctx.lineUserId,
+      messages,
+      'reply',
+      source,
+    ).catch((err) => console.error('[trycle-staff] recordOutgoingMessages failed', err));
   } catch (err) {
     console.error('[trycle-staff] reply failed', err);
   }

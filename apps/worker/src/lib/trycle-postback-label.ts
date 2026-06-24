@@ -47,6 +47,7 @@ const RESERVE_CONFIRM_LABELS: Readonly<Record<string, string>> = {
 const BARE_ACTION_LABELS: Readonly<Record<string, string>> = {
   pkg1_start: '整備見積もりを始める',
   pkg1_wage: '工賃の確認',
+  pkg1_staff: 'スタッフに相談',
   pkg8_start: 'よくある質問',
   faq_start: 'よくある質問',
   // Phase 4 各種予約 3 分岐 + 来店予定ゲート。
@@ -55,6 +56,9 @@ const BARE_ACTION_LABELS: Readonly<Record<string, string>> = {
   reservation_maintenance: 'メンテナンスの予約を選択',
   reservation_visit_start: 'その他（来店予約）を選択',
   reservation_visit_skip: 'ご来店内容の入力をスキップ',
+  // Phase 4 スタッフ相談共通フロー (B1 内容確認ループ・Pkg1 / Pkg8 共通)。
+  staff_consult_yes: 'この内容でスタッフに連携',
+  staff_consult_append: '相談内容に追記する',
 };
 
 /** 来店予定ゲート確定の分岐。 */
@@ -158,6 +162,20 @@ async function resolveAction(
       return value ? op(`ご来店日時「${formatVisitAt(value)}」を選択`) : op('ご来店時間を選択');
     case 'pkg1_reserve_confirm':
       return value && RESERVE_CONFIRM_LABELS[value] ? op(RESERVE_CONFIRM_LABELS[value]) : null;
+    // Phase 4 包括メンテゲート (A2): pkg1_overhaul (value=picker/matrix) と
+    //                              pkg1_overhaul_menu (value=laborId・メニュー確定)。
+    case 'pkg1_overhaul':
+      if (value === 'picker') return op('メニューの選択に進む');
+      if (value === 'matrix') return op('オーバーホールの違いを確認');
+      return null;
+    case 'pkg1_overhaul_menu':
+      return value ? op(`包括メンテのメニューを選択`) : null;
+    // Phase 4 「お悩み」マッチング (A1): value=pick:{index}/again/staff。
+    case 'pkg1_osayami':
+      if (value === 'again') return op('もう一度質問する');
+      if (value === 'staff') return op('スタッフに相談する');
+      if (value && value.startsWith('pick:')) return op('候補のメニューを選択');
+      return null;
     default:
       return null; // 未知の pkg1_ postback は翻訳しない (raw のまま)。
   }
