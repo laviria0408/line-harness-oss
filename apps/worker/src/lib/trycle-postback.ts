@@ -18,6 +18,7 @@ import type { LineClient } from '@line-crm/line-sdk';
 import type { Env } from '../index.js';
 import { handlePkg8Postback, isPkg8Postback } from './trycle-pkg8.js';
 import { handlePkg1Postback, isPkg1Postback } from './trycle-pkg1.js';
+import { startStaffConsultFromPkg1 } from './trycle-staff.js';
 import {
   handleReservationGatePostback,
   isReservationPostback,
@@ -56,6 +57,22 @@ export async function tryHandleTryclePostback(
       lineClient: ctx.lineClient,
       env: ctx.env as TrycleRepoEnv,
     });
+  }
+  // pkg1_staff (リッチメニュー「スタッフに相談」直接タップ): Phase 4 escalate refactor 後の
+  // 補完経路。handlePkg1Postback には対応 handler が無いため、ここで intercept して
+  // 共通スタッフ相談フロー (B1 内容確認ループ) に直接入る。
+  if (data === 'pkg1_staff') {
+    await startStaffConsultFromPkg1(
+      {
+        replyToken: ctx.replyToken,
+        lineUserId: ctx.lineUserId,
+        lineClient: ctx.lineClient,
+        env: ctx.env,
+      },
+      '',
+      'リッチメニューからスタッフ相談',
+    );
+    return true;
   }
   // Pkg1 (整備見積・本物モデル)
   if (isPkg1Postback(data)) {
