@@ -359,7 +359,7 @@ describe('Pkg1 全動線 E2E (postback wiring・経路 B→C→D)', () => {
     expect(last(captured)).toContain('もう一度はじめから');
   });
 
-  it('経路 D-2: reserve_confirm(change) で時間リストに戻る (date 維持)', async () => {
+  it('経路 D-2: reserve_confirm(change) で日付リストに戻る (user 確認 2026-06-24)', async () => {
     buildStatefulSupabase({ consentValid: true });
     const captured: unknown[][] = [];
     const ctx = fakeContext(captured);
@@ -376,7 +376,8 @@ describe('Pkg1 全動線 E2E (postback wiring・経路 B→C→D)', () => {
     await handlePkg1Postback(`action=pkg1_reserve_date&value=${date}`, ctx);
     await handlePkg1Postback(`action=pkg1_reserve_time&value=${dt}`, ctx);
     await handlePkg1Postback('action=pkg1_reserve_confirm&value=change', ctx);
-    expect(last(captured)).toContain(`action=pkg1_reserve_time&value=${date}t`);
+    // 仕様: 「別の日時にする」は常に日付選択へ戻す (同日別時間は直前 step rollback で表現)。
+    expect(last(captured)).toContain('action=pkg1_reserve_date&value=');
   });
 });
 

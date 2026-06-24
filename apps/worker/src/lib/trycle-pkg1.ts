@@ -878,21 +878,22 @@ async function onReservationConfirmed(ctx: Pkg1Context, value: string | null): P
   const env = repoEnv(ctx);
 
   if (value === 'change') {
-    // 「別の日時にする」は session を消さずに時間選択へ戻る (date は維持)。
+    // 「別の日時にする」を選んだ = 日付からやり直したい意図 (user 確認 2026-06-24)。
+    // 旧仕様は session.date が生きていれば時間選択に戻していたが、user 体感では
+    // 「別の日時」と書いてあるのに同じ日の別時間しか選べないのは違和感。
+    // 仕様: 「別の日時にする」は**常に日付選択へ戻す**。同じ日付で別時間にしたい
+    // ユーザは 1 つ前の step (時間選択 Flex 自体) が rollback 対象なので直前 step
+    // 許容ルートで時間を選び直せる (Step ID 方式の rollback 経路を使う)。
     const session = await getReservationSession(env, ctx.lineUserId);
     if (!session) return reservationLost(ctx);
     const store = session.storeId ? await findStoreById(env, session.storeId) : null;
     if (!store) return reservationLost(ctx);
-    // 元の date にまだ枠があれば時間選択へ、無ければ日付選択へ戻す。session.step は
-    // 再提示する画面と一致させる (Step ID ゲートの整合)。
-    const day = session.date ? findVisitDay(store, session.date) : null;
-    const backStep: ReservationStep = day && day.slots.length > 0 ? 'awaiting_time' : 'awaiting_date';
     await setReservationSession(
       env,
       ctx.lineUserId,
-      advanceReservation(session, backStep, { visitAtIso: undefined }),
+      advanceReservation(session, 'awaiting_date', { visitAtIso: undefined, date: undefined }),
     );
-    await reofferTimeOrDate(ctx, store, session.date ?? null, '別の時間をお選びください。');
+    await reofferTimeOrDate(ctx, store, null, '別の日付をお選びください。');
     return;
   }
   if (value !== 'ok') return;

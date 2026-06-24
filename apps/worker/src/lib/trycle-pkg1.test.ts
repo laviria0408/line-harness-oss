@@ -568,7 +568,7 @@ describe('reservation flow (店舗 → 日付 → 時間 → 確認)', () => {
     expect(tables.cases).toHaveLength(0);
   });
 
-  it('「別の日時にする」 returns to the time list keeping the date', async () => {
+  it('「別の日時にする」 returns to the date list (user 確認 2026-06-24)', async () => {
     await reachStoreSelection();
     await postback('action=pkg1_reserve_store&value=s1');
     const dt = nextMondayAt14();
@@ -576,10 +576,11 @@ describe('reservation flow (店舗 → 日付 → 時間 → 確認)', () => {
     await postback(`action=pkg1_reserve_date&value=${date}`);
     await postback(`action=pkg1_reserve_time&value=${dt}`);
     await postback('action=pkg1_reserve_confirm&value=change');
-    expect(lastReplyText()).toContain('別の時間をお選びください');
-    // 同じ日の time list に戻る (date 維持)。
-    expect(lastReplyAny()).toContain(`action=pkg1_reserve_time&value=${date}t`);
-    expect(sessionReservationStep()).toBe('awaiting_time');
+    // 仕様: 「別の日時にする」は user が日付を変えたい意図 → 常に日付選択へ戻す。
+    // 同日別時間は直前 step rollback (時間選択 Flex 自体に戻る) で表現する。
+    expect(lastReplyText()).toContain('別の日付をお選びください');
+    expect(lastReplyAny()).toContain('action=pkg1_reserve_date&value=');
+    expect(sessionReservationStep()).toBe('awaiting_date');
     expect(tables.cases).toHaveLength(0);
   });
 
