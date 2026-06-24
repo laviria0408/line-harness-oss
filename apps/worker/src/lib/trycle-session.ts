@@ -69,11 +69,19 @@ export interface PendingSelection {
 /**
  * Pkg1 セッション state。cart は本物 `QuoteLineItem[]` (name/unitPrice/qty/amount …)。
  * variant ラベル・open-ended の「〜」は name に埋め込む (buildLineItemFromPending)。
+ *
+ * `step` が「いま待っている step (= current step ID)」、`previousStep` が「1 つ前の
+ * step」(Step ID 流入制御の rollback 許容用・2026-06-24)。Flex の postback data に
+ * 埋めた step を `evaluateStep(received, step, previousStep)` で突き合わせ、古ボタン /
+ * 連打を stale として silent に落とす (trycle-step.ts)。previousStep は後方互換のため
+ * optional (古い session は undefined = rollback 不可・advance/stale のみ)。
  */
 export interface Pkg1State {
   readonly step: Pkg1Step;
   readonly cart: QuoteLineItem[];
   readonly pending?: PendingSelection;
+  /** Step ID 流入制御: 1 つ前の step (rollback 許容用)。 */
+  readonly previousStep?: Pkg1Step;
 }
 
 interface BotSessionRow {
@@ -104,6 +112,8 @@ export interface ReservationState {
   readonly date?: string;
   /** "YYYY-MM-DDtHH:mm" (選択した来店日時)。 */
   readonly visitAtIso?: string;
+  /** Step ID 流入制御: 1 つ前の step (rollback 許容用・2026-06-24)。 */
+  readonly previousStep?: ReservationStep;
 }
 
 /** 空の Pkg1 セッション初期値 (本物 startFlow: awaiting_dispatch + 空 cart)。 */
@@ -453,6 +463,7 @@ function normalizeState(state: Partial<Pkg1State> | null | undefined): Pkg1State
     step: state?.step ?? 'awaiting_dispatch',
     cart: Array.isArray(state?.cart) ? state!.cart : [],
     pending: state?.pending,
+    previousStep: state?.previousStep,
   };
 }
 

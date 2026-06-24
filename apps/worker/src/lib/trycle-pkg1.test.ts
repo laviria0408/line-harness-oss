@@ -312,6 +312,95 @@ describe('full identified flow', () => {
   });
 });
 
+// ── Step ID 流入制御 (2026-06-24 真因: 連打 / 古ボタン / 再発行) ───────────────
+//
+// 実機の Flex postback は `&step=<待ち step>` を埋めて飛ぶ。dispatcher はこれを
+// session の current/previous step と突き合わせ、古い Flex のボタン (stale) を
+// 完全 silent に落とす。ここではその step 付き postback を直接投げてゲートを検証する。
+
+describe('Step ID 流入制御 (連打 / 古ボタン / 再発行 を統一防止)', () => {
+  // region 選択まで進める (session.step = awaiting_symptom)。
+  async function reachSymptom() {
+    await postback('pkg1_start');
+    await postback('action=pkg1_dispatch&value=identified&step=awaiting_dispatch');
+    await postback('action=pkg1_region&value=brake&step=awaiting_region');
+    // ここで session は awaiting_symptom 待ち (previous=awaiting_region)。
+  }
+
+  it('連打: 2 手以上前の symptom ボタンを押すと stale → 完全 silent (reply 増えない)', async () => {
+    await postback('pkg1_start');
+    await postback('action=pkg1_dispatch&value=identified&step=awaiting_dispatch');
+    await postback('action=pkg1_region&value=brake&step=awaiting_region');
+    // symptom (variants 有り) を選ぶ → session は awaiting_variant・previous=awaiting_symptom。
+    await postback(`action=pkg1_symptom&value=${BRAKE_ADJUST}&step=awaiting_symptom`);
+    expect(sessionStep()).toBe('awaiting_variant');
+    const before = replied.length;
+    // ここで 2 手前の region ボタン (step=awaiting_region) を押す。current=awaiting_variant /
+    // previous=awaiting_symptom のどちらでもない → stale → silent。
+    await postback('action=pkg1_region&value=drivetrain&step=awaiting_region');
+    expect(replied.length).toBe(before);
+    expect(sessionStep()).toBe('awaiting_variant'); // state は動かない
+  });
+
+  it('古ボタン: 数手前の dispatch ボタンを押しても stale → silent', async () => {
+    await reachSymptom();
+    expect(sessionStep()).toBe('awaiting_symptom');
+    const before = replied.length;
+    // 遡って 2 手前の dispatch ボタン (step=awaiting_dispatch) を押す。
+    await postback('action=pkg1_dispatch&value=identified&step=awaiting_dispatch');
+    expect(replied.length).toBe(before); // silent
+    expect(sessionStep()).toBe('awaiting_symptom');
+  });
+
+  it('直前 step (1 つ前) のボタンは rollback で受理される', async () => {
+    await reachSymptom();
+    // session.step=awaiting_symptom / previous=awaiting_region。
+    // 直前 (awaiting_region) のボタンを押し直す = 部位を選び直す → rollback で受理。
+    const before = replied.length;
+    await postback('action=pkg1_region&value=drivetrain&step=awaiting_region');
+    expect(replied.length).toBeGreaterThan(before); // 応答が返る (silent でない)
+    // drivetrain の作業一覧が出て、session は awaiting_symptom を再び待つ。
+    expect(sessionStep()).toBe('awaiting_symptom');
+    expect(lastReplyText()).toContain('action=pkg1_symptom');
+  });
+
+  it('完了済み (session 無) の古ボタンは stale → silent', async () => {
+    await reachSymptom();
+    // フロー完了相当: session を消す。
+    tables.bot_sessions = tables.bot_sessions.filter((r) => r.kind !== 'pkg1_estimate');
+    const before = replied.length;
+    // step 付きの古ボタンを押す。session が無いので stale → silent。
+    await postback('action=pkg1_symptom&value=0&step=awaiting_symptom');
+    expect(replied.length).toBe(before);
+  });
+
+  it('正常進行: step が一致すれば advance (通常処理)', async () => {
+    await reachSymptom();
+    const before = replied.length;
+    await postback('action=pkg1_symptom&value=0&step=awaiting_symptom');
+    expect(replied.length).toBeGreaterThan(before); // 応答あり
+  });
+
+  it('cart 追加後の qty ボタン再押下は stale → 明細が二重に積まれない', async () => {
+    // 数量ステップを持つ symptom (spoke-swap) で cart へ 1 件積む。
+    await postback('pkg1_start');
+    await postback('action=pkg1_dispatch&value=identified&step=awaiting_dispatch');
+    await postback('action=pkg1_region&value=wheel&step=awaiting_region');
+    await postback(`action=pkg1_symptom&value=${SPOKE_SWAP}&step=awaiting_symptom`);
+    expect(sessionStep()).toBe('awaiting_qty');
+    // qty 選択 → cart へ 1 件追加・session は awaiting_cart_decision (previousStep は畳む)。
+    await postback('action=pkg1_qty&value=2&step=awaiting_qty');
+    expect(sessionStep()).toBe('awaiting_cart_decision');
+    expect(cart()).toHaveLength(1);
+    const before = replied.length;
+    // 画面に残った古い qty ボタンを再度押す。current=awaiting_cart_decision /
+    // previous=undefined なので stale → silent。明細は二重に積まれない。
+    await postback('action=pkg1_qty&value=2&step=awaiting_qty');
+    expect(replied.length).toBe(before);
+    expect(cart()).toHaveLength(1); // 1 件のまま
+  });
+});
+
 // ── 経路 D-1: pdf_only (cases + quote_versions 保存・session 削除) ─────────────
 
 describe('pdf_only route (経路 D-1・v1.2.1 見積保存)', () => {
@@ -527,6 +616,27 @@ describe('reservation flow (店舗 → 日付 → 時間 → 確認)', () => {
     expect(tables.cases).toHaveLength(0);
     // 直近確定マーカーが無い空 claim は失効として graceful 導線 (reservationLost)。
     expect(lastReplyText()).toContain('もう一度はじめから');
+  });
+
+  // ── Step ID ゲートによる二重押下防止 (claim より前段で止まる多層防御) ─────────
+  it('step 付き confirm=ok の 2 回目は Step ID ゲートで silent (case 1 件のまま)', async () => {
+    await reachStoreSelection();
+    await postback('action=pkg1_reserve_store&value=s1&step=awaiting_store');
+    const dt = nextMondayAt14();
+    const date = dt.slice(0, 10);
+    await postback(`action=pkg1_reserve_date&value=${date}&step=awaiting_date`);
+    await postback(`action=pkg1_reserve_time&value=${dt}&step=awaiting_time`);
+
+    // 1 回目: 確定 (advance) → reservation session は削除される。
+    await postback('action=pkg1_reserve_confirm&value=ok&step=awaiting_confirm');
+    expect(tables.cases).toHaveLength(1);
+    const repliesAfterFirst = replied.length;
+
+    // 2 回目: reservation session が無いので Step ID ゲートが stale 判定 → silent。
+    // (claim/done マーカーに到達する前段で止まる多層防御)。
+    await postback('action=pkg1_reserve_confirm&value=ok&step=awaiting_confirm');
+    expect(tables.cases).toHaveLength(1);
+    expect(replied.length).toBe(repliesAfterFirst);
   });
 });
 

@@ -58,9 +58,12 @@ import {
   emptyPkg1State,
   cartSubtotal,
   type Pkg1State,
+  type Pkg1Step,
   type PendingSelection,
   type ReservationState,
+  type ReservationStep,
 } from './trycle-session.js';
+import { evaluateStep, injectStepIntoMessages, parseStep } from './trycle-step.js';
 import { jstWallToIsoZ, parseJstDatetime, validateVisitAt } from './trycle-store-hours.js';
 import { generateVisitDays, nowJst, type VisitDay } from './trycle-visit-slots.js';
 import { notifyStaff } from './trycle-staff.js';
@@ -149,9 +152,21 @@ async function route(data: string, ctx: Pkg1Context): Promise<void> {
   const action = parseAction(data);
   const value = parseValue(data);
 
-  // 入口 / メニュー (素の postback)
+  // 入口 / メニュー (素の postback) は Step ID ゲートを通さない。Rich Menu からの
+  // 開始・来店時補完はいつ押されてもフローを (再) 開始してよい操作のため。
   if (action === 'pkg1_start') return startFlow(ctx);
   if (action === 'pkg1_wage') return startConsentLiff(ctx);
+
+  // ── Step ID 流入制御 (2026-06-24 真因) ─────────────────────────────────────
+  // 受信 postback に埋めた step を session の current(step)/previous(previousStep) と
+  // 突き合わせ、古い Flex のボタン (stale) を完全 silent に落とす。advance/rollback の
+  // ときだけ handler を実行する。連打 2 回目は session が既に次 step へ進んでいるため
+  // 1 回目の step は stale となり silent。
+  const gate = await evaluateStepGate(data, action, ctx);
+  if (gate === 'stale') {
+    console.log('[trycle-pkg1] stale step → silent no-op', JSON.stringify({ action, step: parseStep(data) }));
+    return;
+  }
 
   // 来店予定フロー (本物 handleReservationPostback に委譲相当)
   if (action.startsWith('pkg1_reserve_')) return handleReservationPostback(action, value, ctx);
@@ -176,6 +191,102 @@ async function route(data: string, ctx: Pkg1Context): Promise<void> {
   }
 }
 
+// ── Step ID 流入制御の gate ───────────────────────────────────────────────────
+
+/** Pkg1 見積フローの action → その action が押せる正しい step。 */
+const PKG1_ACTION_STEP: Readonly<Record<string, Pkg1Step>> = {
+  pkg1_dispatch: 'awaiting_dispatch',
+  pkg1_region: 'awaiting_region',
+  pkg1_symptom: 'awaiting_symptom',
+  pkg1_variant: 'awaiting_variant',
+  pkg1_qty: 'awaiting_qty',
+  pkg1_cart: 'awaiting_cart_decision',
+  pkg1_confirm: 'awaiting_confirm',
+};
+
+/** 来店予定フローの action → その action が押せる正しい step。 */
+const RESERVE_ACTION_STEP: Readonly<Record<string, ReservationStep>> = {
+  pkg1_reserve_store: 'awaiting_store',
+  pkg1_reserve_date: 'awaiting_date',
+  pkg1_reserve_time: 'awaiting_time',
+  pkg1_reserve_confirm: 'awaiting_confirm',
+};
+
+type StepGateDecision = 'advance' | 'rollback' | 'stale' | 'pass';
+
+/**
+ * 受信 postback の step を session の current/previous step と突き合わせて流入を判定する。
+ *
+ * - step を持つ flow postback (pkg1_* / pkg1_reserve_*) のみガードする。
+ * - 'pass' = ガード対象外 (未知 action 等)。route の switch default に流す。
+ * - 後方互換: step が埋まっていない (deploy 跨ぎの旧 Flex) postback は、session の
+ *   現 step が「その action が想定する step」と一致するときだけ通す (= advance)。
+ *   一致しなければ stale (silent)。これで旧ボタンの逆走も塞ぐ。
+ */
+async function evaluateStepGate(
+  data: string,
+  action: string,
+  ctx: Pkg1Context,
+): Promise<StepGateDecision> {
+  const received = parseStep(data);
+
+  if (action.startsWith('pkg1_reserve_')) {
+    const expected = RESERVE_ACTION_STEP[action];
+    if (!expected) return 'pass';
+    const session = await getReservationSession(repoEnv(ctx), ctx.lineUserId).catch(() => null);
+    return decideStepGate(received, expected, session?.step ?? null, session?.previousStep ?? null);
+  }
+
+  const expected = PKG1_ACTION_STEP[action];
+  if (!expected) return 'pass';
+  const session = await getPkg1Session(repoEnv(ctx), ctx.lineUserId).catch(() => null);
+  return decideStepGate(received, expected, session?.step ?? null, session?.previousStep ?? null);
+}
+
+/**
+ * step 突き合わせの中核。received (受信 step) が無いとき (旧 Flex) は expected と
+ * current の一致で代替判定する (後方互換)。それ以外は evaluateStep に委ねる。
+ */
+function decideStepGate(
+  received: string | null,
+  expected: string,
+  current: string | null,
+  previous: string | null,
+): StepGateDecision {
+  if (received === null) {
+    // 旧 Flex (step 未埋め込み・deploy 跨ぎ): 厳密に塞ぐと in-flight フローを壊すため
+    // 緩めの後方互換にする。
+    //   - session 無し (current=null): stale と断定できない (新規 tap かも) → handler に委ねる
+    //   - session 有り: その action が想定する step に居れば advance / 居なければ stale
+    //     (= 進んだ session に古いボタンが来た逆走を塞ぐ)
+    if (current === null) return 'advance';
+    return current === expected ? 'advance' : 'stale';
+  }
+  return evaluateStep(received, current, previous);
+}
+
+/**
+ * Pkg1 見積 session を次 step へ進めた新 state を返す (immutable)。今の step を
+ * `previousStep` に退避し、Step ID の rollback 許容 (直前 step のボタンを 1 つ前へ
+ * 戻す) を成立させる。`patch` で pending 等を同時に差し替える。
+ */
+function advancePkg1(
+  session: Pkg1State,
+  nextStep: Pkg1Step,
+  patch: Partial<Pkg1State> = {},
+): Pkg1State {
+  return { ...session, previousStep: session.step, step: nextStep, ...patch };
+}
+
+/** 来店予定 session を次 step へ進めた新 state を返す (previousStep を退避)。 */
+function advanceReservation(
+  session: ReservationState,
+  nextStep: ReservationStep,
+  patch: Partial<ReservationState> = {},
+): ReservationState {
+  return { ...session, previousStep: session.step, step: nextStep, ...patch };
+}
+
 // ── ① 開始 → 状況ふりわけ (REQ-PKG1-002) ──────────────────────────────────────
 
 async function startFlow(ctx: Pkg1Context): Promise<void> {
@@ -189,7 +300,21 @@ async function startFlow(ctx: Pkg1Context): Promise<void> {
     text: '整備見積を依頼',
     startNewFlow: true,
   });
-  await safeReply(ctx, [dispatchPrompt()]);
+  await safeReply(ctx, [dispatchPrompt()], 'awaiting_dispatch');
+}
+
+/**
+ * 失効/エラー導線で「状況ふりわけ 3 択」を再提示する共通 helper。dispatchPrompt の
+ * postback を確実に押せるように、session を空の `awaiting_dispatch` へ作り直してから
+ * step を埋め込む (Step ID ゲートが silent に落とさないようにする)。lead は前置きの
+ * 文言 (省略可)。
+ */
+async function restartToDispatch(ctx: Pkg1Context, lead?: string): Promise<void> {
+  await upsertPkg1Session(repoEnv(ctx), ctx.lineUserId, emptyPkg1State()).catch((err) =>
+    console.error('[trycle-pkg1] restartToDispatch upsertPkg1Session failed', err),
+  );
+  const messages: LineMessage[] = lead ? [textMessage(lead), dispatchPrompt()] : [dispatchPrompt()];
+  await safeReply(ctx, messages, 'awaiting_dispatch');
 }
 
 async function onDispatch(ctx: Pkg1Context, value: string | null): Promise<void> {
@@ -207,12 +332,12 @@ async function onDispatch(ctx: Pkg1Context, value: string | null): Promise<void>
     return;
   }
 
-  await upsertPkg1Session(repoEnv(ctx), ctx.lineUserId, {
-    ...(await currentSession(ctx)),
-    step: 'awaiting_region',
-    pending: undefined,
-  });
-  await safeReply(ctx, regionMessages(REGIONS));
+  await upsertPkg1Session(
+    repoEnv(ctx),
+    ctx.lineUserId,
+    advancePkg1(await currentSession(ctx), 'awaiting_region', { pending: undefined }),
+  );
+  await safeReply(ctx, regionMessages(REGIONS), 'awaiting_region');
 }
 
 // ── ② 部位選択 (REQ-PKG1-004) ─────────────────────────────────────────────────
@@ -220,7 +345,7 @@ async function onDispatch(ctx: Pkg1Context, value: string | null): Promise<void>
 async function onRegion(ctx: Pkg1Context, value: string | null): Promise<void> {
   const region = value ? findRegionByValue(value) : undefined;
   if (!region) {
-    await safeReply(ctx, regionMessages(REGIONS));
+    await safeReply(ctx, regionMessages(REGIONS), 'awaiting_region');
     return;
   }
   // 「その他（自由記述）」はスタッフ送り (REQ-PKG1-018)。選択した部位ラベルを
@@ -229,12 +354,14 @@ async function onRegion(ctx: Pkg1Context, value: string | null): Promise<void> {
     return finishWithEscalation(ctx, region.label);
   }
   const session = await currentSession(ctx);
-  await upsertPkg1Session(repoEnv(ctx), ctx.lineUserId, {
-    ...session,
-    step: 'awaiting_symptom',
-    pending: { regionValue: region.value, symptomIndex: -1 },
-  });
-  await safeReply(ctx, symptomMessages(region));
+  await upsertPkg1Session(
+    repoEnv(ctx),
+    ctx.lineUserId,
+    advancePkg1(session, 'awaiting_symptom', {
+      pending: { regionValue: region.value, symptomIndex: -1 },
+    }),
+  );
+  await safeReply(ctx, symptomMessages(region), 'awaiting_symptom');
 }
 
 // ── ③ 作業選択 (REQ-PKG1-005) ─────────────────────────────────────────────────
@@ -246,19 +373,20 @@ async function onSymptom(ctx: Pkg1Context, value: string | null): Promise<void> 
   const symptomIndex = value ? Number.parseInt(value, 10) : NaN;
   const symptom = region?.symptoms?.[symptomIndex];
   if (!region || !symptom) {
-    await safeReply(ctx, region ? symptomMessages(region) : regionMessages(REGIONS));
+    if (region) await safeReply(ctx, symptomMessages(region), 'awaiting_symptom');
+    else await safeReply(ctx, regionMessages(REGIONS), 'awaiting_region');
     return;
   }
   const pending: PendingSelection = { ...session.pending, symptomIndex };
 
   // variants があれば種類を選ばせる。
   if (symptom.variants && symptom.variants.length > 0) {
-    await upsertPkg1Session(repoEnv(ctx), ctx.lineUserId, {
-      ...session,
-      step: 'awaiting_variant',
-      pending,
-    });
-    await safeReply(ctx, variantMessages(symptom));
+    await upsertPkg1Session(
+      repoEnv(ctx),
+      ctx.lineUserId,
+      advancePkg1(session, 'awaiting_variant', { pending }),
+    );
+    await safeReply(ctx, variantMessages(symptom), 'awaiting_variant');
     return;
   }
   // sample=null (「その他」) は確定額を出さずスタッフ送り (REQ-PKG1-018)。
@@ -279,7 +407,7 @@ async function onVariant(ctx: Pkg1Context, value: string | null): Promise<void> 
   const variantIndex = value ? Number.parseInt(value, 10) : NaN;
   const variant = symptom?.variants?.[variantIndex];
   if (!region || !symptom || !variant) {
-    if (symptom) await safeReply(ctx, variantMessages(symptom));
+    if (symptom) await safeReply(ctx, variantMessages(symptom), 'awaiting_variant');
     return;
   }
   if (!variant.sample) {
@@ -297,12 +425,12 @@ async function resolveAfterSelection(
   pending: PendingSelection,
 ): Promise<void> {
   if (symptom.qty) {
-    await upsertPkg1Session(repoEnv(ctx), ctx.lineUserId, {
-      ...session,
-      step: 'awaiting_qty',
-      pending,
-    });
-    await safeReply(ctx, [qtyPrompt(symptom)]);
+    await upsertPkg1Session(
+      repoEnv(ctx),
+      ctx.lineUserId,
+      advancePkg1(session, 'awaiting_qty', { pending }),
+    );
+    await safeReply(ctx, [qtyPrompt(symptom)], 'awaiting_qty');
     return;
   }
   return addLineItemAndAskCart(ctx, { ...session, pending }, 1);
@@ -319,7 +447,7 @@ async function onQty(ctx: Pkg1Context, value: string | null): Promise<void> {
   // v1.2.1: 3 本以上のスタッフ送りは廃止。任意数量を通常 cart に積む。
   const qty = value ? Number.parseInt(value, 10) : NaN;
   if (!Number.isFinite(qty) || qty < 1) {
-    await safeReply(ctx, [qtyPrompt(symptom)]);
+    await safeReply(ctx, [qtyPrompt(symptom)], 'awaiting_qty');
     return;
   }
   return addLineItemAndAskCart(ctx, session, qty);
@@ -339,7 +467,7 @@ export async function handlePkg1Text(text: string, ctx: Pkg1Context): Promise<bo
     await safeReply(ctx, [
       textMessage('本数を半角数字でお送りください（例: 3）。'),
       qtyPrompt(symptom),
-    ]);
+    ], 'awaiting_qty');
     return true;
   }
   await addLineItemAndAskCart(ctx, session, qty);
@@ -373,31 +501,48 @@ async function addLineItemAndAskCart(
     text: qty > 1 ? `${item.name} ×${qty}` : item.name,
   });
 
+  // cart 追加は非冪等 (re-tap で明細が二重に積まれる)。awaiting_cart_decision へ進む
+  // ときは previousStep を畳んで「直前の qty/variant ボタンへの rollback」を塞ぐ
+  // (rollback で onQty/onVariant が再走すると同じ明細をもう 1 行積んでしまうため)。
+  // 戻りたい場合はカート画面の「他の整備も追加」「やり直す」を使う。
   await upsertPkg1Session(repoEnv(ctx), ctx.lineUserId, {
     ...session,
     cart,
     step: 'awaiting_cart_decision',
+    previousStep: undefined,
     pending: undefined,
   });
   const taxOptions = await getTenantQuoteSettings(repoEnv(ctx));
-  await safeReply(ctx, [textMessage(cartSummaryText(cart, taxOptions)), cartDecisionPrompt()]);
+  await safeReply(
+    ctx,
+    [textMessage(cartSummaryText(cart, taxOptions)), cartDecisionPrompt()],
+    'awaiting_cart_decision',
+  );
 }
 
 async function onCartDecision(ctx: Pkg1Context, value: string | null): Promise<void> {
   const session = await currentSession(ctx);
   if (value === 'add') {
-    await upsertPkg1Session(repoEnv(ctx), ctx.lineUserId, { ...session, step: 'awaiting_region' });
-    await safeReply(ctx, regionMessages(REGIONS));
+    await upsertPkg1Session(
+      repoEnv(ctx),
+      ctx.lineUserId,
+      advancePkg1(session, 'awaiting_region'),
+    );
+    await safeReply(ctx, regionMessages(REGIONS), 'awaiting_region');
     return;
   }
   // 'confirm'
   if (session.cart.length === 0) {
-    await safeReply(ctx, regionMessages(REGIONS));
+    await safeReply(ctx, regionMessages(REGIONS), 'awaiting_region');
     return;
   }
-  await upsertPkg1Session(repoEnv(ctx), ctx.lineUserId, { ...session, step: 'awaiting_confirm' });
+  await upsertPkg1Session(
+    repoEnv(ctx),
+    ctx.lineUserId,
+    advancePkg1(session, 'awaiting_confirm'),
+  );
   const taxOptions = await getTenantQuoteSettings(repoEnv(ctx));
-  await safeReply(ctx, confirmMessages(session.cart, taxOptions));
+  await safeReply(ctx, confirmMessages(session.cart, taxOptions), 'awaiting_confirm');
 }
 
 // ── 確認 → 3 択 (REQ-PKG1-009/011) ────────────────────────────────────────────
@@ -406,16 +551,15 @@ async function onConfirm(ctx: Pkg1Context, value: string | null): Promise<void> 
   const session = await currentSession(ctx);
 
   if (value === 'redo') {
-    await upsertPkg1Session(repoEnv(ctx), ctx.lineUserId, {
-      ...session,
-      cart: [],
-      step: 'awaiting_region',
-      pending: undefined,
-    });
+    await upsertPkg1Session(
+      repoEnv(ctx),
+      ctx.lineUserId,
+      advancePkg1(session, 'awaiting_region', { cart: [], pending: undefined }),
+    );
     await safeReply(ctx, [
       textMessage('承知しました。あらためてご希望の整備をお選びください。'),
       ...regionMessages(REGIONS),
-    ]);
+    ], 'awaiting_region');
     return;
   }
   if (value === 'pdf_only') return finishPdfOnly(ctx, session);
@@ -426,7 +570,7 @@ async function onConfirm(ctx: Pkg1Context, value: string | null): Promise<void> 
 
 async function finishPdfOnly(ctx: Pkg1Context, session: Pkg1State): Promise<void> {
   if (session.cart.length === 0) {
-    await safeReply(ctx, [textMessage('見積もりたい整備メニューを先にお選びください。'), dispatchPrompt()]);
+    await restartToDispatch(ctx, '見積もりたい整備メニューを先にお選びください。');
     return;
   }
   const env = repoEnv(ctx);
@@ -479,7 +623,7 @@ async function finishPdfOnly(ctx: Pkg1Context, session: Pkg1State): Promise<void
 
 async function enterReservation(ctx: Pkg1Context, session: Pkg1State): Promise<void> {
   if (session.cart.length === 0) {
-    await safeReply(ctx, [textMessage('見積もりたい整備メニューを先にお選びください。'), dispatchPrompt()]);
+    await restartToDispatch(ctx, '見積もりたい整備メニューを先にお選びください。');
     return;
   }
   const env = repoEnv(ctx);
@@ -539,10 +683,13 @@ export async function resumeReservationAfterConsent(
   await setReservationSession(repo, lineUserId, { step: 'awaiting_store', cart }).catch((err) => console.error('[trycle-pkg1] setReservationSession failed', err));
   await clearPkg1Cart(repo, lineUserId).catch((err) => console.error('[trycle-pkg1] clearPkg1Cart failed', err));
   await clearPkg1Session(repo, lineUserId).catch((err) => console.error('[trycle-pkg1] clearPkg1Session failed', err));
-  const pushed = [
-    textMessage('ご登録ありがとうございました。\nご来店店舗をお選びください。'),
-    reservationStoreCarousel(stores),
-  ];
+  const pushed = injectStepIntoMessages(
+    [
+      textMessage('ご登録ありがとうございました。\nご来店店舗をお選びください。'),
+      reservationStoreCarousel(stores),
+    ],
+    'awaiting_store',
+  );
   try {
     await lineClient.pushMessage(lineUserId, pushed as never);
   } catch (err) {
@@ -568,7 +715,11 @@ async function startReservationFlow(ctx: Pkg1Context, cart: QuoteLineItem[]): Pr
     return;
   }
   await setReservationSession(env, ctx.lineUserId, { step: 'awaiting_store', cart });
-  await safeReply(ctx, [textMessage('ご来店店舗をお選びください。'), reservationStoreCarousel(stores)]);
+  await safeReply(
+    ctx,
+    [textMessage('ご来店店舗をお選びください。'), reservationStoreCarousel(stores)],
+    'awaiting_store',
+  );
 }
 
 async function handleReservationPostback(
@@ -600,15 +751,17 @@ async function onStoreSelected(ctx: Pkg1Context, storeId: string | null): Promis
   const store = await findStoreById(env, storeId);
   if (!store) return reservationLost(ctx);
 
-  await setReservationSession(env, ctx.lineUserId, {
-    ...session,
-    step: 'awaiting_date',
-    storeId: store.id,
-    storeName: store.name,
-    date: undefined,
-    visitAtIso: undefined,
-  });
-  await safeReply(ctx, [reservationDateList(store, generateVisitDays(store, nowJst()))]);
+  await setReservationSession(
+    env,
+    ctx.lineUserId,
+    advanceReservation(session, 'awaiting_date', {
+      storeId: store.id,
+      storeName: store.name,
+      date: undefined,
+      visitAtIso: undefined,
+    }),
+  );
+  await safeReply(ctx, [reservationDateList(store, generateVisitDays(store, nowJst()))], 'awaiting_date');
 }
 
 // ── ② 日付選択 → 時間候補 ──────────────────────────────────────────────────────
@@ -627,17 +780,16 @@ async function onDateSelected(ctx: Pkg1Context, date: string | null): Promise<vo
     await safeReply(ctx, [
       textMessage('恐れ入りますが、別の日をお選びください。'),
       reservationDateList(store, generateVisitDays(store, nowJst())),
-    ]);
+    ], 'awaiting_date');
     return;
   }
 
-  await setReservationSession(env, ctx.lineUserId, {
-    ...session,
-    step: 'awaiting_time',
-    date,
-    visitAtIso: undefined,
-  });
-  await safeReply(ctx, [reservationTimeList(store, day)]);
+  await setReservationSession(
+    env,
+    ctx.lineUserId,
+    advanceReservation(session, 'awaiting_time', { date, visitAtIso: undefined }),
+  );
+  await safeReply(ctx, [reservationTimeList(store, day)], 'awaiting_time');
 }
 
 // ── ③ 時間選択 → 確認 ──────────────────────────────────────────────────────────
@@ -657,13 +809,15 @@ async function onTimeSelected(ctx: Pkg1Context, datetime: string | null): Promis
     return;
   }
 
-  await setReservationSession(env, ctx.lineUserId, {
-    ...session,
-    step: 'awaiting_confirm',
-    storeName: store.name,
-    visitAtIso: datetime,
-  });
-  await safeReply(ctx, [reservationConfirmPrompt(store.name, datetime)]);
+  await setReservationSession(
+    env,
+    ctx.lineUserId,
+    advanceReservation(session, 'awaiting_confirm', {
+      storeName: store.name,
+      visitAtIso: datetime,
+    }),
+  );
+  await safeReply(ctx, [reservationConfirmPrompt(store.name, datetime)], 'awaiting_confirm');
 }
 
 /** session の date から VisitDay を引く。無効/未存在は null。 */
@@ -684,13 +838,14 @@ async function reofferTimeOrDate(
 ): Promise<void> {
   const day = date ? findVisitDay(store, date) : null;
   if (day && day.slots.length > 0) {
-    await safeReply(ctx, [textMessage(lead), reservationTimeList(store, day)]);
+    await safeReply(ctx, [textMessage(lead), reservationTimeList(store, day)], 'awaiting_time');
     return;
   }
-  await safeReply(ctx, [
-    textMessage(lead),
-    reservationDateList(store, generateVisitDays(store, nowJst())),
-  ]);
+  await safeReply(
+    ctx,
+    [textMessage(lead), reservationDateList(store, generateVisitDays(store, nowJst()))],
+    'awaiting_date',
+  );
 }
 
 async function onReservationConfirmed(ctx: Pkg1Context, value: string | null): Promise<void> {
@@ -702,7 +857,15 @@ async function onReservationConfirmed(ctx: Pkg1Context, value: string | null): P
     if (!session) return reservationLost(ctx);
     const store = session.storeId ? await findStoreById(env, session.storeId) : null;
     if (!store) return reservationLost(ctx);
-    await setReservationSession(env, ctx.lineUserId, { ...session, step: 'awaiting_time', visitAtIso: undefined });
+    // 元の date にまだ枠があれば時間選択へ、無ければ日付選択へ戻す。session.step は
+    // 再提示する画面と一致させる (Step ID ゲートの整合)。
+    const day = session.date ? findVisitDay(store, session.date) : null;
+    const backStep: ReservationStep = day && day.slots.length > 0 ? 'awaiting_time' : 'awaiting_date';
+    await setReservationSession(
+      env,
+      ctx.lineUserId,
+      advanceReservation(session, backStep, { visitAtIso: undefined }),
+    );
     await reofferTimeOrDate(ctx, store, session.date ?? null, '別の時間をお選びください。');
     return;
   }
@@ -742,12 +905,10 @@ async function onReservationConfirmed(ctx: Pkg1Context, value: string | null): P
  * 「選択肢が動かない」体験になるため、再開導線を必ず返す (REQ-PKG1 wiring 監査)。
  */
 async function reservationLost(ctx: Pkg1Context): Promise<void> {
-  await safeReply(ctx, [
-    textMessage(
-      'ご来店予定の受付が一度リセットされました。\nお手数ですが、もう一度はじめからお選びください。',
-    ),
-    dispatchPrompt(),
-  ]);
+  await restartToDispatch(
+    ctx,
+    'ご来店予定の受付が一度リセットされました。\nお手数ですが、もう一度はじめからお選びください。',
+  );
 }
 
 /** 来店予定確定 → cases + quote_versions 保存 → PDF 発行 → LINE 共有。 */
@@ -1069,8 +1230,19 @@ function formatQuoteWithPdf(quote: Quote, pdfUrl: string | null): string {
   return `${head}\n\nお見積書（PDF）の生成に失敗しました。お見積もり内容はスタッフへ共有しましたので、スタッフが確認のうえご連絡いたします。`;
 }
 
-async function safeReply(ctx: Pkg1Context, messages: LineMessage[]): Promise<void> {
-  const sent = messages.slice(0, MAX_REPLY_MESSAGES);
+/**
+ * reply を送る。`step` を渡すと、その reply に含まれる全 postback の data へ Step ID を
+ * 埋め込む (Step ID 流入制御・2026-06-24)。step は「この reply のあと session が待つ
+ * step」= ユーザーがこの Flex を押したときの正しい step。次のフローへ進めない終端
+ * メッセージ (PDF 発行後・スタッフ送り等) では step を渡さない (postback も無いため無害)。
+ */
+async function safeReply(
+  ctx: Pkg1Context,
+  messages: LineMessage[],
+  step?: Pkg1Step | ReservationStep,
+): Promise<void> {
+  const stamped = step ? injectStepIntoMessages(messages, step) : messages;
+  const sent = stamped.slice(0, MAX_REPLY_MESSAGES);
   try {
     await ctx.lineClient.replyMessage(ctx.replyToken, sent as never);
   } catch (err) {
