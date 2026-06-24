@@ -126,6 +126,10 @@ export function storesLinkPrompt(storesUrl: string | undefined): LineMessage {
       ],
     });
   }
+  // user 仕様 2026-06-25: STORES は外部ブラウザで開く (LINE 内 webview 回避)。
+  // openExternalBrowser=true は LINE 慣用クエリ (一部公式ドキュメントに非掲載だが
+  // モバイル LINE クライアントで Safari/Chrome に escape する効果あり)。
+  const externalUrl = storesUrl + (storesUrl.includes('?') ? '&' : '?') + 'openExternalBrowser=true';
   const uriRow = {
     type: 'box',
     layout: 'horizontal',
@@ -134,7 +138,7 @@ export function storesLinkPrompt(storesUrl: string | undefined): LineMessage {
     paddingBottom: 'md',
     paddingStart: 'md',
     paddingEnd: 'md',
-    action: { type: 'uri', label: 'STORES でご予約', uri: storesUrl },
+    action: { type: 'uri', label: 'STORES でご予約', uri: externalUrl },
     contents: [
       { type: 'text', text: '🗓', size: 'md', flex: 0 },
       {
