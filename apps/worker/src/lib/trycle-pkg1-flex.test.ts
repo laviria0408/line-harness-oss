@@ -83,7 +83,8 @@ describe('regionMessages (経路 B・9 部位 縦リスト)', () => {
     const s = serialize(msgs);
     expect(s).toContain('action=pkg1_region&value=brake');
     expect(s).toContain('action=pkg1_region&value=other');
-    expect(s).toContain('オーバーホール関係');
+    // region ラベルは catalog rename 済 (cc4ca47:「オーバーホール関係」→「組立・バラシ」)。
+    expect(s).toContain('組立・バラシ');
   });
 });
 

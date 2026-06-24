@@ -19,6 +19,7 @@ const TENANT = 't-1';
 interface Tables {
   bot_sessions: Record<string, unknown>[];
   labor_master: Record<string, unknown>[];
+  labor_options: Record<string, unknown>[];
   stores: Record<string, unknown>[];
   case_statuses: Record<string, unknown>[];
   cases: Record<string, unknown>[];
@@ -50,6 +51,9 @@ function resetTables(): void {
   tables = {
     bot_sessions: [],
     labor_master: laborSeed(),
+    // labor_options は既定で空 (= 既存フロー 100% 維持・options 無いメニューは skip)。
+    // 自動聞きフローの test だけ seedOptions(...) で対象 labor に option を注入する。
+    labor_options: [],
     stores: [
       {
         id: 's1',
@@ -984,6 +988,203 @@ describe('経路 E: pkg1_wage (来店時補完の同意書単体提出)', () => 
   it('replies with the consent prompt (準備中 when no LIFF URL)', async () => {
     await postback('pkg1_wage');
     expect(lastReplyText()).toContain('整備同意書');
+  });
+});
+
+// ── labor_options 自動聞き (task 20260625-004) ────────────────────────────────
+//
+// メニュー (variant / 包括メンテ / お悩み候補) 確定後、その親 labor に紐付く
+// labor_options を 1 件ずつ「追加しますか?」と順次問う。options が無いメニューは
+// 既存どおり qty / confirm へ skip する (既存テストが seed を空に保つことで担保)。
+
+describe('labor_options 自動聞き (task 20260625-004)', () => {
+  /** 指定 labor に option を注入する (test 単位で対象 labor を選ぶ)。 */
+  function seedOptions(laborId: string, opts: Array<{ id: string; name: string; price: number; notes?: string }>): void {
+    opts.forEach((o, i) => {
+      tables.labor_options.push({
+        id: o.id,
+        tenant_id: TENANT,
+        labor_id: laborId,
+        code: o.id,
+        name: o.name,
+        price: o.price,
+        is_default: false,
+        notes: o.notes ?? null,
+        sort_order: 10 + i,
+        archived: false,
+      });
+    });
+  }
+
+  function optionFlowState(): { index?: number; selected?: string[]; after?: string } | undefined {
+    const s = tables.bot_sessions.find((r) => r.line_user_id === USER && r.kind === 'pkg1_estimate');
+    return (s?.state as { optionFlow?: { index?: number; selected?: string[]; after?: string } } | undefined)?.optionFlow;
+  }
+
+  it('variant 確定後に options が無ければ従来どおり cart decision (skip)', async () => {
+    // la1 (brake-adjust-both) に option を入れない → 従来挙動。
+    await postback('pkg1_start');
+    await postback('action=pkg1_dispatch&value=identified');
+    await postback('action=pkg1_region&value=brake');
+    await postback(`action=pkg1_symptom&value=${BRAKE_ADJUST}`);
+    await postback('action=pkg1_variant&value=0');
+    expect(sessionStep()).toBe('awaiting_cart_decision');
+    expect(cart()).toHaveLength(1);
+  });
+
+  it('variant (qty なし) → option 1 件問い → 追加で cart に独立行が積まれる', async () => {
+    // brake-adjust-both = la1 (qty なし)。option を 1 件注入する。
+    seedOptions('la1', [{ id: 'lo-tube', name: 'チューブも交換', price: 1200 }]);
+    await postback('pkg1_start');
+    await postback('action=pkg1_dispatch&value=identified');
+    await postback('action=pkg1_region&value=brake');
+    await postback(`action=pkg1_symptom&value=${BRAKE_ADJUST}`);
+    await postback('action=pkg1_variant&value=0');
+    // option 問いに入る (cart にはまだ積まれない)。
+    expect(sessionStep()).toBe('awaiting_option');
+    expect(lastReplyText()).toContain('チューブも交換');
+    expect(lastReplyText()).toContain('action=pkg1_option&value=add:lo-tube');
+    expect(cart()).toHaveLength(0);
+
+    // 「追加する」→ 全件完了 → cart に base + option の 2 行。
+    await postback('action=pkg1_option&value=add:lo-tube');
+    expect(sessionStep()).toBe('awaiting_cart_decision');
+    const c = cart() as { name: string; amount: number }[];
+    expect(c).toHaveLength(2);
+    expect(c[0].name).toContain('ブレーキ調整');
+    expect(c[1].name).toBe('チューブも交換');
+    const total = c.reduce((s, i) => s + i.amount, 0);
+    expect(total).toBe(3000 + 1200);
+  });
+
+  it('option を「スキップ」すると cart に base 1 行のみ', async () => {
+    seedOptions('la1', [{ id: 'lo-tube', name: 'チューブも交換', price: 1200 }]);
+    await postback('pkg1_start');
+    await postback('action=pkg1_dispatch&value=identified');
+    await postback('action=pkg1_region&value=brake');
+    await postback(`action=pkg1_symptom&value=${BRAKE_ADJUST}`);
+    await postback('action=pkg1_variant&value=0');
+    await postback('action=pkg1_option&value=skip:lo-tube');
+    expect(sessionStep()).toBe('awaiting_cart_decision');
+    expect(cart()).toHaveLength(1);
+  });
+
+  it('複数 option を順次問い、選んだものだけ積む (2 件中 1 件 add)', async () => {
+    seedOptions('la1', [
+      { id: 'lo-a', name: 'オプションA', price: 1000 },
+      { id: 'lo-b', name: 'オプションB', price: 2000 },
+    ]);
+    await postback('pkg1_start');
+    await postback('action=pkg1_dispatch&value=identified');
+    await postback('action=pkg1_region&value=brake');
+    await postback(`action=pkg1_symptom&value=${BRAKE_ADJUST}`);
+    await postback('action=pkg1_variant&value=0');
+    // 1 件目 = A (skip)。まだ option フェーズ・2 件目へ。
+    await postback('action=pkg1_option&value=skip:lo-a');
+    expect(sessionStep()).toBe('awaiting_option');
+    expect(lastReplyText()).toContain('オプションB');
+    // 2 件目 = B (add)。完了 → cart に base + B。
+    await postback('action=pkg1_option&value=add:lo-b');
+    expect(sessionStep()).toBe('awaiting_cart_decision');
+    const c = cart() as { name: string }[];
+    expect(c.map((i) => i.name)).toEqual([expect.stringContaining('ブレーキ調整'), 'オプションB']);
+  });
+
+  it('variant (qty あり) → options 完了後に数量選択へ・qty 後に options も積む', async () => {
+    // spoke-swap = la3 (qty='single')。option を 1 件注入する。
+    seedOptions('la3', [{ id: 'lo-cap', name: 'バルブキャップ', price: 300 }]);
+    await postback('pkg1_start');
+    await postback('action=pkg1_dispatch&value=identified');
+    await postback('action=pkg1_region&value=wheel');
+    await postback(`action=pkg1_symptom&value=${SPOKE_SWAP}`);
+    // qty より先に option 問いが来る (旧 PWA: variant → option → qty)。
+    expect(sessionStep()).toBe('awaiting_option');
+    await postback('action=pkg1_option&value=add:lo-cap');
+    // option 完了 → 数量選択へ。
+    expect(sessionStep()).toBe('awaiting_qty');
+    await postback('action=pkg1_qty&value=2');
+    // qty 確定後: base (qty=2) + option (qty=1)。
+    expect(sessionStep()).toBe('awaiting_cart_decision');
+    const c = cart() as { name: string; qty: number }[];
+    expect(c).toHaveLength(2);
+    expect(c[0].qty).toBe(2);
+    expect(c[1].name).toBe('バルブキャップ');
+    expect(c[1].qty).toBe(1);
+  });
+
+  it('包括メンテ menu 確定 → options 問い → 完了で base + options を積み confirm', async () => {
+    // la-oh に 2 件 (1 件は price=0 の要相談オプション)。
+    seedOptions('la-oh', [
+      { id: 'lo-glass', name: 'ガラスコーティング', price: 15000 },
+      { id: 'lo-paint', name: '全塗装', price: 0, notes: 'お見積もり要相談' },
+    ]);
+    await postback('pkg1_start');
+    await postback('action=pkg1_dispatch&value=comprehensive');
+    await postback('action=pkg1_overhaul_menu&value=la-oh');
+    // options 問いに入る (即 confirm に行かない)。
+    expect(sessionStep()).toBe('awaiting_option');
+    expect(lastReplyText()).toContain('ガラスコーティング');
+    // 1 件目 add → 2 件目 (要相談) を表示。
+    await postback('action=pkg1_option&value=add:lo-glass');
+    expect(sessionStep()).toBe('awaiting_option');
+    expect(lastReplyText()).toContain('要相談');
+    // 2 件目 add → 完了で confirm。base + 2 options。
+    await postback('action=pkg1_option&value=add:lo-paint');
+    expect(sessionStep()).toBe('awaiting_confirm');
+    const c = cart() as { name: string; amount: number }[];
+    expect(c).toHaveLength(3);
+    expect(c[0].name).toContain('オーバーホール');
+    expect(c.map((i) => i.name)).toContain('ガラスコーティング');
+    expect(c.map((i) => i.name)).toContain('全塗装');
+    // 要相談 (price=0) は金額 0 で積まれる。
+    expect((c.find((i) => i.name === '全塗装') as { amount: number }).amount).toBe(0);
+  });
+
+  it('お悩み候補確定でも options を順次問う', async () => {
+    seedOptions('la1', [{ id: 'lo-tube', name: 'チューブも交換', price: 1200 }]);
+    await postback('pkg1_start');
+    await postback('action=pkg1_dispatch&value=unknown');
+    await handlePkg1Text('ブレーキが効かない', ctx()); // la1 (tags: ブレーキ/効かない) にマッチ
+    expect(sessionStep()).toBe('awaiting_osayami_result');
+    await postback('action=pkg1_osayami&value=pick:0');
+    // 候補確定後、options 問いへ (即 confirm に行かない)。
+    expect(sessionStep()).toBe('awaiting_option');
+    await postback('action=pkg1_option&value=skip:lo-tube');
+    expect(sessionStep()).toBe('awaiting_confirm');
+    expect(cart()).toHaveLength(1);
+  });
+
+  it('archived な option は問わない (skip)', async () => {
+    // archived option のみ → options 無し扱い → 従来 cart decision へ。
+    tables.labor_options.push({
+      id: 'lo-arch', tenant_id: TENANT, labor_id: 'la1', code: 'arch', name: '廃止', price: 999,
+      is_default: false, notes: null, sort_order: 10, archived: true,
+    });
+    await postback('pkg1_start');
+    await postback('action=pkg1_dispatch&value=identified');
+    await postback('action=pkg1_region&value=brake');
+    await postback(`action=pkg1_symptom&value=${BRAKE_ADJUST}`);
+    await postback('action=pkg1_variant&value=0');
+    expect(sessionStep()).toBe('awaiting_cart_decision');
+    expect(cart()).toHaveLength(1);
+  });
+
+  it('古い option bubble (違う option id) を押すと stale → silent', async () => {
+    seedOptions('la1', [
+      { id: 'lo-a', name: 'オプションA', price: 1000 },
+      { id: 'lo-b', name: 'オプションB', price: 2000 },
+    ]);
+    await postback('pkg1_start');
+    await postback('action=pkg1_dispatch&value=identified');
+    await postback('action=pkg1_region&value=brake');
+    await postback(`action=pkg1_symptom&value=${BRAKE_ADJUST}`);
+    await postback('action=pkg1_variant&value=0');
+    // 今問うているのは lo-a (index 0)。lo-b の add を押す (= まだ来ていない先の bubble)。
+    const before = replied.length;
+    await postback('action=pkg1_option&value=add:lo-b&step=awaiting_option');
+    expect(replied.length).toBe(before); // silent
+    expect(optionFlowState()?.index).toBe(0); // 進まない
+    expect(optionFlowState()?.selected).toEqual([]); // 積まれない
   });
 });
 

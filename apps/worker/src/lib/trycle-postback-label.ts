@@ -150,6 +150,8 @@ async function resolveAction(
       return resolveVariant(value, ctx);
     case 'pkg1_qty':
       return resolveQty(value);
+    case 'pkg1_option':
+      return resolveOption(value);
     case 'pkg1_cart':
       return value && CART_LABELS[value] ? op(CART_LABELS[value]) : null;
     case 'pkg1_confirm':
@@ -233,6 +235,18 @@ function resolveVariant(value: string | null, ctx: PostbackLabelContext): string
 function resolveQty(value: string | null): string | null {
   const qty = parseIndex(value);
   return qty !== null ? op(`数量「${qty}」を選択`) : null;
+}
+
+/**
+ * labor_options 自動聞きの回答 (value=add:<id> / skip:<id>) を解決する。
+ * option 名は DB 依存 (本 module は catalog のみ) なので操作種別だけ翻訳し、
+ * 具体的なオプション名は chat_summary 側 (「オプション追加: X」) で文脈化する。
+ */
+function resolveOption(value: string | null): string | null {
+  if (!value) return null;
+  if (value.startsWith('add:')) return op('オプションを追加');
+  if (value.startsWith('skip:')) return op('オプションをスキップ');
+  return null;
 }
 
 async function resolveStore(value: string | null, ctx: PostbackLabelContext): Promise<string | null> {

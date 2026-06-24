@@ -41,10 +41,13 @@ import {
   findLaborById,
   findLaborByCode,
   laborToLineItem,
+  listLaborOptions,
+  laborOptionToLineItem,
   saveQuote,
   updateQuotePdfUrl,
   type SavedQuote,
   type LaborRow,
+  type LaborOptionRow,
 } from './trycle-pkg1-repo.js';
 import {
   getPkg1Session,
@@ -65,6 +68,7 @@ import {
   type Pkg1State,
   type Pkg1Step,
   type PendingSelection,
+  type OptionFlowState,
   type ReservationState,
   type ReservationStep,
 } from './trycle-session.js';
@@ -117,6 +121,7 @@ import {
   type Dispatch,
   type LineMessage,
 } from './trycle-pkg1-flex.js';
+import { buildOptionPromptBubble } from './trycle-options-flex.js';
 
 // ── postback 判定 ─────────────────────────────────────────────────────────────
 
@@ -208,6 +213,8 @@ async function route(data: string, ctx: Pkg1Context): Promise<void> {
       return onVariant(ctx, value);
     case 'pkg1_qty':
       return onQty(ctx, value);
+    case 'pkg1_option':
+      return onOptionAnswer(ctx, value);
     case 'pkg1_cart':
       return onCartDecision(ctx, value);
     case 'pkg1_confirm':
@@ -232,6 +239,7 @@ const PKG1_ACTION_STEP: Readonly<Record<string, Pkg1Step>> = {
   pkg1_symptom: 'awaiting_symptom',
   pkg1_variant: 'awaiting_variant',
   pkg1_qty: 'awaiting_qty',
+  pkg1_option: 'awaiting_option',
   pkg1_cart: 'awaiting_cart_decision',
   pkg1_confirm: 'awaiting_confirm',
   // 包括メンテ (A2): 初期 carousel + entry actions・menu picker 全て awaiting_overhaul_menu。
@@ -457,13 +465,32 @@ async function onVariant(ctx: Pkg1Context, value: string | null): Promise<void> 
   return resolveAfterSelection(ctx, session, symptom, pending);
 }
 
-/** variant 確定後の共通処理: 数量が要るか確認し、不要なら明細追加。 */
+/**
+ * variant 確定後の共通処理 (旧 PWA: variant → surcharge → labor_options → qty)。
+ *
+ * 1. 確定した sample (labor code) を解決し、その labor に紐付く labor_options があれば
+ *    先に「追加しますか?」と順次問うフェーズ (awaiting_option) へ入る。surcharge は
+ *    base 明細に含まれる (buildLineItemFromPending) ので options 問いはその後に来る。
+ * 2. options が無ければ従来どおり数量選択 (awaiting_qty) / 明細追加へ。
+ *
+ * after は symptom.qty の有無で 'qty' / 'cart' を決め、options 完了後に合流する。
+ */
 async function resolveAfterSelection(
   ctx: Pkg1Context,
   session: Pkg1State,
   symptom: Symptom,
   pending: PendingSelection,
 ): Promise<void> {
+  const laborId = await resolvePendingLaborId(ctx, pending);
+  const options = laborId ? await listLaborOptionsSafe(ctx, laborId) : [];
+  if (laborId && options.length > 0) {
+    return startOptionFlow(ctx, { ...session, pending }, {
+      laborId,
+      options,
+      after: symptom.qty ? 'qty' : 'cart',
+    });
+  }
+  // options 無し → 従来フロー (数量選択 or 明細追加)。
   if (symptom.qty) {
     await upsertPkg1Session(
       repoEnv(ctx),
@@ -537,7 +564,9 @@ async function addLineItemAndAskCart(
     qty,
     ...(base.notes ? { notes: base.notes } : {}),
   });
-  const cart = [...session.cart, item];
+  // labor_options 自動聞きで選ばれたオプションを、base 明細に続けて独立 1 行ずつ積む。
+  const optionItems = await resolveSelectedOptionItems(ctx, session.optionFlow);
+  const cart = [...session.cart, item, ...optionItems];
 
   // メニュー選択確定 (region/symptom/variant 合算で 1 行)。item.name に部位+作業+種類が
   // 含まれる (例「ブレーキパッド交換（前後）」)。qty>1 のときは本数も付す。
@@ -546,6 +575,7 @@ async function addLineItemAndAskCart(
     speaker: '顧客',
     text: qty > 1 ? `${item.name} ×${qty}` : item.name,
   });
+  await appendOptionChatSummary(ctx, optionItems);
 
   // cart 追加は非冪等 (re-tap で明細が二重に積まれる)。awaiting_cart_decision へ進む
   // ときは previousStep を畳んで「直前の qty/variant ボタンへの rollback」を塞ぐ
@@ -557,6 +587,7 @@ async function addLineItemAndAskCart(
     step: 'awaiting_cart_decision',
     previousStep: undefined,
     pending: undefined,
+    optionFlow: undefined,
   });
   const taxOptions = await getTenantQuoteSettings(repoEnv(ctx));
   await safeReply(
@@ -564,6 +595,253 @@ async function addLineItemAndAskCart(
     [textMessage(cartSummaryText(cart, taxOptions)), cartDecisionPrompt()],
     'awaiting_cart_decision',
   );
+}
+
+// ── labor_options 自動聞き (旧 PWA optionalPartCategories の port・task 20260625-004) ──
+
+interface StartOptionFlowArgs {
+  readonly laborId: string;
+  readonly options: ReadonlyArray<LaborOptionRow>;
+  readonly after: 'qty' | 'cart' | 'resolved';
+  /** after='resolved' のとき cart へ積む base 明細 (包括メンテ menu / お悩み候補)。 */
+  readonly resolvedItem?: QuoteLineItem;
+}
+
+/**
+ * labor_options 自動聞きフェーズを開始する。session を awaiting_option へ進め、
+ * 1 件目の option の「追加しますか?」bubble を出す。options 解決済み (>=1 件) が前提。
+ */
+async function startOptionFlow(
+  ctx: Pkg1Context,
+  session: Pkg1State,
+  args: StartOptionFlowArgs,
+): Promise<void> {
+  const optionFlow: OptionFlowState = {
+    laborId: args.laborId,
+    optionIds: args.options.map((o) => o.id),
+    index: 0,
+    selected: [],
+    after: args.after,
+    ...(args.resolvedItem ? { resolvedItem: args.resolvedItem } : {}),
+  };
+  await upsertPkg1Session(repoEnv(ctx), ctx.lineUserId, {
+    ...session,
+    previousStep: session.step,
+    step: 'awaiting_option',
+    optionFlow,
+  });
+  await promptOption(ctx, args.options, 0);
+}
+
+/**
+ * labor_options の「追加する / スキップ」回答を捌く。value は add:<id> / skip:<id>。
+ * 今問うている option (optionFlow.optionIds[index]) と value の id が一致しないときは
+ * stale (古い option bubble の再押下) として silent。一致すれば add で selected に積み、
+ * index を進めて次の option へ。全件終わったら after の続きフローへ合流する。
+ */
+async function onOptionAnswer(ctx: Pkg1Context, value: string | null): Promise<void> {
+  const session = await currentSession(ctx);
+  const flow = session.optionFlow;
+  if (!flow) {
+    // 自動聞きフェーズ外で来た (session 失効等) → 無反応を避けて状況ふりわけへ戻す。
+    return restartToDispatch(ctx);
+  }
+  const parsed = parseOptionValue(value);
+  const currentId = flow.optionIds[flow.index];
+  // 今問うている option と違う id (古い bubble の再押下 / 連打) → silent no-op。
+  if (!parsed || !currentId || parsed.optionId !== currentId) {
+    console.log('[trycle-pkg1] option answer stale → silent', JSON.stringify({ value, currentId }));
+    return;
+  }
+
+  const selected =
+    parsed.action === 'add' ? [...flow.selected, currentId] : flow.selected;
+  const nextIndex = flow.index + 1;
+  const nextFlow: OptionFlowState = { ...flow, index: nextIndex, selected };
+
+  // 全件完了 → 続きフローへ合流。
+  if (nextIndex >= flow.optionIds.length) {
+    return finishOptionFlow(ctx, { ...session, optionFlow: nextFlow });
+  }
+
+  // 次の option へ。options 一覧を引き直して提示する (cache 済なので追加コストは小)。
+  await upsertPkg1Session(repoEnv(ctx), ctx.lineUserId, {
+    ...session,
+    previousStep: 'awaiting_option',
+    step: 'awaiting_option',
+    optionFlow: nextFlow,
+  });
+  const options = await listLaborOptionsSafe(ctx, flow.laborId);
+  await promptOption(ctx, options, nextIndex);
+}
+
+/**
+ * labor_options 自動聞き完了後の合流。after に応じて
+ *   - 'qty'      : 数量選択へ (selected は session.optionFlow に保持・onQty が積む)
+ *   - 'cart'     : base 明細 + options を cart へ積み確認 prompt へ
+ *   - 'resolved' : resolvedItem + options を cart へ積み確認へ (包括メンテ / お悩み)
+ */
+async function finishOptionFlow(ctx: Pkg1Context, session: Pkg1State): Promise<void> {
+  const flow = session.optionFlow;
+  if (!flow) return restartToDispatch(ctx);
+
+  if (flow.after === 'qty') {
+    const symptom = session.pending ? currentSymptom(session.pending) : undefined;
+    if (symptom?.qty) {
+      // selected を持ったまま qty へ。onQty → addLineItemAndAskCart が options も積む。
+      await upsertPkg1Session(repoEnv(ctx), ctx.lineUserId, {
+        ...session,
+        previousStep: 'awaiting_option',
+        step: 'awaiting_qty',
+        optionFlow: flow,
+      });
+      await safeReply(ctx, [qtyPrompt(symptom)], 'awaiting_qty');
+      return;
+    }
+    // symptom.qty が解決できない異常系 → cart 直行 (qty=1) に倒す。
+    return addLineItemAndAskCart(ctx, session, 1);
+  }
+
+  if (flow.after === 'cart') {
+    return addLineItemAndAskCart(ctx, session, 1);
+  }
+
+  // 'resolved' (包括メンテ menu / お悩み候補): base + options を cart へ積み confirm。
+  return addResolvedWithOptionsToCart(ctx, session, flow);
+}
+
+/** index 番目の option の「追加しますか?」bubble を出す (残件数を subtitle に表示)。 */
+async function promptOption(
+  ctx: Pkg1Context,
+  options: ReadonlyArray<LaborOptionRow>,
+  index: number,
+): Promise<void> {
+  const option = options[index];
+  if (!option) {
+    // 解決不能 (options が消えた等) → 無反応を避けて状況ふりわけへ。
+    return restartToDispatch(ctx);
+  }
+  const remaining = options.length - index;
+  await safeReply(ctx, [buildOptionPromptBubble(option, remaining)], 'awaiting_option');
+}
+
+/**
+ * 包括メンテ menu / お悩み候補 (resolved labor) + 選んだ options を cart へ積み confirm へ。
+ * variant パスと違い qty を持たない単品なので awaiting_confirm へ直行する。
+ */
+async function addResolvedWithOptionsToCart(
+  ctx: Pkg1Context,
+  session: Pkg1State,
+  flow: OptionFlowState,
+): Promise<void> {
+  const env = repoEnv(ctx);
+  const base = flow.resolvedItem;
+  if (!base) return restartToDispatch(ctx);
+  const optionItems = await resolveSelectedOptionItems(ctx, flow);
+  const cart = [...session.cart, base, ...optionItems];
+
+  await appendChatSummary(env, ctx.lineUserId, {
+    flowType: 'pkg1',
+    speaker: '顧客',
+    text: base.name,
+  }).catch(() => undefined);
+  await appendOptionChatSummary(ctx, optionItems);
+
+  await upsertPkg1Session(env, ctx.lineUserId, {
+    ...session,
+    cart,
+    step: 'awaiting_confirm',
+    previousStep: undefined,
+    pending: undefined,
+    osayamiLoopCount: undefined,
+    osayamiCandidates: undefined,
+    optionFlow: undefined,
+  });
+  const taxOptions = await getTenantQuoteSettings(env);
+  await safeReply(ctx, confirmMessages(cart, taxOptions), 'awaiting_confirm');
+}
+
+interface ParsedOptionValue {
+  readonly action: 'add' | 'skip';
+  readonly optionId: string;
+}
+
+/** option postback の value (add:<id> / skip:<id>) を分解する。不正なら null。 */
+function parseOptionValue(value: string | null): ParsedOptionValue | null {
+  if (!value) return null;
+  const sep = value.indexOf(':');
+  if (sep < 0) return null;
+  const action = value.slice(0, sep);
+  const optionId = value.slice(sep + 1);
+  if ((action !== 'add' && action !== 'skip') || optionId === '') return null;
+  return { action, optionId };
+}
+
+/** optionFlow.selected (labor_option_id 配列) を解決して QuoteLineItem[] に変換する。 */
+async function resolveSelectedOptionItems(
+  ctx: Pkg1Context,
+  flow: OptionFlowState | undefined,
+): Promise<QuoteLineItem[]> {
+  if (!flow || flow.selected.length === 0) return [];
+  const options = await listLaborOptionsSafe(ctx, flow.laborId);
+  const byId = new Map(options.map((o) => [o.id, o]));
+  const items: QuoteLineItem[] = [];
+  for (const id of flow.selected) {
+    const option = byId.get(id);
+    if (option) items.push(laborOptionToLineItem(option));
+  }
+  return items;
+}
+
+/** 選んだオプションを 1 件ずつ chat_summary に積む (会話履歴の完全文脈化)。 */
+async function appendOptionChatSummary(
+  ctx: Pkg1Context,
+  optionItems: ReadonlyArray<QuoteLineItem>,
+): Promise<void> {
+  for (const item of optionItems) {
+    await appendChatSummary(repoEnv(ctx), ctx.lineUserId, {
+      flowType: 'pkg1',
+      speaker: '顧客',
+      text: `オプション追加: ${item.name}`,
+    }).catch(() => undefined);
+  }
+}
+
+/**
+ * pending(region/symptom/variant) → sample(labor code) → labor.id を解決する。
+ * labor_options 自動聞きの親 labor 特定に使う。解決不能なら null (options 無し扱い)。
+ */
+async function resolvePendingLaborId(
+  ctx: Pkg1Context,
+  pending: PendingSelection,
+): Promise<string | null> {
+  const region = findRegionByValue(pending.regionValue);
+  const symptom = region?.symptoms?.[pending.symptomIndex];
+  if (!symptom) return null;
+  const variant =
+    pending.variantIndex !== undefined ? symptom.variants?.[pending.variantIndex] : undefined;
+  const sample = variant ? variant.sample : symptom.sample;
+  if (!sample) return null;
+  try {
+    const labor = await findLaborByCode(repoEnv(ctx), sample);
+    return labor?.id ?? null;
+  } catch (err) {
+    console.error('[trycle-pkg1] resolvePendingLaborId findLaborByCode failed', err);
+    return null;
+  }
+}
+
+/** listLaborOptions の例外を握り潰して空配列に倒す (options 取得失敗で無反応にしない)。 */
+async function listLaborOptionsSafe(
+  ctx: Pkg1Context,
+  laborId: string,
+): Promise<LaborOptionRow[]> {
+  try {
+    return await listLaborOptions(repoEnv(ctx), laborId);
+  } catch (err) {
+    console.error('[trycle-pkg1] listLaborOptions failed', err);
+    return [];
+  }
 }
 
 async function onCartDecision(ctx: Pkg1Context, value: string | null): Promise<void> {
@@ -1357,13 +1635,27 @@ function remainingFromCount(loopCount: number | undefined): number {
  * 解決済み labor 1 件を cart に積み、概算見積の確認 (awaiting_confirm) へ直行する。
  * 包括メンテ menu 選択 / お悩み候補確定の共通終端 (variant/qty を持たない単品)。
  * 既存 cart があれば追記する (お悩み→確定の前に通常見積を積んでいたケースを保全)。
+ *
+ * labor_options 自動聞き (task 20260625-004): その labor に紐付く options があれば先に
+ * 「追加しますか?」と順次問うフェーズ (awaiting_option) へ入り、完了後に base + options を
+ * 積んで確認へ合流する。options が無ければ従来どおり即 cart → 確認。
  */
 async function addResolvedLaborToCart(ctx: Pkg1Context, labor: LaborRow): Promise<void> {
   const env = repoEnv(ctx);
   const session = await currentSession(ctx);
   const item = laborToLineItem(labor);
-  const cart = [...session.cart, item];
 
+  const options = await listLaborOptionsSafe(ctx, labor.id);
+  if (options.length > 0) {
+    // osayami の loop state は options フェーズに入る前にここで畳んでおく。
+    return startOptionFlow(
+      ctx,
+      { ...session, osayamiLoopCount: undefined, osayamiCandidates: undefined, pending: undefined },
+      { laborId: labor.id, options, after: 'resolved', resolvedItem: item },
+    );
+  }
+
+  const cart = [...session.cart, item];
   await appendChatSummary(env, ctx.lineUserId, {
     flowType: 'pkg1',
     speaker: '顧客',

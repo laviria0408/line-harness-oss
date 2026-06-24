@@ -124,6 +124,95 @@ async function loadLaborCache(env: TrycleRepoEnv): Promise<LaborCache> {
   return cache;
 }
 
+// ── labor_options: 親 labor に紐付く追加オプション (1:N・migration 0010/0031) ──
+
+/**
+ * 親 labor_master の追加オプション 1 行 (migration 0010_supabase_unified_master)。
+ * 旧 PWA estimate.js の optionalPartCategories を labor_options ベースに簡略化した
+ * もの (Pkg1 variant/menu 確定後に順次「追加しますか?」と問う対象)。
+ *   - price=0 + notes（例「お見積もり要相談」） は「金額未確定の要相談オプション」。
+ *     line item には金額 0 で積みつつ notes を残す (スタッフが店頭で確定する)。
+ */
+export interface LaborOptionRow {
+  readonly id: string;
+  readonly laborId: string;
+  readonly code: string;
+  readonly name: string;
+  readonly price: number;
+  readonly isDefault: boolean;
+  readonly notes: string | null;
+  readonly sortOrder: number;
+}
+
+interface LaborOptionRaw {
+  id: string;
+  labor_id: string;
+  code: string;
+  name: string;
+  price: number;
+  is_default: boolean;
+  notes: string | null;
+  sort_order: number;
+}
+
+function normalizeLaborOption(raw: LaborOptionRaw): LaborOptionRow {
+  return {
+    id: raw.id,
+    laborId: raw.labor_id,
+    code: raw.code,
+    name: raw.name,
+    price: typeof raw.price === 'number' ? raw.price : 0,
+    isDefault: raw.is_default === true,
+    notes: raw.notes ?? null,
+    sortOrder: typeof raw.sort_order === 'number' ? raw.sort_order : 0,
+  };
+}
+
+/**
+ * 親 labor_id に紐付く有効な labor_options を sort_order 昇順で返す。
+ * archived は除外。オプションが無いメニューは空配列 (= 順次問いを skip)。
+ *
+ * 旧 PWA の parts_master 連動 (optionalPartCategories) は廃止し、labor_options を
+ * そのまま「追加しますか?」の選択肢に使う (簡略化方針・task 20260625-004)。
+ */
+export async function listLaborOptions(
+  env: TrycleRepoEnv,
+  laborId: string,
+): Promise<LaborOptionRow[]> {
+  if (!laborId) return [];
+  const rawRows = await supabaseSelect<LaborOptionRaw>(
+    env,
+    'labor_options',
+    {
+      tenant_id: `eq.${getTenantId(env)}`,
+      labor_id: `eq.${laborId}`,
+      archived: 'eq.false',
+    },
+    {
+      select: 'id,labor_id,code,name,price,is_default,notes,sort_order',
+      order: 'sort_order.asc',
+      limit: 100,
+    },
+  );
+  return rawRows.map(normalizeLaborOption);
+}
+
+/**
+ * labor_options 1 行から QuoteLineItem を作る (オプションを cart 明細へ積むときに使う)。
+ *   - unitPrice = option.price (要相談オプションは 0)
+ *   - notes     = option.notes（あれば。例「お見積もり要相談」を明細に残す）
+ *   - name 末尾に「（オプション）」は付けない (notes 側で区別・PDF 表記をシンプルに)
+ */
+export function laborOptionToLineItem(option: LaborOptionRow): QuoteLineItem {
+  return makeLineItem({
+    name: option.name,
+    unitPrice: option.price,
+    unitPriceMax: option.price,
+    qty: 1,
+    ...(option.notes ? { notes: option.notes } : {}),
+  });
+}
+
 /** code (= regions.ts の sample) で labor をピンポイント取得する。 */
 export async function findLaborByCode(
   env: TrycleRepoEnv,

@@ -59,6 +59,10 @@ export const RECENT_CONFIRM_WINDOW_MS = 30 * 1000;
  *   - awaiting_overhaul_menu : 包括メンテ (A2) の 4 メニュー提示後・メニュー選択待ち
  *   - awaiting_osayami_input : お悩み (A1) の自由文入力待ち (text 経路で受ける)
  *   - awaiting_osayami_result: お悩みマッチ 3 件提示後・候補/再質問/相談の選択待ち
+ *
+ * labor_options 自動聞き (task 20260625-004):
+ *   - awaiting_option : メニュー (variant / 包括メンテ / お悩み候補) 確定後、その labor に
+ *     紐付く labor_options を 1 件ずつ「追加しますか?」と順次問うフェーズ。
  */
 export type Pkg1Step =
   | 'awaiting_dispatch'
@@ -66,6 +70,7 @@ export type Pkg1Step =
   | 'awaiting_symptom'
   | 'awaiting_variant'
   | 'awaiting_qty'
+  | 'awaiting_option'
   | 'awaiting_cart_decision'
   | 'awaiting_confirm'
   | 'awaiting_consent_form'
@@ -82,6 +87,32 @@ export interface PendingSelection {
   readonly regionValue: string;
   readonly symptomIndex: number;
   readonly variantIndex?: number;
+}
+
+/**
+ * labor_options 自動聞きフェーズの作業 state (task 20260625-004)。
+ *
+ * メニュー (variant / 包括メンテ / お悩み候補) 確定後に、その親 labor に紐付く
+ * labor_options を 1 件ずつ順次「追加しますか?」と問う。1 件処理するたびに index を
+ * 進め、全件終わったら `after` の続きフロー (qty / cart 直行) へ合流する。
+ *
+ * - `laborId`   : 親 labor (option の出典・整合性チェックに使う)
+ * - `optionIds` : 問う順 (sort_order 昇順) の labor_option_id 配列
+ * - `index`     : 今問うている option の位置 (= optionIds[index])
+ * - `selected`  : これまで「はい」で選ばれた labor_option_id 配列
+ * - `after`     : 全件完了後の続きフロー。
+ *     'qty'      = variant パス。symptom の数量選択へ (pending 再利用)。
+ *     'cart'     = variant パス・数量不要。base 明細 1 件を cart へ積む (pending 再利用)。
+ *     'resolved' = 包括メンテ / お悩み候補。resolvedLabor を base 明細として cart へ積み confirm。
+ */
+export interface OptionFlowState {
+  readonly laborId: string;
+  readonly optionIds: ReadonlyArray<string>;
+  readonly index: number;
+  readonly selected: ReadonlyArray<string>;
+  readonly after: 'qty' | 'cart' | 'resolved';
+  /** after='resolved' のとき cart へ積む base 明細 (包括メンテ menu / お悩み候補)。 */
+  readonly resolvedItem?: QuoteLineItem;
 }
 
 /**
@@ -111,6 +142,11 @@ export interface Pkg1State {
    * 「このメニューで」postback の value=index → osayamiCandidates[index] で labor を引く。
    */
   readonly osayamiCandidates?: ReadonlyArray<string>;
+  /**
+   * labor_options 自動聞きフェーズ (task 20260625-004)。awaiting_option で保持する。
+   * 未存在 = 自動聞きフェーズ外。
+   */
+  readonly optionFlow?: OptionFlowState;
 }
 
 interface BotSessionRow {
@@ -627,6 +663,25 @@ function normalizeState(state: Partial<Pkg1State> | null | undefined): Pkg1State
     osayamiCandidates: Array.isArray(state?.osayamiCandidates)
       ? state.osayamiCandidates
       : undefined,
+    optionFlow: normalizeOptionFlow(state?.optionFlow),
+  };
+}
+
+/** optionFlow を最低限の形に正規化する (壊れた配列等を防ぐ)。 */
+function normalizeOptionFlow(
+  flow: OptionFlowState | null | undefined,
+): OptionFlowState | undefined {
+  if (!flow || typeof flow.laborId !== 'string') return undefined;
+  const after = flow.after === 'qty' || flow.after === 'cart' || flow.after === 'resolved'
+    ? flow.after
+    : 'cart';
+  return {
+    laborId: flow.laborId,
+    optionIds: Array.isArray(flow.optionIds) ? flow.optionIds : [],
+    index: typeof flow.index === 'number' && flow.index >= 0 ? flow.index : 0,
+    selected: Array.isArray(flow.selected) ? flow.selected : [],
+    after,
+    resolvedItem: flow.resolvedItem,
   };
 }
 
