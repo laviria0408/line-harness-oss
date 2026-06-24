@@ -88,18 +88,34 @@ export async function resolveCaseConversationRange(c: Context<Env>, caseId: stri
     { select: 'line_user_id,created_at', limit: 1 },
   );
   if (!cur[0]) return { status: 'not_found' };
-  const startAt = cur[0].created_at;
+  const curCreatedAt = cur[0].created_at;
   const lineUserId = cur[0].line_user_id;
   if (!lineUserId) return { status: 'ok', startAt: null, endAt: null };
 
-  // 2) 同 line_user_id の next case (created_at > startAt) の最古を end として取る
+  // 2) 同 line_user_id の prev case (created_at < curCreatedAt) の最新を start として。
+  //    起点を「当 case の created_at」にすると pkg1_start などフロー開始時の postback が
+  //    saveQuote (case 作成) より前のため除外される実機 bug があった (2026-06-24)。
+  //    正しくは「前 case 終了時点」= 「前 case の created_at」。無ければ null = friend 追加時から。
+  const prev = await supabaseSelect<{ created_at: string }>(
+    c.env,
+    'cases',
+    {
+      tenant_id: `eq.${tenantId}`,
+      line_user_id: `eq.${lineUserId}`,
+      created_at: `lt.${curCreatedAt}`,
+    },
+    { select: 'created_at', order: 'created_at.desc', limit: 1 },
+  );
+  const startAt = prev[0]?.created_at ?? null;
+
+  // 3) 同 line_user_id の next case (created_at > curCreatedAt) の最古を end として取る
   const next = await supabaseSelect<{ created_at: string }>(
     c.env,
     'cases',
     {
       tenant_id: `eq.${tenantId}`,
       line_user_id: `eq.${lineUserId}`,
-      created_at: `gt.${startAt}`,
+      created_at: `gt.${curCreatedAt}`,
     },
     { select: 'created_at', order: 'created_at.asc', limit: 1 },
   );

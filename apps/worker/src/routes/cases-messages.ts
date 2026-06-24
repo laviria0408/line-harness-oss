@@ -157,11 +157,13 @@ casesMessages.get('/api/cases/:caseId/messages', async (c) => {
     const whereClauses: string[] = ['friend_id = ?'];
     const baseBindings: (string | number)[] = [friend.id];
     if (startAt) {
-      whereClauses.push('julianday(created_at) >= julianday(?)');
+      // 前 case の created_at より新しい (= 前 case 終了後)。境界一致は前 case 側にする。
+      whereClauses.push('julianday(created_at) > julianday(?)');
       baseBindings.push(startAt);
     }
     if (endAt) {
-      whereClauses.push('julianday(created_at) < julianday(?)');
+      // 次 case の created_at 以前 (= 当 case 完了まで)。境界一致は当 case 側に含める。
+      whereClauses.push('julianday(created_at) <= julianday(?)');
       baseBindings.push(endAt);
     }
     if (cursor) {
